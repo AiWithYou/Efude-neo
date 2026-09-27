@@ -18,6 +18,11 @@ Releases are built and published by the `CI` workflow
    git push origin v0.1.0
    ```
 
+   If the fork shows no Actions run after the tag push, start the same CI
+   workflow manually on that tag with `gh workflow run CI --ref v0.1.0`.
+   Check that its Windows build and release jobs succeed before announcing
+   the download.
+
    The maintainer's local `release.bat` (not in the repository) does the same
    after checking that everything is committed and pushed.
 4. The tag's CI run builds on Windows, then the `release` job publishes a

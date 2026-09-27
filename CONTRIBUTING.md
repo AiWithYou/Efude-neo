@@ -82,6 +82,7 @@ Efudeのコード、アセット、ドキュメントは、すべて自分たち
 
 ## Contributions
 
+
 PRs should state their purpose and link an observation-based spec when applicable. Contributors who have seen proprietary internals must not implement the related area. Follow the project code style and add an ADR under `docs/adr/` for large design changes.
 
 Brush output is guarded by a regression test that replays input logs through every built-in brush and compares the result with reference images (`crates/efude-ui/tests/golden/`). If a change to brush feel is intended, regenerate the images with `EFUDE_BLESS=1 cargo test -p efude-ui golden`, look at them, and commit them with the change. On a failure the new images and difference maps are written to `target/golden-out/`. Real tablet strokes can be added by saving an input log in the app ("Save Input Log", which keeps the last 128 strokes) into `crates/efude-ui/tests/golden/logs/`.
