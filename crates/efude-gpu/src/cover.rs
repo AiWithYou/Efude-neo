@@ -562,6 +562,13 @@ impl GpuCover {
 
 impl CoverAccelerator for GpuCover {
     fn paint_cover(&self, batch: &CoverBatch) -> Option<Vec<CoverTileResult>> {
+        // Brush-relative bitmap grain changes texels at integer boundaries.
+        // GPU and CPU float rounding can select different texels there, which
+        // produces visible colour differences. Let the caller use its CPU
+        // fallback until this path can be made pixel-identical.
+        if batch.grain_strength > 0.0 && batch.grain_texture.is_some() && !batch.grain_fixed {
+            return None;
+        }
         let results = self.run(batch).ok()?;
         self.batches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -666,6 +673,8 @@ mod tests {
     /// The per-dab CPU path against the batched CPU cover and (when there
     /// is an adapter) the GPU.
     fn compare(brush: Brush, eraser: bool, size: f32, with_selection: bool) {
+        let expects_cpu_fallback =
+            brush.grain > 0.0 && brush.grain_tip.is_some() && !brush.grain_fixed;
         let (width, height) = (150, 97);
         let points = wavy(70, width as f32, height as f32, size);
         let selection: Vec<u8> = (0..width * height)
@@ -712,6 +721,9 @@ mod tests {
                 brush.kind
             );
         }
+        if expects_cpu_fallback {
+            assert_eq!(gpu.as_ref().unwrap().batches_painted(), 0);
+        }
     }
 
     fn brush(index: usize) -> Brush {
@@ -736,8 +748,7 @@ mod tests {
         compare(pencil, false, 11.0, true);
     }
 
-    #[test]
-    fn brush_with_bitmap_tip_and_tilt_matches_cpu() {
+    fn textured_tilt_brush() -> Brush {
         let mut b = brush(2);
         b.tilt_flattening = 0.6;
         b.tilt_rotation = 1.0;
@@ -754,6 +765,35 @@ mod tests {
             coverage: (0..20).map(|i| (i * 13) as u8).collect(),
         });
         b.grain = 0.5;
+        b
+    }
+
+    #[test]
+    fn bitmap_tip_without_grain_matches_cpu() {
+        let mut b = textured_tilt_brush();
+        b.grain = 0.0;
+        b.grain_tip = None;
+        compare(b, false, 25.0, false);
+    }
+
+    #[test]
+    fn following_grain_without_bitmap_tip_falls_back_to_cpu() {
+        let mut b = textured_tilt_brush();
+        b.tip = None;
+        compare(b, false, 25.0, false);
+    }
+
+    #[test]
+    fn canvas_fixed_grain_texture_matches_cpu() {
+        let mut b = textured_tilt_brush();
+        b.tip = None;
+        b.grain_fixed = true;
+        compare(b, false, 25.0, false);
+    }
+
+    #[test]
+    fn following_grain_with_bitmap_tip_and_tilt_falls_back_to_cpu() {
+        let b = textured_tilt_brush();
         compare(b, false, 25.0, false);
     }
 

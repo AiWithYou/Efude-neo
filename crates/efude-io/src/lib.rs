@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Hakoniwa
 use efude_canvas::{
-    BlendMode, Document, Layer, LayerKind, MAX_DOCUMENT_DIMENSION, MAX_DOCUMENT_PIXELS, TILE_SIZE,
-    composite, composite_transparent, sparse_tile_keys,
+    BlendMode, Document, GuideImage, Layer, LayerKind, MAX_DOCUMENT_DIMENSION, MAX_DOCUMENT_PIXELS,
+    TILE_SIZE, composite, composite_transparent, sparse_tile_keys,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
@@ -11,6 +11,7 @@ use std::{
     path::Path,
 };
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
+pub mod timelapse;
 const MAX_EFUDE_TILE_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_INCREMENTAL_ENTRY_COMPARE: usize = 32 * 1024 * 1024;
 
@@ -106,6 +107,9 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
     if doc.layers.is_empty() || doc.layers.len() > 2000 {
         return Err(".efude layer count is outside the supported range".into());
     }
+    if doc.guide.as_ref().is_some_and(|guide| !guide.is_valid()) {
+        return Err(".efude tracing guide is invalid".into());
+    }
     let mut ids = std::collections::HashSet::with_capacity(doc.layers.len());
     for layer in &doc.layers {
         if !ids.insert(layer.id) {
@@ -135,7 +139,8 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
         }
     }
     // mimetype, manifest, layers, merged image, thumbnail, optional metadata
-    let mut entry_count = 5usize + usize::from(!doc.metadata.is_empty());
+    let mut entry_count =
+        5usize + usize::from(!doc.metadata.is_empty()) + 2 * usize::from(doc.guide.is_some());
     for layer in &doc.layers {
         entry_count = entry_count
             .checked_add(sparse_tile_keys(layer, doc.width, doc.height).len())
@@ -181,6 +186,29 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
     if !doc.metadata.is_empty() {
         let metadata = serde_json::to_vec_pretty(&doc.metadata)?;
         write_or_reuse_entry(&mut z, &mut previous_archive, "metadata.json", o, &metadata)?;
+    }
+    if let Some(guide) = &doc.guide {
+        let settings = serde_json::to_vec_pretty(&serde_json::json!({
+            "width": guide.width, "height": guide.height,
+            "offset_x": guide.offset_x, "offset_y": guide.offset_y,
+            "scale": guide.scale, "opacity": guide.opacity, "visible": guide.visible
+        }))?;
+        write_or_reuse_entry(
+            &mut z,
+            &mut previous_archive,
+            "guide/settings.json",
+            o,
+            &settings,
+        )?;
+        let mut bytes = Vec::new();
+        {
+            let mut encoder =
+                png::Encoder::new(std::io::Cursor::new(&mut bytes), guide.width, guide.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&guide.rgba)?;
+        }
+        write_or_reuse_entry(&mut z, &mut previous_archive, "guide/image.png", o, &bytes)?;
     }
     for l in &doc.layers {
         if let Some(strokes) = &l.vector {
@@ -535,12 +563,86 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
         entry.read_to_end(&mut bytes)?;
         metadata = serde_json::from_slice(&bytes)?;
     }
+    let has_guide = z.file_names().any(|name| name == "guide/settings.json");
+    let guide = if has_guide {
+        let mut settings_entry = z.by_name("guide/settings.json")?;
+        if settings_entry.size() > 64 * 1024 {
+            return Err(".efude guide settings exceed the size limit".into());
+        }
+        let mut settings_bytes = Vec::new();
+        settings_entry.read_to_end(&mut settings_bytes)?;
+        drop(settings_entry);
+        let settings: serde_json::Value = serde_json::from_slice(&settings_bytes)?;
+        let guide_width = u32::try_from(
+            settings["width"]
+                .as_u64()
+                .ok_or(".efude guide width is missing")?,
+        )?;
+        let guide_height = u32::try_from(
+            settings["height"]
+                .as_u64()
+                .ok_or(".efude guide height is missing")?,
+        )?;
+        if guide_width == 0
+            || guide_height == 0
+            || u64::from(guide_width) * u64::from(guide_height) > 16_777_216
+        {
+            return Err(".efude guide dimensions exceed the size limit".into());
+        }
+        let mut image_entry = z.by_name("guide/image.png")?;
+        if image_entry.size() > 128 * 1024 * 1024 {
+            return Err(".efude guide image exceeds the size limit".into());
+        }
+        let mut image_bytes = Vec::new();
+        image_entry.read_to_end(&mut image_bytes)?;
+        let decoder = png::Decoder::new(std::io::Cursor::new(&image_bytes));
+        let mut reader = decoder.read_info()?;
+        if reader.info().width != guide_width
+            || reader.info().height != guide_height
+            || reader.info().color_type != png::ColorType::Rgba
+            || reader.info().bit_depth != png::BitDepth::Eight
+        {
+            return Err(".efude guide image format does not match its settings".into());
+        }
+        let mut rgba = vec![0; guide_width as usize * guide_height as usize * 4];
+        let frame = reader.next_frame(&mut rgba)?;
+        if frame.buffer_size() != rgba.len() {
+            return Err(".efude guide image is incomplete".into());
+        }
+        let guide = GuideImage {
+            width: guide_width,
+            height: guide_height,
+            rgba: std::sync::Arc::new(rgba),
+            offset_x: settings["offset_x"]
+                .as_f64()
+                .ok_or(".efude guide offset is missing")? as f32,
+            offset_y: settings["offset_y"]
+                .as_f64()
+                .ok_or(".efude guide offset is missing")? as f32,
+            scale: settings["scale"]
+                .as_f64()
+                .ok_or(".efude guide scale is missing")? as f32,
+            opacity: settings["opacity"]
+                .as_f64()
+                .ok_or(".efude guide opacity is missing")? as f32,
+            visible: settings["visible"]
+                .as_bool()
+                .ok_or(".efude guide visibility is missing")?,
+        };
+        if !guide.is_valid() {
+            return Err(".efude guide settings are invalid".into());
+        }
+        Some(guide)
+    } else {
+        None
+    };
     efude_canvas::tidy_layer_order(&mut layers);
     Ok(Document {
         width,
         height,
         dpi,
         layers,
+        guide,
         metadata,
     })
 }
@@ -1885,6 +1987,39 @@ mod tests {
         assert_eq!((loaded.width, loaded.height), (4, 3));
         assert_eq!(loaded.layers[0].pixels.pixel(1, 1), [220, 48, 76, 255]);
         assert_eq!(loaded.layers[0].pixels.pixel(2, 1), [18, 90, 240, 127]);
+    }
+
+    #[test]
+    fn tracing_guide_round_trips_but_never_enters_artwork_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("guided.efude");
+        let mut doc = Document::new(4, 3);
+        doc.guide = GuideImage::fit_to_canvas(4, 3, [255, 0, 255, 255].repeat(12), &doc);
+        doc.layers[0].pixels.set_pixel(1, 1, [0, 0, 0, 255]);
+        assert_ne!(efude_canvas::composite_display(&doc, 0), composite(&doc));
+        assert_ne!(efude_canvas::composite_with_guide(&doc), composite(&doc));
+        save(&path, &doc).unwrap();
+        let loaded = load(&path).unwrap();
+        let guide = loaded.guide.as_ref().unwrap();
+        assert_eq!((guide.width, guide.height, guide.opacity), (4, 3, 0.5));
+        assert_eq!(
+            guide.rgba.as_slice(),
+            doc.guide.as_ref().unwrap().rgba.as_slice()
+        );
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut merged_png = Vec::new();
+        archive
+            .by_name("merged.png")
+            .unwrap()
+            .read_to_end(&mut merged_png)
+            .unwrap();
+        let merged = image::load_from_memory(&merged_png).unwrap().to_rgba8();
+        assert_eq!(merged.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(merged.get_pixel(1, 1).0, [0, 0, 0, 255]);
+        let png = directory.path().join("art.png");
+        export_png(&png, &loaded).unwrap();
+        let exported = image::open(&png).unwrap().to_rgba8();
+        assert_eq!(exported.get_pixel(0, 0).0, [0, 0, 0, 0]);
     }
 
     #[test]

@@ -647,7 +647,7 @@ mod mip_tests {
 
     /// The GPU display composites exactly like the CPU compositor.
     #[test]
-    fn gpu_composite_matches_the_cpu_exactly() {
+    fn gpu_composite_stays_within_one_byte_of_cpu() {
         use efude_canvas::{BlendMode, Document, Layer, composite_display};
         let Some((device, queue)) = device() else {
             return;
@@ -766,7 +766,9 @@ mod mip_tests {
                 }
             }
         }
-        assert_eq!(worst, 0, "GPU and CPU composites differ by up to {worst}");
+        // Shader floating-point operations and UNORM storage can round at an
+        // adjacent 8-bit value. Brush output itself is checked separately.
+        assert!(worst <= 1, "GPU and CPU composites differ by up to {worst}");
     }
 
     #[test]

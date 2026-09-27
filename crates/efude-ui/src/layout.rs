@@ -514,9 +514,10 @@ impl EfudeApp {
             .vscroll(true)
             .show(ctx, |ui| {
                 self.view_ui(ui, ctx);
-                egui::CollapsingHeader::new(
-                    self.text("サブビュー / 参照画像", "Sub View / Reference Image"),
-                )
+                egui::CollapsingHeader::new(self.text(
+                    "資料ビュー（別枠の画像）",
+                    "Reference view (floating image)",
+                ))
                 .show(ui, |ui| self.subview_ui(ui, ctx));
             });
         self.show_view_options = open;
@@ -635,6 +636,11 @@ impl EfudeApp {
                         }
                         close_menu_on_click(ui);
                     });
+                    ui.menu_button(self.text("記録", "Record"), |ui| {
+                        self.timelapse_menu_ui(ui, ctx);
+                        ui.separator();
+                        self.macro_menu_ui(ui);
+                    });
                     let tool_label = format!(
                         "{}: {}",
                         self.text("ツール", "Tool"),
@@ -665,6 +671,9 @@ impl EfudeApp {
                             self.show_view_options = true;
                             ui.close_menu();
                         }
+                        ui.menu_button(self.text("下絵ガイド", "Tracing guide"), |ui| {
+                            self.guide_menu_ui(ui, ctx);
+                        });
                         ui.separator();
                         ui.label(
                             egui::RichText::new(self.text("パネル", "Panels"))
@@ -732,17 +741,25 @@ impl EfudeApp {
                             egui::Label::new(egui::RichText::new(&self.status).color(MUTED_TEXT))
                                 .truncate(),
                         );
+                        if let Some(label) = self.timelapse_status() {
+                            ui.colored_label(Color32::from_rgb(245, 95, 95), label);
+                        }
+                        if let Some(label) = self.macro_status() {
+                            ui.colored_label(Color32::from_rgb(245, 150, 90), label);
+                        }
                     });
                 });
             });
     }
 
     pub(crate) fn undo(&mut self) {
+        self.commit_pending_guide_edit();
         self.history.undo_document(&mut self.doc);
         self.after_history_step();
     }
 
     pub(crate) fn redo(&mut self) {
+        self.commit_pending_guide_edit();
         self.history.redo_document(&mut self.doc);
         self.after_history_step();
     }

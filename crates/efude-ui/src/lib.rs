@@ -43,6 +43,27 @@ enum IoCompletion {
         height: u32,
         rgba: Vec<u8>,
     },
+    GuideLoaded {
+        document_id: u64,
+        path: std::path::PathBuf,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    RecoverySaved,
+    Recovered {
+        snapshot: std::path::PathBuf,
+        metadata: std::path::PathBuf,
+        info: recovery::SnapshotMeta,
+        document: Document,
+    },
+    RecoveryFailed {
+        snapshot: std::path::PathBuf,
+        document_id: Option<u64>,
+        state_token: Option<u64>,
+        message: String,
+    },
+    RecoveryCleared,
     FilterApplied {
         layer_id: u64,
         document_id: u64,
@@ -115,6 +136,30 @@ enum IoTask {
     },
     LoadReference {
         path: std::path::PathBuf,
+        repaint: egui::Context,
+    },
+    LoadGuide {
+        document_id: u64,
+        path: std::path::PathBuf,
+        repaint: egui::Context,
+    },
+    SaveRecovery {
+        snapshot: std::path::PathBuf,
+        metadata: std::path::PathBuf,
+        info: recovery::SnapshotMeta,
+        document: Document,
+        repaint: egui::Context,
+    },
+    LoadRecovery {
+        snapshot: std::path::PathBuf,
+        metadata: std::path::PathBuf,
+        info: recovery::SnapshotMeta,
+        repaint: egui::Context,
+    },
+    ClearRecovery {
+        directory: std::path::PathBuf,
+        document_id: u64,
+        saved_token: Option<u64>,
         repaint: egui::Context,
     },
     ApplyFilter {
@@ -1020,6 +1065,18 @@ pub struct EfudeApp {
     reference_opacity: f32,
     reference_zoom: f32,
     reference_position: Option<Pos2>,
+    guide_edit_pending: Option<u64>,
+    recovery: recovery::Store,
+    timelapse_worker: timelapse::Worker,
+    timelapse_sessions: timelapse::Sessions,
+    show_timelapse_start: bool,
+    timelapse_include_guide: bool,
+    timelapse_max_side: u32,
+    macro_recording: Option<macros::Recording>,
+    saved_macros: Vec<macros::Saved>,
+    macro_replaying: bool,
+    macro_name: String,
+    show_macro_save: bool,
     selection_erase: bool,
     /// GPU painting of opacity-capped strokes, when a GPU is available.
     gpu_cover: Option<efude_gpu::GpuCover>,
@@ -1130,8 +1187,35 @@ impl Default for EfudeApp {
                                     rgba,
                                 },
                                 Err(error) => IoCompletion::Failed(format!(
-                                    "参照画像を読み込めません: {error}"
+                                    "資料ビューの画像を読み込めません: {error}"
                                 )),
+                            };
+                            let _ = completion_sender.send(completion);
+                            repaint.request_repaint();
+                        }
+                        IoTask::LoadGuide {
+                            document_id,
+                            path,
+                            repaint,
+                        } => {
+                            let completion = match decode_limited_image(&path, 4096, 4096) {
+                                Ok((width, height, rgba))
+                                    if u64::from(width) * u64::from(height) <= 16_777_216 =>
+                                {
+                                    IoCompletion::GuideLoaded {
+                                        document_id,
+                                        path,
+                                        width,
+                                        height,
+                                        rgba,
+                                    }
+                                }
+                                Ok(_) => {
+                                    IoCompletion::Failed("下絵ガイドは1677万画素までです".into())
+                                }
+                                Err(error) => {
+                                    IoCompletion::Failed(format!("下絵ガイドを開けません: {error}"))
+                                }
                             };
                             let _ = completion_sender.send(completion);
                             repaint.request_repaint();
@@ -1160,6 +1244,60 @@ impl Default for EfudeApp {
                                 Err(error) => IoCompletion::Failed(error.to_string()),
                             };
                             let _ = completion_sender.send(completion);
+                            repaint.request_repaint();
+                        }
+                        IoTask::SaveRecovery {
+                            snapshot,
+                            metadata,
+                            info,
+                            document,
+                            repaint,
+                        } => {
+                            let completion = match recovery::write_snapshot(
+                                &snapshot, &metadata, &document, &info,
+                            ) {
+                                Ok(()) => IoCompletion::RecoverySaved,
+                                Err(message) => IoCompletion::RecoveryFailed {
+                                    snapshot,
+                                    document_id: Some(info.document_id),
+                                    state_token: Some(info.state_token),
+                                    message,
+                                },
+                            };
+                            let _ = completion_sender.send(completion);
+                            repaint.request_repaint();
+                        }
+                        IoTask::LoadRecovery {
+                            snapshot,
+                            metadata,
+                            info,
+                            repaint,
+                        } => {
+                            let completion = match efude_io::load(&snapshot) {
+                                Ok(document) => IoCompletion::Recovered {
+                                    snapshot,
+                                    metadata,
+                                    info,
+                                    document,
+                                },
+                                Err(error) => IoCompletion::RecoveryFailed {
+                                    snapshot,
+                                    document_id: None,
+                                    state_token: None,
+                                    message: error.to_string(),
+                                },
+                            };
+                            let _ = completion_sender.send(completion);
+                            repaint.request_repaint();
+                        }
+                        IoTask::ClearRecovery {
+                            directory,
+                            document_id,
+                            saved_token,
+                            repaint,
+                        } => {
+                            recovery::clear_snapshot_family(&directory, document_id, saved_token);
+                            let _ = completion_sender.send(IoCompletion::RecoveryCleared);
                             repaint.request_repaint();
                         }
                         IoTask::Export {
@@ -1413,6 +1551,18 @@ impl Default for EfudeApp {
             reference_opacity: 0.75,
             reference_zoom: 0.3,
             reference_position: None,
+            guide_edit_pending: None,
+            recovery: recovery::Store::new(),
+            timelapse_worker: timelapse::Worker::new(),
+            timelapse_sessions: Default::default(),
+            show_timelapse_start: false,
+            timelapse_include_guide: false,
+            timelapse_max_side: 1080,
+            macro_recording: None,
+            saved_macros: macros::load_saved(),
+            macro_replaying: false,
+            macro_name: String::new(),
+            show_macro_save: false,
             selection_erase: false,
             gpu_cover: None,
             gpu_min_pixels: 250_000.0,
@@ -1540,6 +1690,7 @@ impl EfudeApp {
             height: self.doc.height,
             dpi: self.doc.dpi,
             layers: self.doc.layers.clone(),
+            guide: self.doc.guide.clone(),
             metadata: self.doc.metadata.clone(),
         }
     }
@@ -1592,6 +1743,31 @@ impl EfudeApp {
             .map(|(index, layer)| (layer.id, index))
             .collect::<std::collections::HashMap<_, _>>();
         let mut gpu_layers = Vec::new();
+        if let Some(guide) = self
+            .doc
+            .guide
+            .as_ref()
+            .filter(|guide| guide.visible && guide.is_valid())
+        {
+            let mut pixels =
+                vec![0; (efude_canvas::TILE_SIZE * efude_canvas::TILE_SIZE * 4) as usize];
+            for y in 0..height {
+                for x in 0..width {
+                    if let Some(sample) = guide.sample(origin_x + x, origin_y + y) {
+                        let index = ((y * efude_canvas::TILE_SIZE + x) * 4) as usize;
+                        pixels[index..index + 4].copy_from_slice(&sample);
+                    }
+                }
+            }
+            gpu_layers.push(efude_gpu::GpuCompositeLayer {
+                pixels,
+                coverage: vec![1.0; (efude_canvas::TILE_SIZE * efude_canvas::TILE_SIZE) as usize],
+                opacity: guide.opacity,
+                blend_mode: 0,
+                linear_blend: false,
+                clipping: false,
+            });
+        }
         for layer in self
             .doc
             .layers
@@ -1838,7 +2014,8 @@ impl EfudeApp {
                 .iter()
                 .filter(|layer| layer.kind == LayerKind::Raster)
                 .count()
-                .clamp(1, 200);
+                + usize::from(self.doc.guide.as_ref().is_some_and(|guide| guide.visible));
+            let layer_count = layer_count.clamp(1, 200);
             let bytes_per_tile = (efude_canvas::TILE_SIZE as usize).pow(2) * 8 * layer_count;
             let max_batch_tiles = (GPU_COMPOSITE_INPUT_BUDGET / bytes_per_tile).max(1);
             for tile_batch in tiles.chunks(max_batch_tiles) {
@@ -1992,14 +2169,37 @@ impl EfudeApp {
             .or_else(|| {
                 rfd::FileDialog::new()
                     .add_filter("Efude", &["efude"])
-                    .set_file_name("Artwork.efude")
+                    .set_file_name(self.suggested_save_name())
                     .save_file()
             })
+    }
+    pub(crate) fn suggested_save_name(&self) -> String {
+        if let Some(name) = self
+            .doc_path
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+        {
+            return name.to_owned();
+        }
+        let title = self
+            .tabs
+            .slots
+            .get(self.tabs.active)
+            .and_then(|slot| slot.recovered_title.as_deref())
+            .unwrap_or("Artwork");
+        let safe: String = title
+            .chars()
+            .filter(|ch| !"/\\:*?\"<>|".contains(*ch) && !ch.is_control())
+            .collect();
+        let safe = safe.trim().trim_matches('.');
+        format!("{}.efude", if safe.is_empty() { "Artwork" } else { safe })
     }
     fn request_native_save(&mut self, ctx: &egui::Context) -> Result<bool, String> {
         let Some(path) = self.choose_native_save_path() else {
             return Ok(false);
         };
+        self.commit_pending_guide_edit();
         self.queue_document_save(path, false, ctx)?;
         self.last_backup = std::time::Instant::now();
         Ok(true)
@@ -2090,6 +2290,9 @@ impl EfudeApp {
     }
     /// Puts `document` in the active tab, discarding what was there.
     fn replace_document(&mut self, document: Document, path: Option<std::path::PathBuf>) {
+        if let Some(slot) = self.tabs.slots.get_mut(self.tabs.active) {
+            slot.recovered_title = None;
+        }
         self.doc = document;
         self.canvas_width_input = self.doc.width;
         self.canvas_height_input = self.doc.height;
@@ -2188,13 +2391,19 @@ impl EfudeApp {
         if let Some(copy_root) = copies.iter_mut().find(|layer| layer.id == id_map[&root_id]) {
             copy_root.name = format!("{} のコピー", copy_root.name);
         }
-        self.history.begin();
+        let history_was_active = self.history.is_active();
+        if !history_was_active {
+            self.history.begin();
+        }
         for (offset, layer) in copies.into_iter().enumerate() {
             self.history
                 .insert_layer(&mut self.doc.layers, insert_at + offset, layer);
         }
-        self.history.commit();
+        if !history_was_active {
+            self.history.commit();
+        }
         self.selected_layer = insert_at;
+        self.record_macro_step(macros::Step::DuplicateActive);
     }
     fn install_image_layer(
         &mut self,
@@ -4699,6 +4908,10 @@ impl EfudeApp {
 }
 impl Drop for EfudeApp {
     fn drop(&mut self) {
+        let _ = self.timelapse_worker.sender.send(timelapse::Task::Shutdown);
+        if let Some(worker) = self.timelapse_worker.join.take() {
+            let _ = worker.join();
+        }
         if let (Some(surface), Some(render_state)) = (
             self.gpu_canvas_surface.take(),
             self.gpu_render_state.as_ref(),
@@ -4712,6 +4925,7 @@ impl Drop for EfudeApp {
         if let Some(worker) = self.io_worker.take() {
             let _ = worker.join();
         }
+        self.recovery.finish_cleanly();
     }
 }
 
@@ -4719,6 +4933,10 @@ impl EfudeApp {
     /// One frame of the whole UI (everything `eframe::App::update` does;
     /// tests drive it directly).
     pub(crate) fn update_ui(&mut self, ctx: &egui::Context) {
+        self.poll_timelapse_worker();
+        if self.guide_edit_pending.is_some() && !ctx.input(|input| input.pointer.primary_down()) {
+            self.commit_pending_guide_edit();
+        }
         self.sync_tool_change();
         self.tidy_layers();
         let other_dirty_tabs = self
@@ -4881,6 +5099,25 @@ impl EfudeApp {
                     } else {
                         self.mark_tab_saved(document_id, state_token, &path);
                     }
+                    if let Some(directory) = self.recovery.current_dir() {
+                        let current_token = if same_document {
+                            Some(self.history.state_token())
+                        } else {
+                            self.tabs
+                                .slots
+                                .iter()
+                                .filter_map(|slot| slot.parked.as_ref())
+                                .find(|tab| tab.history.document_id() == document_id)
+                                .map(|tab| tab.history.state_token())
+                        };
+                        let _ = self.io_task_sender.send(IoTask::ClearRecovery {
+                            directory: directory.to_path_buf(),
+                            document_id,
+                            saved_token: (current_token != Some(state_token))
+                                .then_some(state_token),
+                            repaint: ctx.clone(),
+                        });
+                    }
                     let mut close_was_blocked_by_new_changes = false;
                     if self.close_after_save {
                         self.close_after_save = false;
@@ -4904,6 +5141,63 @@ impl EfudeApp {
                             .into();
                     }
                 }
+                IoCompletion::RecoverySaved => {}
+                IoCompletion::Recovered {
+                    snapshot,
+                    metadata,
+                    info,
+                    document,
+                } => {
+                    self.open_document_tab();
+                    self.replace_document(document, None);
+                    self.history.mark_recovered();
+                    let base_name = info
+                        .original_path
+                        .as_deref()
+                        .and_then(std::path::Path::file_stem)
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&info.title);
+                    self.tabs.slots[self.tabs.active].recovered_title = Some(format!(
+                        "{} ({})",
+                        base_name,
+                        self.text("復元", "recovered")
+                    ));
+                    self.recovery.remember_restored(snapshot, metadata);
+                    self.status = self
+                        .text(
+                            "作業を復元しました。別名で保存してください。",
+                            "Work recovered. Save it under a new name.",
+                        )
+                        .into();
+                }
+                IoCompletion::RecoveryFailed {
+                    snapshot,
+                    document_id,
+                    state_token,
+                    message,
+                } => {
+                    let failed_to_save = document_id.is_some();
+                    if let Some(id) = document_id
+                        && self.recovery.queued_tokens.get(&id) == state_token.as_ref()
+                    {
+                        self.recovery.queued_tokens.remove(&id);
+                    }
+                    if let Some(candidate) = self
+                        .recovery
+                        .candidates
+                        .iter_mut()
+                        .find(|candidate| candidate.snapshot == snapshot)
+                    {
+                        candidate.loading = false;
+                        self.recovery.show_dialog = true;
+                    }
+                    self.status = if failed_to_save {
+                        format!("復旧用の自動記録に失敗しました: {message}")
+                    } else {
+                        format!("作業を復元できません: {message}")
+                    };
+                }
+                IoCompletion::RecoveryCleared => {}
                 IoCompletion::Exported {
                     path,
                     format,
@@ -5020,8 +5314,32 @@ impl EfudeApp {
                     self.status = if self.language_english {
                         format!("Reference image: {name}")
                     } else {
-                        format!("参照画像: {name}")
+                        format!("資料ビュー: {name}")
                     };
+                }
+                IoCompletion::GuideLoaded {
+                    document_id,
+                    path,
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("image");
+                    if self.history.document_id() == document_id {
+                        if let Some(guide) =
+                            efude_canvas::GuideImage::fit_to_canvas(width, height, rgba, &self.doc)
+                        {
+                            self.history.set_guide(&mut self.doc, Some(guide));
+                            self.canvas_texture_dirty = true;
+                            self.navigator_texture_dirty = true;
+                            self.status = format!("下絵ガイドを読み込みました: {name}");
+                        }
+                    } else if self.install_guide_in_parked_tab(document_id, width, height, rgba) {
+                        self.status = format!("下絵ガイドを読み込みました: {name}");
+                    }
                 }
                 IoCompletion::FilterApplied {
                     layer_id,
@@ -5208,13 +5526,16 @@ impl EfudeApp {
             }
         }
         if self.last_backup.elapsed() >= efude_io::backup_interval(self.backup_interval_minutes) {
-            if self.history.is_dirty()
-                && let Some(path) = self.doc_path.clone()
-            {
-                self.status = match self.queue_document_save(path, true, ctx) {
-                    Ok(()) => "自動バックアップ中…".into(),
-                    Err(error) => error,
-                };
+            let recovery_result = self.queue_recovery_snapshots(ctx);
+            self.status = match self.queue_dirty_tab_backups(ctx) {
+                Ok(0) => self.status.clone(),
+                Ok(_) => self
+                    .text("自動バックアップ中…", "Creating automatic backups…")
+                    .into(),
+                Err(error) => error,
+            };
+            if let Err(error) = recovery_result {
+                self.status = error;
             }
             self.last_backup = std::time::Instant::now();
         }
@@ -5246,6 +5567,9 @@ impl EfudeApp {
                 .into();
         }
         self.layout_ui(ctx);
+        self.recovery_dialog(ctx);
+        self.timelapse_start_dialog(ctx);
+        self.macro_save_dialog(ctx);
         let english = self.language_english;
         egui::Window::new(if english { "Efude Help" } else { "Efude ヘルプ" })
             .open(&mut self.show_help)
@@ -5284,6 +5608,7 @@ impl EfudeApp {
             }
             ctx.request_repaint();
         }
+        self.capture_timelapse_frame(ctx, false, false);
         if (self.view_rotation, self.flip_x, self.flip_y) != view_transform_at_frame_start {
             // The canvas is transformed when drawn; only a repaint is needed.
             ctx.request_repaint();
@@ -5448,8 +5773,11 @@ mod display;
 mod filters_ui;
 mod icons;
 mod layout;
+mod macros;
 mod panels;
+mod recovery;
 mod tabs;
+mod timelapse;
 mod vector_edit;
 mod vector_tools;
 

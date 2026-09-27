@@ -1,5 +1,6 @@
 # Build output
 /target/
+/work/
 
 # Generated at release time by cargo-about
 /THIRD_PARTY_NOTICES.txt

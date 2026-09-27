@@ -69,7 +69,14 @@ The in-app Help window describes the current shortcuts. Shortcuts can be changed
 - Use **PSD** to exchange raster artwork. PSD cannot represent every Efude property; the export reports properties it cannot preserve. Unsupported PSD structures may be imported as the merged image with a warning.
 - Export a transparent **PNG** or a white-background **JPEG** for flattened images.
 - Efude can periodically back up a saved document. Configure the interval and number of generations in settings. Backups are stored in a `.efude-backups` folder beside the document.
+- Every changed tab, including an unsaved canvas, also gets a separate crash-recovery snapshot at the configured backup interval. After an unexpected exit, the next launch shows thumbnails under **File → Recover work…**. Restored work opens as a new, unsaved tab; save it under a new name. A normal exit removes the current session's recovery snapshots. Recovery data is stored under `%LOCALAPPDATA%\Efude-neo\recovery\`.
 - When working with layers, save to `.efude` regularly. Use PSD as an interchange format, not as the only copy of an editable Efude document.
+
+## Tracing guide, timelapse and macros
+
+- **View → Tracing guide** imports an image beneath the artwork. Adjust its visibility, opacity, position and scale there. The guide is saved in `.efude` but excluded from ordinary PNG, JPEG and PSD exports.
+- **Record → Start timelapse recording…** captures document content after edits. Choose **Include tracing guide in video** before starting; when OFF, every frame excludes the guide even while it stays visible in the editor. **Record → Export video…** writes a 30 fps MJPEG AVI. The JPEG frames stay in `%LOCALAPPDATA%\Efude-neo\timelapse\` for later export. The editor window is never screen-captured.
+- **Record → Start macro recording** records raster-layer creation, duplication, name, visibility, opacity and blend-mode changes. Finish and save it, then run it from the same menu on another document. One Undo reverses the whole replay. Brush strokes and pointer movement are not macro steps.
 
 ## Input and troubleshooting
 
@@ -82,7 +89,7 @@ The in-app Help window describes the current shortcuts. Shortcuts can be changed
 
 Efude is free software. The application (`efude-ui`, `efude-app`) is under the Mozilla Public License 2.0 (`LICENSE-MPL`), and the engine crates under MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). The libraries it uses are listed with their licenses in `THIRD_PARTY_NOTICES.txt`.
 
-The source code is at https://github.com/852wa/Efude. Every release is built from a version tag (for example `v0.1.0`), and the source of that exact version can be downloaded from the release page or from `https://github.com/852wa/Efude/archive/refs/tags/<tag>.zip`. `SOURCE.txt`, next to this guide, names the tag and commit this build was made from, with direct links.
+The Efude-neo source code is at https://github.com/AiWithYou/Efude-neo. It is derived from [852wa's Efude](https://github.com/852wa/Efude).
 
 ## ユーザーガイド
 
@@ -153,7 +160,14 @@ Windows MSIを使うとセットアップウィザードからインストール
 - ラスター画像の受け渡しには **PSD** を使えます。PSDがEfudeの全設定を保持できるわけではありません。書き出し時に保持できない情報が警告されます。未対応構造を含むPSDは、警告を出して統合画像として読み込む場合があります。
 - 透明部分を保つ **PNG**、または白背景の **JPEG** に書き出せます。
 - 保存済みドキュメントは一定間隔で自動バックアップできます。設定で間隔と世代数を変更できます。バックアップはドキュメントと同じ場所の `.efude-backups` フォルダーに作成されます。
+- 未保存のキャンバスも含め、変更のある各タブの復旧データを設定した間隔で別々に保存します。異常終了後の起動時にサムネイルが表示され、「ファイル → 作業の復旧…」からも選べます。復元した作品は未保存の新しいタブで開くので、別名で保存してください。正常終了時には、その実行中に作成した復旧データを削除します。保存先は `%LOCALAPPDATA%\Efude-neo\recovery\` です。
 - レイヤーを含む作品は、`.efude` 形式で定期的に保存してください。編集データの唯一のコピーにPSDだけを使わないでください。
+
+### 下絵ガイド・タイムラプス・マクロ
+
+- 「表示 → 下絵ガイド」から画像を読み込むと、描画の下に表示されます。同じメニューで表示、不透明度、位置、倍率を調整できます。ガイドは `.efude` に保存されますが、通常のPNG・JPEG・PSD書き出しには入りません。
+- 「記録 → タイムラプスの記録を開始…」では、開始前に「下絵ガイドを動画に含める」を選べます。OFFでも編集中は表示され、動画の全フレームからは除かれます。「記録 → 動画を書き出す…」で30fpsのMJPEG AVIを作ります。連番JPEGは `%LOCALAPPDATA%\Efude-neo\timelapse\` に残り、後から再書き出しできます。画面全体の録画はしません。
+- 「記録 → マクロの記録を開始」で、ラスターレイヤーの作成・複製、名前、表示、不透明度、合成モードを記録します。保存後は同じメニューから別の作品で実行できます。実行全体を1回の取り消しで戻せます。ブラシの線やポインター操作は記録しません。
 
 ### 入力とトラブルシューティング
 
@@ -166,4 +180,4 @@ Windows MSIを使うとセットアップウィザードからインストール
 
 Efudeは自由ソフトウェアです。アプリ部分（`efude-ui`・`efude-app`）はMozilla Public License 2.0（`LICENSE-MPL`）、エンジン部分はMIT OR Apache-2.0（`LICENSE-MIT`・`LICENSE-APACHE`）です。使用しているライブラリとそのライセンスは `THIRD_PARTY_NOTICES.txt` にあります。
 
-ソースコードは https://github.com/852wa/Efude で公開しています。各リリースはバージョンのタグ（例: `v0.1.0`）から作られており、そのバージョンのソースはリリースページ、または `https://github.com/852wa/Efude/archive/refs/tags/<タグ>.zip` から入手できます。このガイドと同じ場所にある `SOURCE.txt` に、この配布物を作ったタグとコミット、直接のリンクが書かれています。
+Efude-neoのソースコードは https://github.com/AiWithYou/Efude-neo で公開しています。[852wa氏のEfude](https://github.com/852wa/Efude)から派生したプロジェクトです。

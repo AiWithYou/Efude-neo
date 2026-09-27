@@ -23,8 +23,6 @@ raw-window-handle = "0.6"
 pollster = "0.4"
 wgpu.workspace = true
 egui_dock = { version = "0.16", features = ["serde"] }
-
-[dev-dependencies]
 tempfile.workspace = true
 
 [[bench]]

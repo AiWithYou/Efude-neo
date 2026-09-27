@@ -5,6 +5,115 @@
 use super::*;
 
 impl EfudeApp {
+    pub(crate) fn commit_pending_guide_edit(&mut self) {
+        if let Some(document_id) = self.guide_edit_pending.take()
+            && document_id == self.history.document_id()
+        {
+            self.history.commit();
+        }
+    }
+
+    pub(crate) fn guide_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.set_min_width(240.0);
+        if ui
+            .button(self.text("画像を読み込む…", "Import image…"))
+            .clicked()
+        {
+            self.commit_pending_guide_edit();
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "webp"])
+                .pick_file()
+            {
+                self.status = match self.io_task_sender.send(IoTask::LoadGuide {
+                    document_id: self.history.document_id(),
+                    path,
+                    repaint: ctx.clone(),
+                }) {
+                    Ok(()) => self
+                        .text("下絵ガイドを読み込み中…", "Loading tracing guide…")
+                        .into(),
+                    Err(_) => self
+                        .text("画像読み込みワーカーが停止しました", "Image worker stopped")
+                        .into(),
+                };
+            }
+            ui.close_menu();
+        }
+        if let Some(mut guide) = self.doc.guide.clone() {
+            ui.separator();
+            ui.label(self.text("描画レイヤーの下に表示", "Shown beneath paint layers"));
+            let mut changed = ui
+                .checkbox(&mut guide.visible, self.text("表示", "Visible"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut guide.opacity, 0.0..=1.0)
+                        .text(self.text("不透明度", "Opacity")),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut guide.offset_x)
+                        .speed(1.0)
+                        .prefix("X "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut guide.offset_y)
+                        .speed(1.0)
+                        .prefix("Y "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut guide.scale)
+                        .speed(0.005)
+                        .range(0.01..=100.0)
+                        .prefix(self.text("倍率 ", "Scale ")),
+                )
+                .changed();
+            if changed {
+                if ui.input(|input| input.pointer.primary_down())
+                    && self.guide_edit_pending.is_none()
+                {
+                    self.history.begin();
+                    self.guide_edit_pending = Some(self.history.document_id());
+                }
+                self.history.set_guide(&mut self.doc, Some(guide));
+                self.canvas_texture_dirty = true;
+                self.navigator_texture_dirty = true;
+            }
+            if ui
+                .button(self.text("キャンバスに合わせる", "Fit to canvas"))
+                .clicked()
+            {
+                self.commit_pending_guide_edit();
+                if let Some(mut guide) = self.doc.guide.clone() {
+                    guide.scale = (self.doc.width as f32 / guide.width as f32)
+                        .min(self.doc.height as f32 / guide.height as f32);
+                    guide.offset_x =
+                        (self.doc.width as f32 - guide.width as f32 * guide.scale) / 2.0;
+                    guide.offset_y =
+                        (self.doc.height as f32 - guide.height as f32 * guide.scale) / 2.0;
+                    self.history.set_guide(&mut self.doc, Some(guide));
+                    self.canvas_texture_dirty = true;
+                    self.navigator_texture_dirty = true;
+                }
+            }
+            ui.separator();
+            if ui
+                .button(self.text("下絵ガイドを削除", "Remove tracing guide"))
+                .clicked()
+            {
+                self.commit_pending_guide_edit();
+                self.history.set_guide(&mut self.doc, None);
+                self.canvas_texture_dirty = true;
+                self.navigator_texture_dirty = true;
+                ui.close_menu();
+            }
+        }
+    }
     /// Asks for a file and opens it the way its type needs: Efude
     /// documents and PSD files with their layers, PNG, JPEG, BMP and GIF
     /// images as a one-layer picture.
@@ -116,15 +225,10 @@ impl EfudeApp {
     pub(crate) fn save_as_dialog(&mut self, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Efude", &["efude"])
-            .set_file_name(
-                self.doc_path
-                    .as_deref()
-                    .and_then(std::path::Path::file_name)
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Artwork.efude"),
-            )
+            .set_file_name(self.suggested_save_name())
             .save_file()
         {
+            self.commit_pending_guide_edit();
             self.last_backup = std::time::Instant::now();
             self.status = match self.queue_document_save(path, false, ctx) {
                 Ok(()) => self.text("別名保存中…", "Saving As…").into(),
@@ -197,6 +301,7 @@ impl EfudeApp {
             self.doc.height,
         );
         self.insert_layer_above_selected(layer);
+        self.record_macro_step(macros::Step::NewRaster);
     }
 
     /// File actions: new, open, save and export.
@@ -238,6 +343,12 @@ impl EfudeApp {
             .clicked()
         {
             self.export_dialog(ctx);
+        }
+        if ui
+            .button(self.text("作業の復旧…", "Recover work…"))
+            .clicked()
+        {
+            self.recovery.show_dialog = true;
         }
         ui.separator();
         if ui.button(self.text("環境設定…", "Preferences…")).clicked() {
@@ -2664,7 +2775,7 @@ impl EfudeApp {
             };
         }
         if ui
-            .button(self.text("参照画像を開く", "Open Reference Image"))
+            .button(self.text("資料ビューで画像を開く", "Open image in reference view"))
             .clicked()
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(
@@ -2682,9 +2793,12 @@ impl EfudeApp {
                 repaint: ctx.clone(),
             }) {
                 Ok(()) => self
-                    .text("参照画像を読み込み中…", "Loading reference image…")
+                    .text(
+                        "資料ビューの画像を読み込み中…",
+                        "Loading reference view image…",
+                    )
                     .into(),
-                Err(error) => format!("参照画像の読み込みを開始できません: {error}"),
+                Err(error) => format!("資料ビューの画像を読み込めません: {error}"),
             };
         }
         if self.reference_image.is_some() {
@@ -2692,7 +2806,7 @@ impl EfudeApp {
                 if self.language_english {
                     "Sub View Zoom"
                 } else {
-                    "サブビュー倍率"
+                    "資料ビュー倍率"
                 },
             ));
             ui.add(
@@ -2714,7 +2828,7 @@ impl EfudeApp {
                 );
             }
             if ui
-                .button(self.text("参照画像を閉じる", "Close Reference Image"))
+                .button(self.text("資料ビューの画像を閉じる", "Close reference view image"))
                 .clicked()
             {
                 self.reference_image = None;
@@ -3153,6 +3267,17 @@ impl EfudeApp {
                 .any(|child| child.parent_id == Some(self.doc.layers[i].id));
             let layer_id = self.doc.layers[i].id;
             let property_before = self.doc.layers[i].property_state();
+            let macro_before = if i == self.selected_layer {
+                let layer = &self.doc.layers[i];
+                Some((
+                    layer.name.clone(),
+                    layer.opacity,
+                    layer.visible,
+                    layer.blend,
+                ))
+            } else {
+                None
+            };
             let parent_id = self.doc.layers[i].parent_id;
             let mut descendants = vec![layer_id];
             let mut descendant_cursor = 0;
@@ -3706,6 +3831,31 @@ impl EfudeApp {
             let property_after = self.doc.layers[i].property_state();
             self.history
                 .record_layer_properties(layer_id, property_before, property_after);
+            if let Some((name, opacity, visible, blend)) = macro_before {
+                let layer = &self.doc.layers[i];
+                let mut steps = Vec::new();
+                if name != layer.name {
+                    steps.push(macros::Step::SetName {
+                        name: layer.name.clone(),
+                    });
+                }
+                if opacity != layer.opacity {
+                    steps.push(macros::Step::SetOpacity {
+                        value: layer.opacity,
+                    });
+                }
+                if visible != layer.visible {
+                    steps.push(macros::Step::SetVisibility {
+                        visible: layer.visible,
+                    });
+                }
+                if blend != layer.blend {
+                    steps.push(macros::Step::SetBlend { mode: layer.blend });
+                }
+                for step in steps {
+                    self.record_macro_step(step);
+                }
+            }
             if let Some(j) = move_to {
                 let selected_id = self.doc.layers[self.selected_layer].id;
                 if let Some(new_index) = self.history.move_layer_subtree(&mut self.doc.layers, i, j)

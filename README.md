@@ -2,7 +2,29 @@
   <img src="assets/Efude_sub.png" alt="Efude logo" width="120">
 </p>
 
-<h1 align="center">Efude</h1>
+<h1 align="center">Efude-neo</h1>
+
+Efude-neoは、**852wa氏の[Efude](https://github.com/852wa/Efude)をもとにした派生版**です。元プロジェクトの作者と貢献者に敬意を表します。
+
+## 更新履歴
+
+### v0.2.0 (2026-09-28)
+
+- GPUブラシで、ブラシに追従するグレインを使用したときのCPU描画との差を修正しました。該当する組み合わせはCPU描画へ切り替えます。
+- 複数タブを開いたとき、非表示のタブも自動バックアップの対象にし、未保存の作品も次回起動時に復旧できるようにしました。
+- 下絵ガイド、制作タイムラプス、操作マクロを追加しました。
+
+## 追加機能
+
+- **下絵ガイド**: 「表示 > 下絵ガイド」から画像をキャンバスの描画レイヤーの下へ配置し、不透明度・位置・倍率を変更できます。ガイドは文書に保存され、通常のPNG・JPEG・PSD書き出しには入りません。
+- **制作タイムラプス**: 「記録」メニューから開始し、ガイドを動画へ含めるかを開始時に選べます。OFFでも編集画面にはガイドを表示したまま、動画の全フレームはガイドを除いた描画データから生成します。画面全体は録画しません。完成動画は30fpsのMJPEG AVIです。
+- **操作マクロ**: レイヤーの新規作成・複製・名前・表示・不透明度・合成モードを記録し、別の文書で再生できます。再生は1回のUndoで戻せます。ブラシの線や画面操作は記録対象外です。
+- **作業の復旧**: 保存していないタブも含め、変更のある各タブを定期的に別々の復旧ファイルへ保存します。異常終了後の起動時にサムネイルで選んで復元でき、元の作品ファイルは上書きしません。通常の自動バックアップは保存済み文書の隣に引き続き作成します。
+
+### 記録データの保存先
+
+タイムラプスの連番JPEGは `%LOCALAPPDATA%\Efude-neo\timelapse\` に、作業の復旧データは `%LOCALAPPDATA%\Efude-neo\recovery\` に、マクロは `%APPDATA%\Efude-neo\macros\` に保存します。タイムラプスの記録を終了した後も元のJPEGは残り、「記録 > 以前の記録から動画を書き出す…」から再書き出しできます。AVIが1.9GBを超える場合はJPEGフレームを利用してください。
+
 
 <p align="center">
   <b>An open-source painting and manga app for Windows, written in Rust.</b><br>
@@ -10,22 +32,22 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/852wa/Efude/releases"><b>Download</b></a> ·
+  <a href="https://github.com/AiWithYou/Efude-neo/releases"><b>Releases</b></a> ·
   <a href="docs/USER_GUIDE.md">User Guide</a> ·
   <a href="#日本語">日本語</a>
 </p>
 
 ![Efude: an illustration open on the canvas, with the brush presets, colour wheel and tool settings beside it](docs/images/screenshot.png)
 
-Efude aims for a crisp, responsive drawing feel, a full set of illustration and
-manga tools, and brushes with character.
+Efude-neo builds on Efude's responsive drawing feel, illustration and manga
+tools, and characterful brushes.
 
 > **Public test.** Efude is under active development. Files and settings may
 > change between versions — keep backups of important work.
 
 ## Download
 
-Get the latest build from [Releases](https://github.com/852wa/Efude/releases):
+Check [Efude-neo Releases](https://github.com/AiWithYou/Efude-neo/releases) for builds. If none are available, build from source below. The [original Efude releases](https://github.com/852wa/Efude/releases) are separate from this fork.
 
 - `Efude-<version>-windows-x64.zip` — portable: unzip anywhere and run `efude.exe`.
 - `Efude-<version>-windows-x64.msi` — installer.
@@ -62,11 +84,9 @@ described in [docs/spec](docs/spec). Releases are built by GitHub Actions; see
 
 ## Contributing
 
-- **Bug reports and feature requests** are welcome as
-  [issues](https://github.com/852wa/Efude/issues/new/choose): pick the
-  "Bug report" or "Feature request" form and fill it in.
-- **Pull requests are accepted from invited collaborators only.** To fix or
-  add something, open an issue first; collaborators may be invited from there.
+- **Bug reports and feature requests** for this fork belong in its
+  [issues](https://github.com/AiWithYou/Efude-neo/issues).
+- For code contributions, see [CONTRIBUTING.md](CONTRIBUTING.md).
 - Security problems: report them privately from the Security tab, not in an issue.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for details. Efude is built
@@ -85,14 +105,14 @@ independently, from observed behavior only
 
 ## 日本語
 
-Efude（えふで）は、Rustで作っているWindows向けのオープンソースのお絵かき・漫画制作アプリです。
+Efude-neoは、Rustで作られたWindows向けのオープンソースのお絵かき・漫画制作アプリの派生版です。
 気持ちよく描ける書き味、イラストと漫画のための一通りの機能、個性のあるブラシを目指しています。
 
 > **公開テスト版です。** 開発中のため、バージョンによってファイルや設定が変わることがあります。大切な作品はバックアップを取ってください。
 
 ### ダウンロード
 
-[Releases](https://github.com/852wa/Efude/releases) から最新版を入手できます。
+[Efude-neo の Releases](https://github.com/AiWithYou/Efude-neo/releases) に配布がある場合は、そこから入手できます。現時点で配布がない場合は、下記の手順でソースから起動してください。[元のEfudeの配布](https://github.com/852wa/Efude/releases)はこの派生版とは別です。
 
 - `Efude-<バージョン>-windows-x64.zip` — ポータブル版。好きな場所に展開して `efude.exe` を起動します。
 - `Efude-<バージョン>-windows-x64.msi` — インストーラー。
@@ -122,8 +142,8 @@ cargo run -p efude-app --release
 
 ### 参加するには
 
-- **不具合報告・要望**は [Issue](https://github.com/852wa/Efude/issues/new/choose) で歓迎します。「不具合報告」か「要望」のフォームを選んで記入してください。
-- **プルリクエストは、招待した協力者からのみ受け付けています。** 直したい点や作りたい機能があれば、まず Issue で相談してください。そこから協力者としてお招きすることがあります。
+- **この派生版の不具合報告・要望**は [Efude-neoのIssue](https://github.com/AiWithYou/Efude-neo/issues) に投稿してください。
+- コードの提供については [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
 - セキュリティ上の問題は Issue ではなく、Security タブから非公開で知らせてください。
 
 詳しくは [CONTRIBUTING.md](CONTRIBUTING.md) をご覧ください。Efudeは他製品の挙動の観察だけをもとに独自に作っており（[docs/CLEAN_ROOM.md](docs/CLEAN_ROOM.md)）、コミットには DCO の `Signed-off-by` 行が必要です。

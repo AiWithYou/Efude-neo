@@ -160,6 +160,84 @@ fn v(x: f32, y: f32) -> Vec2 {
 }
 
 #[test]
+fn tracing_guide_is_displayed_under_paint_without_entering_artwork() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(4, 4);
+    app.doc.guide =
+        efude_canvas::GuideImage::fit_to_canvas(4, 4, [255, 0, 255, 255].repeat(16), &app.doc);
+    app.doc.layers[0].pixels.set_pixel(1, 1, [0, 0, 0, 255]);
+    let (width, height, gpu_layers) = app.prepare_gpu_composite_tile(0, 0).unwrap();
+    assert_eq!((width, height, gpu_layers.len()), (4, 4, 2));
+    assert_eq!(&gpu_layers[0].pixels[0..4], &[255, 0, 255, 255]);
+    assert_eq!(
+        &gpu_layers[1].pixels[(256 + 1) * 4..(256 + 1) * 4 + 4],
+        &[0, 0, 0, 255]
+    );
+    assert_eq!(
+        &efude_canvas::composite(&app.doc)[0..4],
+        &[255, 255, 255, 255]
+    );
+    assert_eq!(
+        &efude_canvas::composite_display(&app.doc, 0)[0..4],
+        &[255, 128, 255, 255]
+    );
+}
+
+#[test]
+fn guide_only_edits_do_not_add_timelapse_frames() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(64, 64);
+    app.doc.guide = efude_canvas::GuideImage::fit_to_canvas(
+        64,
+        64,
+        [255, 0, 255, 255].repeat(64 * 64),
+        &app.doc,
+    );
+    let session =
+        efude_io::timelapse::create_session(directory.path(), &app.doc, false, 720).unwrap();
+    let id = app.history.document_id();
+    app.timelapse_sessions.insert(
+        id,
+        timelapse::Recording {
+            session: session.clone(),
+            next_index: 1,
+            frames_written: 0,
+            last_content_revision: app.history.content_revision(),
+            last_capture: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            recording: true,
+            paused: false,
+        },
+    );
+    let ctx = egui::Context::default();
+    app.capture_timelapse_frame(&ctx, true, true);
+    assert_eq!(app.timelapse_sessions[&id].next_index, 2);
+    let mut guide = app.doc.guide.clone().unwrap();
+    guide.opacity = 1.0;
+    app.history.set_guide(&mut app.doc, Some(guide));
+    app.timelapse_sessions.get_mut(&id).unwrap().last_capture -= std::time::Duration::from_secs(2);
+    app.capture_timelapse_frame(&ctx, false, true);
+    assert_eq!(app.timelapse_sessions[&id].next_index, 2);
+    app.history.begin();
+    app.history
+        .record_pixel(&app.doc.layers[0], (4 * 64 + 4) * 4);
+    app.doc.layers[0].pixels.set_pixel(4, 4, [0, 0, 0, 255]);
+    app.history.commit();
+    app.timelapse_sessions.get_mut(&id).unwrap().last_capture = std::time::Instant::now();
+    app.capture_timelapse_frame(&ctx, false, true);
+    assert_eq!(app.timelapse_sessions[&id].next_index, 3);
+    drop(app); // The recording worker flushes its accepted frames on shutdown.
+    assert_eq!(efude_io::timelapse::frame_paths(&session).unwrap().len(), 2);
+    for path in efude_io::timelapse::frame_paths(&session).unwrap() {
+        let pixel = image::open(path).unwrap().to_rgb8().get_pixel(32, 32).0;
+        assert!(
+            pixel.iter().all(|channel| *channel > 245),
+            "guide leaked: {pixel:?}"
+        );
+    }
+}
+
+#[test]
 fn brush_paints_along_the_drag() {
     let mut h = Harness::new(400, 300);
     h.use_tool(Tool::Brush);
@@ -951,6 +1029,64 @@ fn new_canvases_open_in_tabs() {
     h.frames(1);
     assert!(h.app.new_document());
     assert_eq!(h.app.tabs.slots.len(), 1);
+}
+
+#[test]
+fn automatic_backup_covers_parked_and_active_tabs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::new(96, 64);
+    h.app.doc_path = Some(dir.path().join("first.efude"));
+    h.app.history.begin();
+    h.app.history.record_pixel(&h.app.doc.layers[0], 0);
+    h.app.doc.layers[0]
+        .pixels
+        .set_pixel(0, 0, [10, 20, 30, 255]);
+    h.app.history.commit();
+    h.app.canvas_width_input = 96;
+    h.app.canvas_height_input = 64;
+    assert!(h.app.new_document());
+    h.app.doc_path = Some(dir.path().join("second.efude"));
+    h.app.history.begin();
+    h.app.history.record_pixel(&h.app.doc.layers[0], 0);
+    h.app.doc.layers[0]
+        .pixels
+        .set_pixel(0, 0, [40, 50, 60, 255]);
+    h.app.history.commit();
+
+    assert_eq!(h.app.queue_dirty_tab_backups(&h.ctx).unwrap(), 2);
+    drop(h); // The I/O worker completes queued saves before it stops.
+
+    let backup_dir = dir.path().join(".efude-backups");
+    let mut backups = std::fs::read_dir(&backup_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    backups.sort();
+    assert_eq!(backups.len(), 2);
+    let first = backups.iter().find(|path| {
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("first.")
+    });
+    let second = backups.iter().find(|path| {
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("second.")
+    });
+    assert_eq!(
+        efude_io::load(first.unwrap()).unwrap().layers[0]
+            .pixels
+            .pixel(0, 0),
+        [10, 20, 30, 255]
+    );
+    assert_eq!(
+        efude_io::load(second.unwrap()).unwrap().layers[0]
+            .pixels
+            .pixel(0, 0),
+        [40, 50, 60, 255]
+    );
 }
 
 #[test]

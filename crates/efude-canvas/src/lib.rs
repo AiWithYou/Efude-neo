@@ -468,6 +468,7 @@ pub struct Layer {
     pub locked: bool,
     pub clipping: bool,
     pub sketch: bool,
+    /// Used by fill/selection sampling, unrelated to the tracing `Document::guide`.
     pub reference: bool,
     pub blend: BlendMode,
     #[serde(default)]
@@ -568,9 +569,92 @@ pub struct Document {
     pub height: u32,
     pub dpi: f32,
     pub layers: Vec<Layer>,
+    /// A tracing guide, kept outside the paint layer stack and all normal exports.
+    pub guide: Option<GuideImage>,
     /// Document-level data of other components (for example comic page
     /// setup and panels), by key, as JSON text. Saved with the document.
     pub metadata: std::collections::BTreeMap<String, String>,
+}
+
+/// A document-local image shown beneath paint layers while editing. Its RGBA
+/// pixels are shared by snapshots, so recording and asynchronous saves do not
+/// copy the image on the UI thread.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GuideImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub scale: f32,
+    pub opacity: f32,
+    pub visible: bool,
+}
+
+impl PartialEq for GuideImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && Arc::ptr_eq(&self.rgba, &other.rgba)
+            && self.offset_x == other.offset_x
+            && self.offset_y == other.offset_y
+            && self.scale == other.scale
+            && self.opacity == other.opacity
+            && self.visible == other.visible
+    }
+}
+
+impl GuideImage {
+    /// Sample the guide in document coordinates for display or opt-in video.
+    pub fn sample(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        let source_x = ((x as f32 - self.offset_x) / self.scale).floor() as i64;
+        let source_y = ((y as f32 - self.offset_y) / self.scale).floor() as i64;
+        if source_x < 0
+            || source_y < 0
+            || source_x >= i64::from(self.width)
+            || source_y >= i64::from(self.height)
+        {
+            return None;
+        }
+        let index = ((source_y as u32 * self.width + source_x as u32) * 4) as usize;
+        self.rgba.get(index..index + 4)?.try_into().ok()
+    }
+    pub fn fit_to_canvas(
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        canvas: &Document,
+    ) -> Option<Self> {
+        if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+            return None;
+        }
+        let scale = (canvas.width as f32 / width as f32).min(canvas.height as f32 / height as f32);
+        Some(Self {
+            width,
+            height,
+            rgba: Arc::new(rgba),
+            offset_x: (canvas.width as f32 - width as f32 * scale) / 2.0,
+            offset_y: (canvas.height as f32 - height as f32 * scale) / 2.0,
+            scale,
+            opacity: 0.5,
+            visible: true,
+        })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width <= MAX_DOCUMENT_DIMENSION
+            && self.height <= MAX_DOCUMENT_DIMENSION
+            && u64::from(self.width) * u64::from(self.height) <= 16_777_216
+            && self.rgba.len() == self.width as usize * self.height as usize * 4
+            && self.offset_x.is_finite()
+            && self.offset_y.is_finite()
+            && self.scale.is_finite()
+            && self.scale > 0.0
+            && self.opacity.is_finite()
+            && (0.0..=1.0).contains(&self.opacity)
+    }
 }
 /// Where a dragged layer lands, next to a layer of the panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -734,6 +818,7 @@ impl Document {
             height,
             dpi: 300.,
             layers: vec![Layer::new(1, "レイヤー 1", width, height)],
+            guide: None,
             metadata: Default::default(),
         }
     }
@@ -760,6 +845,7 @@ pub struct History {
     undo_states: Vec<u64>,
     redo_states: Vec<u64>,
     document_id: u64,
+    content_revision: u64,
     selection_update: Option<(bool, Vec<u8>)>,
 }
 static HISTORY_STATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -784,6 +870,7 @@ impl Default for History {
             undo_states: Vec::new(),
             redo_states: Vec::new(),
             document_id,
+            content_revision: 0,
             selection_update: None,
         }
     }
@@ -816,6 +903,7 @@ enum HistoryEntry {
         height: u32,
         dpi: f32,
         layers: Vec<Layer>,
+        guide: Option<GuideImage>,
     },
     Properties {
         id: u64,
@@ -846,9 +934,30 @@ enum HistoryEntry {
         before: Option<String>,
         after: Option<String>,
     },
+    Guide(Option<GuideImage>),
 }
 type TileSnapshot = (u64, u8, u32, u32, Option<Arc<Vec<u8>>>);
 impl History {
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+    /// Replace the non-paint guide as one undoable document change.
+    pub fn set_guide(&mut self, doc: &mut Document, guide: Option<GuideImage>) {
+        if doc.guide == guide {
+            return;
+        }
+        let previous = std::mem::replace(&mut doc.guide, guide);
+        if self.active
+            && let Some(HistoryEntry::Guide(original)) = self.pending.last()
+        {
+            if doc.guide == *original {
+                self.pending.pop();
+            }
+            self.full_redraw_pending = true;
+            return;
+        }
+        self.push_entry(HistoryEntry::Guide(previous));
+    }
     pub fn begin(&mut self) {
         self.current.clear();
         self.pending.clear();
@@ -960,6 +1069,17 @@ impl History {
             let entries = std::mem::take(&mut self.pending);
             self.push_undo_entry(HistoryEntry::Batch(entries));
         }
+    }
+    /// Abandons an unfinished transaction without touching Undo, Redo or the
+    /// document state token. Used when a multi-step macro cannot finish.
+    pub fn cancel(&mut self, doc: &mut Document) {
+        self.rollback_active(doc);
+        let entries = std::mem::take(&mut self.pending);
+        for entry in entries.into_iter().rev() {
+            self.apply_history_entry(entry, doc, true);
+        }
+        self.active = false;
+        self.full_redraw_pending = true;
     }
     /// Sets (or removes) a document metadata entry, undoably.
     pub fn set_metadata(&mut self, doc: &mut Document, key: &str, value: Option<String>) {
@@ -1315,6 +1435,9 @@ impl History {
             HistoryEntry::Selection { before, after, .. } => 2usize
                 .saturating_add(before.len())
                 .saturating_add(after.len()),
+            HistoryEntry::Guide(guide) => {
+                128usize.saturating_add(guide.as_ref().map_or(0, |image| image.rgba.len()))
+            }
             _ => postcard::to_allocvec(entry)
                 .map(|serialized| serialized.len())
                 .unwrap_or(usize::MAX),
@@ -1351,6 +1474,9 @@ impl History {
     fn push_undo_entry(&mut self, entry: HistoryEntry) {
         self.clear_redo();
         let changes_document = Self::changes_document(&entry);
+        if Self::changes_artwork(&entry) {
+            self.content_revision = self.content_revision.wrapping_add(1);
+        }
         self.store_undo_entry(entry);
         if changes_document {
             self.current_state =
@@ -1362,6 +1488,15 @@ impl History {
         match entry {
             HistoryEntry::Selection { .. } => false,
             HistoryEntry::Batch(entries) => entries.iter().any(Self::changes_document),
+            _ => true,
+        }
+    }
+    fn changes_artwork(entry: &HistoryEntry) -> bool {
+        match entry {
+            HistoryEntry::Guide(_)
+            | HistoryEntry::Selection { .. }
+            | HistoryEntry::Metadata { .. } => false,
+            HistoryEntry::Batch(entries) => entries.iter().any(Self::changes_artwork),
             _ => true,
         }
     }
@@ -1454,6 +1589,7 @@ impl History {
             height: doc.height,
             dpi: doc.dpi,
             layers: doc.layers.clone(),
+            guide: doc.guide.clone(),
         };
         let offset_x = (width as i64 - doc.width as i64) as i32 / 2;
         let offset_y = (height as i64 - doc.height as i64) as i32 / 2;
@@ -1473,6 +1609,10 @@ impl History {
                     mask, doc.width, doc.height, width, height, offset_x, offset_y, true,
                 ));
             }
+        }
+        if let Some(guide) = &mut doc.guide {
+            guide.offset_x += offset_x as f32;
+            guide.offset_y += offset_y as f32;
         }
         doc.width = width;
         doc.height = height;
@@ -1495,6 +1635,7 @@ impl History {
             height,
             dpi: 300.0,
             layers: std::mem::take(layers),
+            guide: None,
             metadata: Default::default(),
         };
         self.undo_document(&mut doc);
@@ -1503,6 +1644,9 @@ impl History {
     pub fn undo_document(&mut self, doc: &mut Document) {
         self.selection_update = None;
         if let Some(entry) = self.pop_undo_entry() {
+            if Self::changes_artwork(&entry) {
+                self.content_revision = self.content_revision.wrapping_add(1);
+            }
             let reverse = self.apply_history_entry(entry, doc, true);
             Self::collect_history_changes(
                 &reverse,
@@ -1529,6 +1673,7 @@ impl History {
             height,
             dpi: 300.0,
             layers: std::mem::take(layers),
+            guide: None,
             metadata: Default::default(),
         };
         self.redo_document(&mut doc);
@@ -1537,6 +1682,9 @@ impl History {
     pub fn redo_document(&mut self, doc: &mut Document) {
         self.selection_update = None;
         if let Some(entry) = self.pop_redo_entry() {
+            if Self::changes_artwork(&entry) {
+                self.content_revision = self.content_revision.wrapping_add(1);
+            }
             let reverse = self.apply_history_entry(entry, doc, false);
             Self::collect_history_changes(
                 &reverse,
@@ -1576,9 +1724,16 @@ impl History {
     pub fn document_id(&self) -> u64 {
         self.document_id
     }
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
     /// Marks a previously captured state as saved. A later edit remains dirty.
     pub fn mark_saved(&mut self, state_token: u64) {
         self.saved_state = state_token;
+    }
+    /// A recovered snapshot is a new, unsaved document, even before another edit.
+    pub fn mark_recovered(&mut self) {
+        self.saved_state = 0;
     }
     pub fn is_dirty(&self) -> bool {
         self.current_state != self.saved_state
@@ -1613,17 +1768,23 @@ impl History {
                 height,
                 dpi,
                 layers,
+                guide,
             } => {
                 let old_width = std::mem::replace(&mut doc.width, width);
                 let old_height = std::mem::replace(&mut doc.height, height);
                 let old_dpi = std::mem::replace(&mut doc.dpi, dpi);
                 let old_layers = std::mem::replace(&mut doc.layers, layers);
+                let old_guide = std::mem::replace(&mut doc.guide, guide);
                 HistoryEntry::DocumentState {
                     width: old_width,
                     height: old_height,
                     dpi: old_dpi,
                     layers: old_layers,
+                    guide: old_guide,
                 }
+            }
+            HistoryEntry::Guide(guide) => {
+                HistoryEntry::Guide(std::mem::replace(&mut doc.guide, guide))
             }
             HistoryEntry::Tiles(delta) => {
                 let layers = &mut doc.layers;
@@ -1780,7 +1941,12 @@ impl Drop for History {
 }
 
 pub fn composite(doc: &Document) -> Vec<u8> {
-    composite_at(doc, (0, 0), 0)
+    composite_at(doc, (0, 0), 0, false)
+}
+
+/// Composite for a timelapse with the editing guide deliberately included.
+pub fn composite_with_guide(doc: &Document) -> Vec<u8> {
+    composite_at(doc, (0, 0), 0, true)
 }
 
 /// The light square colour of the transparency checkerboard (the other
@@ -1808,7 +1974,7 @@ pub fn backdrop(checker: u32, x: u32, y: u32) -> u8 {
 /// `composite` for the screen: transparent parts show a checkerboard with
 /// squares of `checker` pixels (0: white, as exported).
 pub fn composite_display(doc: &Document, checker: u32) -> Vec<u8> {
-    composite_at(doc, (0, 0), checker)
+    composite_at(doc, (0, 0), checker, true)
 }
 
 /// A layer's storage tile as displayed: tone layers become halftone.
@@ -1841,7 +2007,7 @@ pub fn display_pixel(layer: &Layer, dpi: f32, x: u32, y: u32, pixel: [u8; 4]) ->
     }
 }
 
-fn composite_at(doc: &Document, origin: (u32, u32), checker: u32) -> Vec<u8> {
+fn composite_at(doc: &Document, origin: (u32, u32), checker: u32, include_guide: bool) -> Vec<u8> {
     let mut out = vec![255; (doc.width * doc.height * 4) as usize];
     if checker > 0 {
         for y in 0..doc.height {
@@ -1849,6 +2015,26 @@ fn composite_at(doc: &Document, origin: (u32, u32), checker: u32) -> Vec<u8> {
                 let value = backdrop(checker, origin.0 + x, origin.1 + y);
                 let i = ((y * doc.width + x) * 4) as usize;
                 out[i..i + 3].fill(value);
+            }
+        }
+    }
+    if include_guide
+        && let Some(guide) = &doc.guide
+        && guide.visible
+        && guide.is_valid()
+    {
+        for y in 0..doc.height {
+            for x in 0..doc.width {
+                let Some(sample) = guide.sample(origin.0 + x, origin.1 + y) else {
+                    continue;
+                };
+                let target = ((y * doc.width + x) * 4) as usize;
+                let alpha = sample[3] as f32 / 255.0 * guide.opacity;
+                for channel in 0..3 {
+                    out[target + channel] = (sample[channel] as f32 * alpha
+                        + out[target + channel] as f32 * (1.0 - alpha))
+                        .round() as u8;
+                }
             }
         }
     }
@@ -1962,7 +2148,7 @@ fn composite_at(doc: &Document, origin: (u32, u32), checker: u32) -> Vec<u8> {
 
 /// Recompose one sparse storage tile while preserving the original layer stack semantics.
 pub fn composite_tile(doc: &Document, tile_x: u32, tile_y: u32) -> Option<(u32, u32, Vec<u8>)> {
-    composite_tile_display(doc, tile_x, tile_y, 0)
+    composite_tile_at(doc, tile_x, tile_y, 0, false)
 }
 
 /// `composite_tile` over the display backdrop (see `composite_display`).
@@ -1971,6 +2157,16 @@ pub fn composite_tile_display(
     tile_x: u32,
     tile_y: u32,
     checker: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    composite_tile_at(doc, tile_x, tile_y, checker, true)
+}
+
+fn composite_tile_at(
+    doc: &Document,
+    tile_x: u32,
+    tile_y: u32,
+    checker: u32,
+    include_guide: bool,
 ) -> Option<(u32, u32, Vec<u8>)> {
     let origin_x = tile_x.checked_mul(TILE_SIZE)?;
     let origin_y = tile_y.checked_mul(TILE_SIZE)?;
@@ -1984,6 +2180,7 @@ pub fn composite_tile_display(
         height: tile_height,
         dpi: doc.dpi,
         layers: Vec::with_capacity(doc.layers.len()),
+        guide: doc.guide.clone(),
         metadata: Default::default(),
     };
     for source_layer in &doc.layers {
@@ -2011,7 +2208,7 @@ pub fn composite_tile_display(
     Some((
         tile_width,
         tile_height,
-        composite_at(&tile_doc, (origin_x, origin_y), checker),
+        composite_at(&tile_doc, (origin_x, origin_y), checker, include_guide),
     ))
 }
 
@@ -3453,6 +3650,66 @@ pub fn apply_tone_curve(layer: &mut Layer, points: [f32; 5]) {
         }
     }
     layer.pixels.prune_empty_tiles();
+}
+
+#[cfg(test)]
+mod guide_history_tests {
+    use super::*;
+
+    #[test]
+    fn guide_drag_is_one_undo_step_and_does_not_advance_artwork_revision() {
+        let mut doc = Document::new(16, 16);
+        let mut history = History::default();
+        let guide = GuideImage::fit_to_canvas(2, 2, [255, 0, 255, 255].repeat(4), &doc).unwrap();
+        history.set_guide(&mut doc, Some(guide));
+        let revision = history.content_revision();
+        let opacity_before = doc.guide.as_ref().unwrap().opacity;
+        history.begin();
+        for opacity in [0.6, 0.7, 0.8] {
+            let mut changed = doc.guide.clone().unwrap();
+            changed.opacity = opacity;
+            history.set_guide(&mut doc, Some(changed));
+        }
+        history.commit();
+        assert_eq!(history.content_revision(), revision);
+        history.undo_document(&mut doc);
+        assert_eq!(doc.guide.as_ref().unwrap().opacity, opacity_before);
+        assert_eq!(history.content_revision(), revision);
+        history.redo_document(&mut doc);
+        assert_eq!(doc.guide.as_ref().unwrap().opacity, 0.8);
+        history.undo_document(&mut doc);
+        history.undo_document(&mut doc);
+        assert!(doc.guide.is_none());
+    }
+
+    #[test]
+    fn cancelled_transaction_restores_layers_and_redo() {
+        let mut doc = Document::new(8, 8);
+        let mut history = History::default();
+        history.insert_layer(&mut doc.layers, 1, Layer::new(2, "prior", 8, 8));
+        history.undo_document(&mut doc);
+        assert!(history.can_redo());
+        let state = history.state_token();
+        history.begin();
+        history.insert_layer(&mut doc.layers, 1, Layer::new(3, "temporary", 8, 8));
+        history.cancel(&mut doc);
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(history.state_token(), state);
+        assert!(history.can_redo());
+    }
+
+    #[test]
+    fn canvas_resize_moves_the_guide_with_artwork_and_undo_restores_it() {
+        let mut doc = Document::new(16, 16);
+        doc.guide = GuideImage::fit_to_canvas(8, 8, [255, 0, 255, 255].repeat(64), &doc);
+        let before = doc.guide.as_ref().unwrap().clone();
+        let mut history = History::default();
+        history.resize_document(&mut doc, 20, 18, 300.0).unwrap();
+        assert_eq!(doc.guide.as_ref().unwrap().offset_x, before.offset_x + 2.0);
+        assert_eq!(doc.guide.as_ref().unwrap().offset_y, before.offset_y + 1.0);
+        history.undo_document(&mut doc);
+        assert!(doc.guide.as_ref().unwrap() == &before);
+    }
 }
 
 #[cfg(test)]

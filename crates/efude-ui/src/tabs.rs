@@ -8,8 +8,8 @@ use super::*;
 
 /// Everything that belongs to one open document.
 pub(crate) struct DocumentTab {
-    doc: Document,
-    history: History,
+    pub(crate) doc: Document,
+    pub(crate) history: History,
     selection: Selection,
     selected_layer: usize,
     editing_mask: bool,
@@ -18,7 +18,7 @@ pub(crate) struct DocumentTab {
     view_rotation: f32,
     flip_x: bool,
     flip_y: bool,
-    doc_path: Option<std::path::PathBuf>,
+    pub(crate) doc_path: Option<std::path::PathBuf>,
     symmetry_center: Vec2,
     perspective_points: Vec<(i32, i32)>,
     perspective_selected: usize,
@@ -32,6 +32,7 @@ pub(crate) struct DocumentTab {
 pub(crate) struct TabSlot {
     pub number: u32,
     pub parked: Option<DocumentTab>,
+    pub recovered_title: Option<String>,
 }
 
 /// State of the tab bar.
@@ -50,6 +51,7 @@ impl Tabs {
             slots: vec![TabSlot {
                 number: 1,
                 parked: None,
+                recovered_title: None,
             }],
             active: 0,
             next_number: 2,
@@ -59,7 +61,31 @@ impl Tabs {
 }
 
 impl EfudeApp {
+    pub(crate) fn install_guide_in_parked_tab(
+        &mut self,
+        document_id: u64,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> bool {
+        let Some(tab) = self
+            .tabs
+            .slots
+            .iter_mut()
+            .filter_map(|slot| slot.parked.as_mut())
+            .find(|tab| tab.history.document_id() == document_id)
+        else {
+            return false;
+        };
+        let Some(guide) = efude_canvas::GuideImage::fit_to_canvas(width, height, rgba, &tab.doc)
+        else {
+            return false;
+        };
+        tab.history.set_guide(&mut tab.doc, Some(guide));
+        true
+    }
     fn park_active(&mut self) -> DocumentTab {
+        self.commit_pending_guide_edit();
         let size = (self.doc.width, self.doc.height);
         DocumentTab {
             doc: std::mem::replace(&mut self.doc, Document::new(size.0, size.1)),
@@ -160,6 +186,7 @@ impl EfudeApp {
         self.tabs.slots.push(TabSlot {
             number,
             parked: None,
+            recovered_title: None,
         });
         self.tabs.active = self.tabs.slots.len() - 1;
         self.reset_transient_state();
@@ -208,12 +235,46 @@ impl EfudeApp {
             .collect()
     }
 
+    /// Queues a separate backup snapshot for every changed, named canvas.
+    /// Parked tabs must be included: their documents can remain open without
+    /// becoming active again for the whole editing session.
+    pub(crate) fn queue_dirty_tab_backups(&mut self, ctx: &egui::Context) -> Result<usize, String> {
+        self.commit_pending_guide_edit();
+        let mut queued = 0;
+        for slot in &self.tabs.slots {
+            if let Some(tab) = &slot.parked {
+                if tab.history.is_dirty()
+                    && let Some(path) = &tab.doc_path
+                {
+                    self.io_task_sender
+                        .send(IoTask::Save {
+                            path: path.clone(),
+                            document: tab.doc.clone(),
+                            backup: true,
+                            backup_generations: self.backup_generations,
+                            state_token: tab.history.state_token(),
+                            document_id: tab.history.document_id(),
+                            repaint: ctx.clone(),
+                        })
+                        .map_err(|_| "保存ワーカーへタスクを送信できませんでした".to_string())?;
+                    queued += 1;
+                }
+            } else if self.history.is_dirty()
+                && let Some(path) = &self.doc_path
+            {
+                self.queue_document_save(path.clone(), true, ctx)?;
+                queued += 1;
+            }
+        }
+        Ok(queued)
+    }
+
     /// The tab showing the file at `path`.
     pub(crate) fn tab_with_path(&self, path: &std::path::Path) -> Option<usize> {
         (0..self.tabs.slots.len()).find(|&index| self.tab_path(index).is_some_and(|p| p == path))
     }
 
-    fn tab_title(&self, index: usize) -> String {
+    pub(crate) fn tab_title(&self, index: usize) -> String {
         let path = match &self.tabs.slots[index].parked {
             Some(tab) => tab.doc_path.as_ref(),
             None => self.doc_path.as_ref(),
@@ -221,6 +282,7 @@ impl EfudeApp {
         path.and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
             .map(str::to_owned)
+            .or_else(|| self.tabs.slots[index].recovered_title.clone())
             .unwrap_or_else(|| {
                 let number = self.tabs.slots[index].number;
                 if self.language_english {
@@ -234,6 +296,33 @@ impl EfudeApp {
     /// Closes a tab without asking. The last tab is replaced by a blank
     /// canvas of the same size.
     pub(crate) fn close_tab_now(&mut self, index: usize) {
+        if let Some(slot) = self.tabs.slots.get(index) {
+            let document_id = slot
+                .parked
+                .as_ref()
+                .map_or(self.history.document_id(), |tab| tab.history.document_id());
+            if let Some(directory) = self.recovery.current_dir() {
+                let _ = self.io_task_sender.send(IoTask::ClearRecovery {
+                    directory: directory.to_path_buf(),
+                    document_id,
+                    saved_token: None,
+                    repaint: egui::Context::default(),
+                });
+            }
+            self.recovery.queued_tokens.remove(&document_id);
+            self.timelapse_sessions.remove(&document_id);
+            if self
+                .macro_recording
+                .as_ref()
+                .is_some_and(|recording| recording.document_id == document_id)
+            {
+                self.macro_recording = None;
+                self.show_macro_save = false;
+            }
+        }
+        if index == self.tabs.active {
+            self.commit_pending_guide_edit();
+        }
         if index >= self.tabs.slots.len() {
             return;
         }
@@ -242,6 +331,7 @@ impl EfudeApp {
             self.replace_document(Document::new(width, height), None);
             self.doc.dpi = dpi;
             self.tabs.slots[0].number = self.tabs.next_number;
+            self.tabs.slots[0].recovered_title = None;
             self.tabs.next_number += 1;
             self.reset_transient_state();
             return;
@@ -374,6 +464,42 @@ impl EfudeApp {
 
     /// Closes a tab, asking first when it has unsaved changes.
     pub(crate) fn request_close_tab(&mut self, index: usize) {
+        let Some(slot) = self.tabs.slots.get(index) else {
+            return;
+        };
+        let document_id = slot
+            .parked
+            .as_ref()
+            .map_or(self.history.document_id(), |tab| tab.history.document_id());
+        let has_timelapse = self
+            .timelapse_sessions
+            .get(&document_id)
+            .is_some_and(|session| session.recording);
+        let has_macro = self
+            .macro_recording
+            .as_ref()
+            .is_some_and(|recording| recording.document_id == document_id);
+        if has_timelapse || has_macro {
+            let message = match (has_timelapse, has_macro) {
+                (true, true) => {
+                    "このタブのタイムラプスは終了し、保存前のマクロ記録は破棄されます。タイムラプスの画像は後で動画に書き出せます。閉じますか？"
+                }
+                (true, false) => {
+                    "タイムラプス記録を終了してタブを閉じますか？ 記録画像は後で動画に書き出せます。"
+                }
+                (false, true) => "保存前のマクロ記録を破棄してタブを閉じますか？",
+                (false, false) => unreachable!(),
+            };
+            if rfd::MessageDialog::new()
+                .set_title("記録中のタブ")
+                .set_description(message)
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                != rfd::MessageDialogResult::Ok
+            {
+                return;
+            }
+        }
         if self.tab_is_dirty(index) {
             self.tabs.confirm_close = Some(index);
         } else {
