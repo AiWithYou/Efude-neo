@@ -6,6 +6,10 @@ use efude_canvas::{BlendMode, Document, History, LayerKind, Selection};
 use efude_core::InkPoint;
 use serde::{Deserialize, Serialize};
 enum IoCompletion {
+    BookExportFinished {
+        receipts: Vec<book::SaveReceipt>,
+        result: Result<std::path::PathBuf, String>,
+    },
     Saved {
         path: std::path::PathBuf,
         backup: bool,
@@ -101,6 +105,10 @@ impl IoSender {
 }
 
 enum IoTask {
+    BookExport {
+        request: book::ExportRequest,
+        repaint: egui::Context,
+    },
     Save {
         path: std::path::PathBuf,
         document: Document,
@@ -494,6 +502,8 @@ fn dynamic_source_control(
 struct PersistedSettings {
     #[serde(default)]
     language_english: bool,
+    #[serde(default)]
+    timelapse_ffmpeg: std::path::PathBuf,
     brushes: Vec<Brush>,
     selected_brush: usize,
     /// Brush of the pen, eraser, blur and smudge tools.
@@ -1072,11 +1082,15 @@ pub struct EfudeApp {
     show_timelapse_start: bool,
     timelapse_include_guide: bool,
     timelapse_max_side: u32,
+    timelapse_export: timelapse::ExportState,
+    inspection: inspection::State,
     macro_recording: Option<macros::Recording>,
     saved_macros: Vec<macros::Saved>,
     macro_replaying: bool,
-    macro_name: String,
-    show_macro_save: bool,
+    macro_editor: Option<macros::Editor>,
+    macro_run: Option<macros::RunDialog>,
+    material_import: Option<material_import::Preview>,
+    material_import_undo: Option<material_import::Undo>,
     selection_erase: bool,
     /// GPU painting of opacity-capped strokes, when a GPU is available.
     gpu_cover: Option<efude_gpu::GpuCover>,
@@ -1120,6 +1134,12 @@ impl Default for EfudeApp {
                 while let Ok(task) = task_receiver.recv() {
                     match task {
                         IoTask::Shutdown => break,
+                        IoTask::BookExport { request, repaint } => {
+                            let (receipts, result) = book::execute_export(request);
+                            let _ = completion_sender
+                                .send(IoCompletion::BookExportFinished { receipts, result });
+                            repaint.request_repaint();
+                        }
                         IoTask::LoadEfude { path, repaint } => {
                             let completion = match efude_io::load(&path) {
                                 Ok(document) => IoCompletion::Loaded { path, document },
@@ -1558,11 +1578,15 @@ impl Default for EfudeApp {
             show_timelapse_start: false,
             timelapse_include_guide: false,
             timelapse_max_side: 1080,
+            timelapse_export: Default::default(),
+            inspection: Default::default(),
             macro_recording: None,
             saved_macros: macros::load_saved(),
             macro_replaying: false,
-            macro_name: String::new(),
-            show_macro_save: false,
+            macro_editor: None,
+            macro_run: None,
+            material_import: None,
+            material_import_undo: None,
             selection_erase: false,
             gpu_cover: None,
             gpu_min_pixels: 250_000.0,
@@ -2403,7 +2427,11 @@ impl EfudeApp {
             self.history.commit();
         }
         self.selected_layer = insert_at;
-        self.record_macro_step(macros::Step::DuplicateActive);
+        let created = self.doc.layers[insert_at..insert_at + source_indices.len()]
+            .iter()
+            .map(|layer| layer.id)
+            .collect::<Vec<_>>();
+        self.record_macro_creation(macros::Step::DuplicateActive, root_id, &created);
     }
     fn install_image_layer(
         &mut self,
@@ -2556,6 +2584,7 @@ impl EfudeApp {
                 }
             }
             app.selected_brush = settings.selected_brush.min(app.brushes.len() - 1);
+            app.timelapse_export.ffmpeg = settings.timelapse_ffmpeg;
             app.tool_brushes = settings.tool_brushes;
             // Start with the tool that draws with the remembered brush.
             app.tool = tool_for_brush(app.brushes[app.selected_brush].kind);
@@ -5077,6 +5106,9 @@ impl EfudeApp {
                 .busy
                 .set(self.io_task_sender.busy.get().saturating_sub(1));
             match completion {
+                IoCompletion::BookExportFinished { receipts, result } => {
+                    self.book_export_finished(receipts, result)
+                }
                 IoCompletion::Saved {
                     path, backup: true, ..
                 } => {
@@ -5569,7 +5601,12 @@ impl EfudeApp {
         self.layout_ui(ctx);
         self.recovery_dialog(ctx);
         self.timelapse_start_dialog(ctx);
-        self.macro_save_dialog(ctx);
+        self.timelapse_export_dialog(ctx);
+        self.macro_editor_dialog(ctx);
+        self.macro_run_dialog(ctx);
+        self.brush_import_dialog(ctx);
+        self.book_export_dialog(ctx);
+        self.finishing_check_dialog(ctx);
         let english = self.language_english;
         egui::Window::new(if english { "Efude Help" } else { "Efude ヘルプ" })
             .open(&mut self.show_help)
@@ -5627,6 +5664,7 @@ impl eframe::App for EfudeApp {
             "settings",
             &PersistedSettings {
                 language_english: self.language_english,
+                timelapse_ffmpeg: self.timelapse_export.ffmpeg.clone(),
                 brushes: self.brushes.clone(),
                 selected_brush: self.selected_brush,
                 tool_brushes: self.tool_brushes,
@@ -5772,8 +5810,10 @@ mod comic;
 mod display;
 mod filters_ui;
 mod icons;
+mod inspection;
 mod layout;
 mod macros;
+mod material_import;
 mod panels;
 mod recovery;
 mod tabs;

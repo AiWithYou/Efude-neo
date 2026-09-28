@@ -288,6 +288,11 @@ impl EfudeApp {
 
     /// Adds an empty raster layer above the selected one and selects it.
     pub(crate) fn add_raster_layer(&mut self) {
+        let source_id = self
+            .doc
+            .layers
+            .get(self.selected_layer)
+            .map_or(0, |layer| layer.id);
         let english = self.language_english;
         let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
         let layer = efude_canvas::Layer::new(
@@ -301,7 +306,7 @@ impl EfudeApp {
             self.doc.height,
         );
         self.insert_layer_above_selected(layer);
-        self.record_macro_step(macros::Step::NewRaster);
+        self.record_macro_creation(macros::Step::NewRaster, source_id, &[id]);
     }
 
     /// File actions: new, open, save and export.
@@ -2877,12 +2882,22 @@ impl EfudeApp {
             {
                 self.status = match efude_brush::load_set(&path) {
                     Ok(brushes) => {
-                        self.replace_brushes(brushes);
-                        self.text("ブラシセットを読み込みました", "Brush set imported")
-                            .into()
+                        self.stage_brush_import(brushes, path.display().to_string());
+                        self.text(
+                            "取り込むブラシを確認してください",
+                            "Review the brushes to import",
+                        )
+                        .into()
                     }
                     Err(error) => error.to_string(),
                 };
+            }
+            if self.material_import_undo.is_some()
+                && ui
+                    .button(self.text("直前の取り込みを戻す", "Undo last import"))
+                    .clicked()
+            {
+                self.undo_brush_import();
             }
             if ui
                 .button(self.text("初期ブラシを追加", "Add Default Brushes"))
@@ -3853,7 +3868,7 @@ impl EfudeApp {
                     steps.push(macros::Step::SetBlend { mode: layer.blend });
                 }
                 for step in steps {
-                    self.record_macro_step(step);
+                    self.record_macro_step(step, layer_id);
                 }
             }
             if let Some(j) = move_to {

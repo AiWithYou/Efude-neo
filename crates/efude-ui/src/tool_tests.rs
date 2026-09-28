@@ -8,15 +8,16 @@ use efude_canvas::ToneSettings;
 
 const SCREEN: Vec2 = Vec2::new(1280.0, 820.0);
 
-struct Harness {
-    app: EfudeApp,
+pub(super) struct Harness {
+    pub(super) app: EfudeApp,
     ctx: egui::Context,
     time: f64,
     pointer: Pos2,
+    shapes: Vec<egui::epaint::ClippedShape>,
 }
 
 impl Harness {
-    fn new(width: u32, height: u32) -> Self {
+    pub(super) fn new(width: u32, height: u32) -> Self {
         let mut app = EfudeApp::default();
         app.doc = Document::new(width, height);
         app.navigator_center = Vec2::new(width as f32 / 2.0, height as f32 / 2.0);
@@ -31,6 +32,7 @@ impl Harness {
             ctx,
             time: 0.0,
             pointer: Pos2::new(5.0, 5.0),
+            shapes: Vec::new(),
         };
         harness.frames(3);
         harness
@@ -45,10 +47,10 @@ impl Harness {
             ..Default::default()
         };
         let app = &mut self.app;
-        let _ = self.ctx.run(input, |ctx| app.update_ui(ctx));
+        self.shapes = self.ctx.run(input, |ctx| app.update_ui(ctx)).shapes;
     }
 
-    fn frames(&mut self, n: usize) {
+    pub(super) fn frames(&mut self, n: usize) {
         for _ in 0..n {
             self.frame_with(Vec::new());
         }
@@ -118,6 +120,34 @@ impl Harness {
         self.frames(2);
     }
 
+    fn label_rect(&self, label: &str) -> Option<Rect> {
+        fn find(shape: &egui::epaint::Shape, label: &str) -> Option<Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()))
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| find(shape, label))
+                }
+                _ => None,
+            }
+        }
+        self.shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, label))
+    }
+
+    pub(super) fn click_label(&mut self, label: &str) {
+        let rect = self
+            .label_rect(label)
+            .unwrap_or_else(|| panic!("Label not rendered: {label}"));
+        assert!(
+            Rect::from_min_size(Pos2::ZERO, SCREEN).contains(rect.center()),
+            "Label outside viewport: {label}"
+        );
+        self.click_screen(rect.center());
+    }
+
     fn key(&mut self, key: egui::Key, pressed: bool) {
         self.frame_with(vec![egui::Event::Key {
             key,
@@ -181,6 +211,98 @@ fn tracing_guide_is_displayed_under_paint_without_entering_artwork() {
         &efude_canvas::composite_display(&app.doc, 0)[0..4],
         &[255, 128, 255, 255]
     );
+}
+
+#[test]
+fn finishing_check_ui_reports_candidates_then_invalidates_after_an_edit() {
+    let mut h = Harness::new(32, 32);
+    h.fill_rect(4, 4, 20, 20, [30, 40, 50, 255]);
+    h.app.doc.layers[0].pixels.set_pixel(10, 10, [0; 4]);
+    h.app.doc.layers[0]
+        .pixels
+        .set_pixel(27, 27, [30, 40, 50, 255]);
+    let before = h.app.doc.layers[0].pixels.to_dense();
+    let token = h.app.history.state_token();
+    h.app.open_finishing_check();
+    h.frames(3);
+    h.click_label("チェック");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.label_rect("透明穴 1 · 孤立点 1 · 範囲外 0").is_none()
+        && std::time::Instant::now() < deadline
+    {
+        h.frames(1);
+        std::thread::yield_now();
+    }
+    assert!(h.label_rect("透明穴 1 · 孤立点 1 · 範囲外 0").is_some());
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), before);
+    assert_eq!(h.app.history.state_token(), token);
+    h.app.add_raster_layer();
+    h.frames(3);
+    assert!(
+        h.label_rect("編集されたため、もう一度チェックしてください")
+            .is_some()
+    );
+    assert!(h.label_rect("透明穴 1 · 孤立点 1 · 範囲外 0").is_none());
+}
+
+#[test]
+fn brush_import_ui_stages_then_applies_a_reviewed_append() {
+    let mut h = Harness::new(32, 32);
+    let before = h.app.brushes.clone();
+    let mut brush = before[0].clone();
+    brush.name = "Imported preset".into();
+    brush.size += 7.0;
+    h.app
+        .stage_brush_import(vec![brush.clone()], "Test brush set".into());
+    h.frames(3);
+    assert_eq!(h.app.brushes, before);
+    h.click_label("この内容で取り込む");
+    assert_eq!(h.app.brushes.len(), before.len() + 1);
+    assert_eq!(h.app.brushes.last(), Some(&brush));
+    h.app.undo_brush_import();
+    assert_eq!(h.app.brushes, before);
+}
+
+#[test]
+fn macro_ui_checks_target_runs_and_saves_edited_steps() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut h = Harness::new(32, 32);
+    let definition = macros::Definition {
+        version: 2,
+        name: "UI target test".into(),
+        steps: vec![macros::Command {
+            id: 7,
+            target: macros::Target::Start,
+            step: macros::Step::SetName {
+                name: "Macro layer".into(),
+            },
+        }],
+    };
+    let path = directory.path().join("test.efmacro.json");
+    std::fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    h.app.saved_macros = vec![macros::Saved {
+        path: path.clone(),
+        definition,
+    }];
+    h.frames(3);
+    h.click_label("記録");
+    h.click_label("マクロを実行");
+    h.click_label("UI target test");
+    assert!(h.app.macro_run.is_some());
+    h.click_label("実行");
+    assert_eq!(h.app.doc.layers[0].name, "Macro layer");
+    h.app.history.undo_document(&mut h.app.doc);
+    assert_ne!(h.app.doc.layers[0].name, "Macro layer");
+    h.frames(2);
+    h.click_label("記録");
+    h.click_label("マクロの手順を編集…");
+    h.click_label("UI target test");
+    h.click_label("手順を追加");
+    h.click_label("保存");
+    let edited: macros::Definition = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(edited.steps.len(), 2);
+    assert_eq!(edited.steps[0].id, 7);
+    assert_eq!(edited.steps[1].id, 8);
 }
 
 #[test]
@@ -1017,9 +1139,9 @@ fn new_canvases_open_in_tabs() {
     h.app.switch_tab(1);
     h.frames(2);
     assert!(h.pixel(300, 100)[3] > 150, "second tab kept its stroke");
-    // Closing a tab with changes asks first.
+    // Undo restored the first tab to its initial state; only the second has changes.
     h.app.tabs.confirm_close = None;
-    assert_eq!(h.app.dirty_tabs().len(), 2);
+    assert_eq!(h.app.dirty_tabs(), vec![1]);
     h.app.close_tab_now(1);
     h.frames(2);
     assert_eq!(h.app.tabs.slots.len(), 1);

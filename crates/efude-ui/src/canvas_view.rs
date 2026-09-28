@@ -559,6 +559,7 @@ impl EfudeApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
         self.paint_comic_overlay(&painter, &to_screen);
+        self.paint_finishing_check(&painter, &to_screen);
         self.paint_balloon_overlay(&painter, &to_screen);
         self.paint_vector_overlay(&painter, &to_screen);
         if response.drag_started_by(egui::PointerButton::Primary)

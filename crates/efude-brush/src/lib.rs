@@ -4,7 +4,7 @@ pub mod engine;
 use serde::{Deserialize, Serialize};
 const MAX_BRUSH_TEXTURE_DIMENSION: u32 = 4096;
 const MAX_BRUSH_TEXTURE_PIXELS: usize = 16 * 1024 * 1024;
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Brush {
     pub name: String,
     pub kind: BrushKind,
@@ -166,7 +166,7 @@ fn default_antialias() -> u8 {
 fn default_wet_edge_width() -> f32 {
     6.0
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BrushTip {
     pub width: u32,
     pub height: u32,
@@ -235,7 +235,7 @@ fn default_grain_scale() -> f32 {
 fn default_tip_aspect() -> f32 {
     1.0
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PaintMix {
     #[serde(default)]
     pub blend: f32,
@@ -379,7 +379,7 @@ impl Brush {
         by.clamp(0.0, 1.0).powf(self.pressure_curve.clamp(0.2, 3.0))
     }
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrushKind {
     Pen,

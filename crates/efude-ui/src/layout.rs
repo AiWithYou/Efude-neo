@@ -582,6 +582,12 @@ impl EfudeApp {
                     ui.menu_button(self.text("編集", "Edit"), |ui| {
                         ui.set_min_width(160.0);
                         self.undo_redo_ui(ui, ctx);
+                        if ui
+                            .button(self.text("塗り残し・消し忘れチェック…", "Finishing check…"))
+                            .clicked()
+                        {
+                            self.open_finishing_check();
+                        }
                         ui.separator();
                         let item = |text: &str, keys: &str| {
                             egui::Button::new(text.to_owned()).shortcut_text(keys.to_owned())

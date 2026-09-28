@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Hakoniwa
 pub mod filters;
+pub mod inspection;
 pub mod tone;
 pub mod vector;
 
@@ -1478,11 +1479,11 @@ impl History {
             self.content_revision = self.content_revision.wrapping_add(1);
         }
         self.store_undo_entry(entry);
+        self.undo_states.push(self.current_state);
         if changes_document {
             self.current_state =
                 HISTORY_STATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.undo_states.push(self.current_state);
     }
     fn changes_document(entry: &HistoryEntry) -> bool {
         match entry {
@@ -1692,8 +1693,8 @@ impl History {
                 &mut self.full_redraw_pending,
             );
             self.store_undo_entry(reverse);
-            self.current_state = self.redo_states.pop().unwrap_or(self.current_state);
             self.undo_states.push(self.current_state);
+            self.current_state = self.redo_states.pop().unwrap_or(self.current_state);
         }
     }
     pub fn take_selection_update(&mut self) -> Option<(bool, Vec<u8>)> {
@@ -3655,6 +3656,34 @@ pub fn apply_tone_curve(layer: &mut Layer, points: [f32; 5]) {
 #[cfg(test)]
 mod guide_history_tests {
     use super::*;
+
+    #[test]
+    fn undo_and_redo_restore_saved_state_tokens() {
+        let mut doc = Document::new(8, 8);
+        let mut history = History::default();
+        let initial = history.state_token();
+        history.insert_layer(&mut doc.layers, 1, Layer::new(2, "saved", 8, 8));
+        let saved = history.state_token();
+        history.mark_saved(saved);
+        history.insert_layer(&mut doc.layers, 2, Layer::new(3, "later", 8, 8));
+        let later = history.state_token();
+        assert!(history.is_dirty());
+        history.undo_document(&mut doc);
+        assert_eq!(history.state_token(), saved);
+        assert!(!history.is_dirty());
+        history.undo_document(&mut doc);
+        assert_eq!(history.state_token(), initial);
+        assert!(history.is_dirty());
+        history.redo_document(&mut doc);
+        assert_eq!(history.state_token(), saved);
+        assert!(!history.is_dirty());
+        history.redo_document(&mut doc);
+        assert_eq!(history.state_token(), later);
+        assert!(history.is_dirty());
+        history.undo_document(&mut doc);
+        assert_eq!(history.state_token(), saved);
+        assert!(!history.is_dirty());
+    }
 
     #[test]
     fn guide_drag_is_one_undo_step_and_does_not_advance_artwork_revision() {

@@ -317,7 +317,7 @@ impl EfudeApp {
                 .is_some_and(|recording| recording.document_id == document_id)
             {
                 self.macro_recording = None;
-                self.show_macro_save = false;
+                self.macro_editor = None;
             }
         }
         if index == self.tabs.active {

@@ -11,6 +11,7 @@ use std::{
 };
 
 pub const FRAME_RATE: u32 = 30;
+pub mod video;
 const MAX_AVI_BYTES: u64 = 1_900_000_000;
 
 #[derive(Clone, Debug)]
@@ -118,6 +119,13 @@ pub fn frame_paths(session: &Session) -> Result<Vec<PathBuf>, Box<dyn std::error
         }
     }
     paths.sort();
+    for (index, path) in paths.iter().enumerate() {
+        if path.file_name().and_then(|name| name.to_str())
+            != Some(format!("frame_{:08}.jpg", index + 1).as_str())
+        {
+            return Err("記録フレームに欠落があります。記録フォルダーを確認してください".into());
+        }
+    }
     Ok(paths)
 }
 
@@ -204,12 +212,26 @@ fn begin_list(out: &mut File, name: &[u8; 4]) -> std::io::Result<u64> {
 /// kept so an interrupted export can be retried without losing the recording.
 pub fn export_avi(session: &Session, path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
     let frames = frame_paths(session)?;
+    export_avi_frames(session, path, &frames, None, None)
+}
+
+pub fn export_avi_frames(
+    session: &Session,
+    path: &Path,
+    frames: &[PathBuf],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<&std::sync::atomic::AtomicU32>,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
     if frames.is_empty() {
         return Err("timelapse contains no frames".into());
     }
     let mut sizes = Vec::with_capacity(frames.len());
     let mut expected_bytes = 512u64 + frames.len() as u64 * 24;
-    for frame in &frames {
+    for frame in frames {
+        if cancelled() {
+            return Err("書き出しを中止しました".into());
+        }
         let size = frame.metadata()?.len();
         if !(4..=64 * 1024 * 1024).contains(&size) {
             return Err("invalid timelapse JPEG size".into());
@@ -289,7 +311,10 @@ pub fn export_avi(session: &Session, path: &Path) -> Result<u32, Box<dyn std::er
     end_chunk(&mut out, hdrl)?;
     let movi = begin_list(&mut out, b"movi")?;
     let mut index = Vec::with_capacity(frames.len());
-    for (path, size) in frames.iter().zip(sizes) {
+    for (frame_index, (path, size)) in frames.iter().zip(sizes).enumerate() {
+        if cancelled() {
+            return Err("書き出しを中止しました".into());
+        }
         let chunk_start = out.stream_position()?;
         let bytes = fs::read(path)?;
         if bytes.len() != size as usize
@@ -298,12 +323,19 @@ pub fn export_avi(session: &Session, path: &Path) -> Result<u32, Box<dyn std::er
         {
             return Err(format!("invalid or incomplete JPEG frame: {}", path.display()).into());
         }
+        video::read_frame(session, path)?;
         let offset =
             u32::try_from(chunk_start - movi - 8).map_err(|_| "AVI index offset overflow")?;
         let chunk = begin_chunk(&mut out, b"00dc")?;
         out.write_all(&bytes)?;
         end_chunk(&mut out, chunk)?;
         index.push((offset, size));
+        if let Some(progress) = progress {
+            progress.store(
+                (frame_index + 1) as u32,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
     end_chunk(&mut out, movi)?;
     let idx1 = begin_chunk(&mut out, b"idx1")?;
@@ -317,6 +349,9 @@ pub fn export_avi(session: &Session, path: &Path) -> Result<u32, Box<dyn std::er
     end_chunk(&mut out, riff)?;
     out.sync_all()?;
     drop(out);
+    if cancelled() {
+        return Err("書き出しを中止しました".into());
+    }
     temp.persist(path)?;
     Ok(frames.len() as u32)
 }
