@@ -8,6 +8,14 @@ Efude-neoは、**852wa氏の[Efude](https://github.com/852wa/Efude)をもとに�
 
 ## 更新履歴
 
+### v0.3.0 (2026-09-28)
+
+- 塗り残し・消し忘れチェックを追加。小さな透明穴、孤立した点、仕上がり範囲外の描画を強調して確認できます。
+- タイムラプスのMP4出力と、仕上がり時間・完成画像の静止時間・動画サイズの指定に対応しました。
+- マクロの対象レイヤー指定と、手順の追加・削除・並べ替え・値の編集を追加しました。
+- ブラシセットの取り込み前に、重複と同名ブラシの扱いを確認できるようにしました。初期動作は今のブラシへの追加です。
+- 漫画の一括PNG出力で、全タブの未保存内容と既存PNGを確認できるようにしました。保存・書き出し失敗時の復元も改善しました。
+
 ### v0.2.0 (2026-09-28)
 
 - GPUブラシで、ブラシに追従するグレインを使用したときのCPU描画との差を修正しました。該当する組み合わせはCPU描画へ切り替えます。
@@ -17,8 +25,10 @@ Efude-neoは、**852wa氏の[Efude](https://github.com/852wa/Efude)をもとに�
 ## 追加機能
 
 - **下絵ガイド**: 「表示 > 下絵ガイド」から画像をキャンバスの描画レイヤーの下へ配置し、不透明度・位置・倍率を変更できます。ガイドは文書に保存され、通常のPNG・JPEG・PSD書き出しには入りません。
-- **制作タイムラプス**: 「記録」メニューから開始し、ガイドを動画へ含めるかを開始時に選べます。OFFでも編集画面にはガイドを表示したまま、動画の全フレームはガイドを除いた描画データから生成します。画面全体は録画しません。完成動画は30fpsのMJPEG AVIです。
-- **操作マクロ**: レイヤーの新規作成・複製・名前・表示・不透明度・合成モードを記録し、別の文書で再生できます。再生は1回のUndoで戻せます。ブラシの線や画面操作は記録対象外です。
+- **塗り残し・消し忘れチェック**: 「編集」メニューから対象レイヤーと仕上がり範囲を選び、透明穴・孤立点・範囲外の候補を強調します。作品の画素は変更せず、候補を押して拡大確認できます。
+- **制作タイムラプス**: 「記録」メニューから開始し、ガイドを動画へ含めるかを開始時に選べます。OFFでも編集中はガイドを表示でき、動画からは除きます。MP4は1〜600秒の仕上がり時間（完成画像の静止時間を含む）と動画サイズ・収め方を指定できます。MP4・MJPEG AVIとも30fpsです。
+- **操作マクロ**: レイヤーの新規作成・複製・名前・表示・不透明度・合成モードを記録し、対象レイヤーと手順を編集して別の文書で再生できます。対象不足や同名レイヤーは実行前に確認し、再生は1回のUndoで戻せます。ブラシの線や画面操作は記録対象外です。
+- **取り込み・一括出力の確認**: ブラシセットは適用前に重複・同名の扱いを確認でき、直前の取り込みを戻せます。漫画の一括PNGは未保存のページと同名PNGを確認し、現在の内容を使うか、原稿を保存してから出力するかを選べます。
 - **作業の復旧**: 保存していないタブも含め、変更のある各タブを定期的に別々の復旧ファイルへ保存します。異常終了後の起動時にサムネイルで選んで復元でき、元の作品ファイルは上書きしません。通常の自動バックアップは保存済み文書の隣に引き続き作成します。
 
 ### 記録データの保存先
@@ -47,10 +57,13 @@ tools, and characterful brushes.
 
 ## Download
 
-Check [Efude-neo Releases](https://github.com/AiWithYou/Efude-neo/releases) for builds. If none are available, build from source below. The [original Efude releases](https://github.com/852wa/Efude/releases) are separate from this fork.
+Download the Windows build from [Efude-neo Releases](https://github.com/AiWithYou/Efude-neo/releases/latest). The [original Efude releases](https://github.com/852wa/Efude/releases) are separate from this fork.
 
-- `Efude-<version>-windows-x64.zip` — portable: unzip anywhere and run `efude.exe`.
-- `Efude-<version>-windows-x64.msi` — installer.
+- `Efude-v<version>-windows-x64.zip` — portable: unzip anywhere and run `efude.exe`.
+- `Efude-v<version>-windows-x64.msi` — installer.
+
+MP4 timelapse export needs FFmpeg with `libx264`, installed separately. Choose its executable in the export dialog, or use FFmpeg on PATH. AVI export needs no FFmpeg.
+Macros saved by 0.3, including old macros you edit and save, cannot be read by 0.2. Old macros can still be opened in 0.3.
 
 Windows 10 or 11 (64-bit). A pen tablet works through Windows Ink or WinTab.
 The builds are not code-signed yet, so Windows SmartScreen may warn on first
@@ -70,7 +83,7 @@ See the [User Guide](docs/USER_GUIDE.md) for how to use it.
 
 ## Build from source
 
-Requires the latest stable Rust.
+Requires Rust 1.95 or later.
 
 ```powershell
 cargo run -p efude-app --release
@@ -112,10 +125,13 @@ Efude-neoは、Rustで作られたWindows向けのオープンソースのお絵
 
 ### ダウンロード
 
-[Efude-neo の Releases](https://github.com/AiWithYou/Efude-neo/releases) に配布がある場合は、そこから入手できます。現時点で配布がない場合は、下記の手順でソースから起動してください。[元のEfudeの配布](https://github.com/852wa/Efude/releases)はこの派生版とは別です。
+[Efude-neo の Releases](https://github.com/AiWithYou/Efude-neo/releases/latest) からWindows版をダウンロードできます。[元のEfudeの配布](https://github.com/852wa/Efude/releases)はこの派生版とは別です。
 
-- `Efude-<バージョン>-windows-x64.zip` — ポータブル版。好きな場所に展開して `efude.exe` を起動します。
-- `Efude-<バージョン>-windows-x64.msi` — インストーラー。
+- `Efude-v<バージョン>-windows-x64.zip` — ポータブル版。好きな場所に展開して `efude.exe` を起動します。
+- `Efude-v<バージョン>-windows-x64.msi` — インストーラー。
+
+MP4のタイムラプス出力には、`libx264`を含むFFmpegが別途必要です。書き出し画面で実行ファイルを指定するか、PATHにあるFFmpegを使います。AVIはFFmpeg不要です。
+0.3で保存したマクロ（旧マクロを編集して保存したものを含む）は0.2では読めません。旧マクロは0.3でも読み込めます。
 
 Windows 10 / 11（64ビット）。ペンタブレットは Windows Ink または WinTab で使えます。
 まだコード署名をしていないため、初回起動時に Windows SmartScreen の警告が出ることがあります（「詳細情報」→「実行」）。
@@ -134,7 +150,7 @@ Windows 10 / 11（64ビット）。ペンタブレットは Windows Ink また�
 
 ### ソースからのビルド
 
-最新の安定版Rustが必要です。
+Rust 1.95以降が必要です。
 
 ```powershell
 cargo run -p efude-app --release

@@ -1,4 +1,5 @@
 <!-- SPDX-FileCopyrightText: 2026 Hakoniwa -->
+<!-- SPDX-FileCopyrightText: 2026 AiWithYou -->
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 
 # Releasing Efude
@@ -8,36 +9,50 @@ Releases are built and published by the `CI` workflow
 
 ## Steps
 
-1. Set the version in the root `Cargo.toml` (`[workspace.package] version`,
-   three numbers such as `0.1.0`; the MSI installer needs this form).
-2. Commit and push, and wait until the `CI` run for that commit is green.
-3. Create and push the tag, for example `v0.1.0`:
+1. Set the version in the root `Cargo.toml` (`[workspace.package] version`
+   and every internal `[workspace.dependencies]` version), using three
+   numbers such as `0.3.0`; the MSI installer needs this form. Run
+   `cargo build --release -p efude-app` to update `Cargo.lock`,
+   and include its workspace package version changes in the commit.
+2. Commit with a DCO sign-off and push, and wait until the `CI` run for that
+   commit is green. If no run starts, use `gh workflow run CI --ref main`
+   and check that the run's head SHA matches the commit being released.
+3. Create and push the tag, for example `v0.3.0`:
 
    ```sh
-   git tag -a v0.1.0 -m "Efude v0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.3.0 -m "Efude v0.3.0"
+   git push origin v0.3.0
    ```
 
    If the fork shows no Actions run after the tag push, start the same CI
-   workflow manually on that tag with `gh workflow run CI --ref v0.1.0`.
+   workflow manually on that tag with `gh workflow run CI --ref v0.3.0`.
    Check that its Windows build and release jobs succeed before announcing
    the download.
 
    The maintainer's local `release.bat` (not in the repository) does the same
    after checking that everything is committed and pushed.
 4. The tag's CI run builds on Windows, then the `release` job publishes a
-   GitHub Release named `Efude v0.1.0` with:
-   - `Efude-v0.1.0-windows-x64.zip` — portable build (`efude.exe`, license
+   GitHub Release named `Efude v0.3.0` with:
+   - `Efude-v0.3.0-windows-x64.zip` — portable build (`efude.exe`, license
      files, third-party notices and the user guide),
-   - `Efude-v0.1.0-windows-x64.msi` — installer,
+   - `Efude-v0.3.0-windows-x64.msi` — installer,
    - `THIRD_PARTY_NOTICES.txt`.
 
    Release notes are generated from the commits since the previous tag; edit
    them on the release page if needed.
 
-Tags with a suffix (`v0.2.0-beta.1`) are published as pre-releases. A failed
-release can be retried by deleting the release and the tag on GitHub, fixing
-the problem, and pushing the tag again.
+Tags with a suffix (`v0.3.0-beta.1`) are published as pre-releases. If a run
+fails without changing the source, rerun the failed jobs. If a source change
+is needed after a tag has been published, publish a new patch version.
+Keep published version tags fixed.
+
+Before announcing a release, download its ZIP and MSI from GitHub. Check
+the executable's FileVersion/ProductVersion, the MSI ProductVersion, the
+source commit in `SOURCE.txt`, and the bundled user guide. Keep the MSI
+UpgradeCode stable so existing installations can upgrade. Write concise
+user-facing release notes, including changed file compatibility and any
+separately installed requirements. FFmpeg is not bundled; MP4 export needs
+an FFmpeg build with `libx264`, while AVI works without it.
 
 ## Publishing the engine crates to crates.io
 

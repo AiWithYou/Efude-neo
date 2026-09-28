@@ -1,4 +1,5 @@
 <!-- SPDX-FileCopyrightText: 2026 Hakoniwa -->
+<!-- SPDX-FileCopyrightText: 2026 AiWithYou -->
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 
 # Efude User Guide
@@ -41,7 +42,8 @@ The in-app Help window describes the current shortcuts. Shortcuts can be changed
 - Each brush has its own grain. The grain **Template** list offers four seamless textures (clouds, canvas weave, watercolor paper, chalk). **Grain position** is **Fixed to canvas** (the texture stays put like paper), **Fixed, turned each stroke** (fixed while you draw, but every new stroke turns it by a random angle so layered strokes do not repeat the same pattern), or **Follows the brush** (the texture moves with every dab, like a stamp).
 - The selection outline is drawn as moving black-and-white dashes. Moving a selection with the move tool carries only the selected pixels: whatever it passes over or lands on stays where it is (the moved pixels are laid on top).
 - Common shortcuts: Ctrl+A select all, Ctrl+D deselect, Ctrl+Shift+I invert selection, Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste (also images from other apps), Ctrl+Z undo, Ctrl+Y or Ctrl+Shift+Z redo, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+N new, Ctrl+O open, Ctrl+W close tab, Ctrl+Tab next tab, Ctrl+Shift+N new layer, Ctrl+J duplicate layer.
-- Brush presets are laid out in columns of ten, as many columns as the panel is wide. Each preset is its own brush: rename it from its right-click menu, the **Name** field of Brush Settings, or **Name** in the Tool panel, and set it up as you like. **Export Brush Set…** (brush panel, Import/Export) saves all presets in one `.efudebrushes` file; placed at `assets/brushes/default.efudebrushes` it becomes the presets of a new installation. **Add Default Brushes** adds one column of default brushes and keeps yours; **Import Brush Set…** and **Restore Default Presets** replace the presets.
+- Brush presets are laid out in columns of ten, as many columns as the panel is wide. Each preset is its own brush: rename it from its right-click menu, the **Name** field of Brush Settings, or **Name** in the Tool panel, and set it up as you like. **Export Brush Set…** (brush panel, Import/Export) saves all presets in one `.efudebrushes` file; placed at `assets/brushes/default.efudebrushes` it becomes the presets of a new installation. **Add Default Brushes** adds one column of default brushes and keeps yours; **Restore Default Presets** replaces the presets.
+- **Import Brush Set…** opens a review before changing your brushes. It adds brushes by default, skips identical content, and lets you rename a conflicting brush, keep the existing one, or replace it. Select individual brushes or choose to replace the entire set; check the counts before applying. **Undo last import** restores the previous set while keeping later size and selection changes. If you edited brush content afterward, restoration stops so that edit is preserved.
 - The dotted circle next to the Help menu deletes all layers, leaving one empty layer; Undo brings them back.
 - Ctrl and + (on Japanese keyboards also Ctrl and the ";+" key, and the keypad +) zoom the canvas in, Ctrl − zooms out, Ctrl 0 fits it.
 - The initial layout has the layer and brush panels as tabs on the right, with the color and tool panels side by side below them.
@@ -60,7 +62,8 @@ The in-app Help window describes the current shortcuts. Shortcuts can be changed
 - **Tone Fill…** adds a screentone layer over the selection, else the current panel, else the page, with a density, lines per inch, angle, dot shape (round, square, diamond, line, cross, noise), and colour. A tone layer's pixels are its density: paint or erase on it in grey to change where and how dark the dots are. Its settings can be changed at any time in the layer panel; **Layer to Tone** turns any layer into a tone. Tones are flattened to dots in PSD export.
 - **Focus Lines…** and **Speed Lines…** draw effect lines in the current colour on a new layer, fitting the selection, current panel, or inner frame. Adjust count, centre, randomness, width, taper, and bundles, then **Redraw** or **New Arrangement**.
 - **Balloons and text**: the Balloon tool (tool bar, bottom) drags out a speech balloon, or a click makes one sized to its text; the Text tool places plain text. The editor window takes the text (vertical or horizontal), font (any installed font), size in points, spacing, colours, the shape (ellipse, rounded box, cloud, spiky, none), outline width, fill, and tails. Drag a balloon to move it, its corner square to resize it, a tail's circle to move the tip; Ctrl-drag from a balloon pulls out a new tail. **Join Overlapping Balloon** puts two balloons on one layer so their outlines merge.
-- **Books**: **Manga → Book (Pages)…** creates a folder of page files with the current page setup (sides alternate with the binding), or opens an existing `.efudebook`. It shows the pages as spreads (click one to open it in a tab), lets you add, reorder and remove pages, sets page numbers, and exports every page or spread as PNG: trim only, with bleed, or with crop marks; colour, grey, or black and white. Save open pages first: export reads the saved files.
+- **Books**: **Manga → Book (Pages)…** creates a folder of page files with the current page setup (sides alternate with the binding), or opens an existing `.efudebook`. It shows the pages as spreads (click one to open it in a tab), lets you add, reorder and remove pages, sets page numbers, and exports every page or spread as PNG: trim only, with bleed, or with crop marks; colour, grey, or black and white.
+- Book export reviews unsaved pages in every open tab and existing PNGs. Choose either the current contents without saving the originals, or save all changed pages before export. Closed pages use their saved files. Confirm replacement of the listed PNGs. If a page or output changes after review, refresh the review. A save failure stops PNG export; a replacement failure restores earlier outputs where possible and reports the backup location if restoration fails.
 
 ## Save, export, and backups
 
@@ -72,11 +75,17 @@ The in-app Help window describes the current shortcuts. Shortcuts can be changed
 - Every changed tab, including an unsaved canvas, also gets a separate crash-recovery snapshot at the configured backup interval. After an unexpected exit, the next launch shows thumbnails under **File → Recover work…**. Restored work opens as a new, unsaved tab; save it under a new name. A normal exit removes the current session's recovery snapshots. Recovery data is stored under `%LOCALAPPDATA%\Efude-neo\recovery\`.
 - When working with layers, save to `.efude` regularly. Use PSD as an interchange format, not as the only copy of an editable Efude document.
 
+## Finishing check
+
+**Edit → Finishing check…** highlights small transparent holes, isolated marks and drawing outside the chosen finishing area. Select the drawing layers and choose the whole canvas, manga trim or a custom rectangle. Adjust the transparency threshold and maximum hole/mark areas, then run the check. Exclude opaque background layers when looking for holes. Click a candidate to zoom in; ignore intentional dots or bleed. The artwork and Undo history are unchanged. After editing, run the check again.
+
 ## Tracing guide, timelapse and macros
 
 - **View → Tracing guide** imports an image beneath the artwork. Adjust its visibility, opacity, position and scale there. The guide is saved in `.efude` but excluded from ordinary PNG, JPEG and PSD exports.
-- **Record → Start timelapse recording…** captures document content after edits. Choose **Include tracing guide in video** before starting; when OFF, every frame excludes the guide even while it stays visible in the editor. **Record → Export video…** writes a 30 fps MJPEG AVI. The JPEG frames stay in `%LOCALAPPDATA%\Efude-neo\timelapse\` for later export. The editor window is never screen-captured.
-- **Record → Start macro recording** records raster-layer creation, duplication, name, visibility, opacity and blend-mode changes. Finish and save it, then run it from the same menu on another document. One Undo reverses the whole replay. Brush strokes and pointer movement are not macro steps.
+- **Record → Start timelapse recording…** captures document content after edits. Choose **Include tracing guide in video** before starting; when OFF, every frame excludes the guide even while it stays visible in the editor. **Record → Export video…** writes MP4 or MJPEG AVI at 30 fps. The JPEG frames stay in `%LOCALAPPDATA%\Efude-neo\timelapse\`; **Export video from previous recording…** lets you reuse them. The editor window is never screen-captured.
+- MP4 uses H.264 and a duration of 1–600 seconds, including the final image hold. For example, 30 seconds with a 2-second hold gives 28 seconds of drawing and 2 seconds of the finished picture. Choose the size and either fit the whole picture with white margins or crop from the centre; check the preview before exporting. MP4 needs a separately installed FFmpeg with `libx264`: use FFmpeg on PATH or choose its executable in the export dialog. FFmpeg is not bundled. AVI needs no FFmpeg and uses the recording's dimensions at 30 fps; duration and cropping controls apply only to MP4. Export can be cancelled; a failed or cancelled export keeps any existing destination file.
+- **Record → Start macro recording** records raster-layer creation, duplication, name, visibility, opacity and blend-mode changes. **Edit macro steps…** adds, removes, reorders and edits steps. Target the starting layer, the currently selected layer, a named layer, or a layer created by an earlier step. Check layer mappings before running; missing or duplicate names require a choice. One Undo reverses the whole replay, and a failed replay rolls back all its steps. Brush strokes and pointer movement are not macro steps.
+- Old version 1 macros keep their original selection-based behaviour when opened. Saving a macro in 0.3 writes version 2, which 0.2 cannot read. To keep the old file for use in 0.2, choose **Save as another macro**. Macros are stored in `%APPDATA%\Efude-neo\macros\`.
 
 ## Input and troubleshooting
 
@@ -132,7 +141,8 @@ Windows MSIを使うとセットアップウィザードからインストール
 - グレインはブラシごとの設定です。「テンプレート」から継ぎ目のない4種類の模様（雲・布目・水彩紙・チョーク）を選べます。「グレインの位置」は「キャンバスに固定」（紙の目のように模様が動かない）、「固定・描くたびに回転」（描いている間は固定し、線を引くたびに模様の向きがランダムに変わるので重ね塗りで同じ模様が目立たない）、「ブラシに追従」（一打ごとに模様がブラシと動くスタンプ風）から選びます。
 - 選択範囲の境界は白黒の動く破線で表示されます。移動ツールで選択範囲を動かすと、選んだ部分だけが移動し、通り道や移動先にある色は引きずられず、そのまま残ります（移動した部分がその上に重なります）。
 - 一般的なショートカット: Ctrl+A すべてを選択、Ctrl+D 選択解除、Ctrl+Shift+I 選択範囲を反転、Ctrl+C／Ctrl+X／Ctrl+V コピー・切り取り・貼り付け（他のアプリの画像も貼り付け可）、Ctrl+Z 取り消し、Ctrl+Y または Ctrl+Shift+Z やり直し、Ctrl+S 保存、Ctrl+Shift+S 別名で保存、Ctrl+N 新規、Ctrl+O 開く、Ctrl+W タブを閉じる、Ctrl+Tab 次のタブ、Ctrl+Shift+N 新規レイヤー、Ctrl+J レイヤーを複製。
-- ブラシプリセットは10個ずつの列で並び、パネルの幅に入るだけ列が増えます。プリセットはそれぞれ独立したブラシです。右クリックメニューの「名前を変更…」、ブラシの詳細設定の「名前」、ツールパネルの「名前」で名前を付け、自由に設定できます。ブラシパネルの「読み書き」にある「ブラシセットを書き出し…」でプリセット一式を `.efudebrushes` ファイルに保存でき、これを `assets/brushes/default.efudebrushes` に置くと新しくインストールしたときの初期プリセットになります。「初期ブラシを追加」は今のブラシを残したまま初期ブラシを1列追加します。「ブラシセットを読み込み…」「初期プリセットに戻す」はプリセットを置き換えます。
+- ブラシプリセットは10個ずつの列で並び、パネルの幅に入るだけ列が増えます。プリセットはそれぞれ独立したブラシです。右クリックメニューの「名前を変更…」、ブラシの詳細設定の「名前」、ツールパネルの「名前」で名前を付け、自由に設定できます。ブラシパネルの「読み書き」にある「ブラシセットを書き出し…」でプリセット一式を `.efudebrushes` ファイルに保存でき、これを `assets/brushes/default.efudebrushes` に置くと新しくインストールしたときの初期プリセットになります。「初期ブラシを追加」は今のブラシを残したまま初期ブラシを1列追加します。「初期プリセットに戻す」はプリセットを置き換えます。
+- 「ブラシセットを読み込み…」では適用前に確認します。初期動作は今のブラシへの追加で、同じ内容は省き、同名で内容が違う場合は別名で追加・今のものを残す・置換から選べます。個別に選ぶかセット全体を置き換えるかを指定し、本数を確認して適用します。「直前の取り込みを戻す」で元のセットに戻せます。後から変えたサイズ・選択は保ちますが、ブラシ内容を編集した場合はその編集を守るため復元を止めます。
 - ヘルプの横の点線の丸は「レイヤー全削除」です。空のレイヤーを1枚残してすべて削除します（元に戻すで戻せます）。
 - Ctrl＋＋（日本語キーボードでは Ctrl＋「;+」キー、テンキーの＋も可）で拡大、Ctrl＋−で縮小、Ctrl＋0で全体表示します。
 - 初期配置では、右側にレイヤーとブラシのタブ、その下にカラーとツールのパネルが横に並びます。
@@ -151,7 +161,8 @@ Windows MSIを使うとセットアップウィザードからインストール
 - 「トーンを貼る…」で、選択範囲（なければ選んでいるコマ、なければページ全体）にトーンレイヤーを作ります。濃度、線数、角度、網点の形（円・四角・ひし形・線・十字・砂目）、色を選べます。トーンレイヤーの画素は濃度を表すので、グレーで描いたり消したりすると網点の範囲や濃さが変わります。設定はレイヤーパネルでいつでも変えられ、「レイヤーをトーンにする」で普通のレイヤーもトーンにできます。PSD書き出しでは網点として統合されます。
 - 「集中線…」「流線…」は、選択範囲・選んでいるコマ・基本枠に合わせて、描画色で新しいレイヤーに効果線を描きます。本数、中心、乱れ、太さ、入り抜き、まとまりを調整して「描き直す」「配置を変える」を押します。
 - 「フキダシ」ツール（ツールバー下）でドラッグするとフキダシを、クリックすると文字に合わせた大きさのフキダシを作ります。「テキスト」ツールは文字だけを置きます。編集ウィンドウでセリフ（縦書き・横書き）、フォント（パソコンに入っているフォント）、文字サイズ（pt）、行間・字間、色、形（楕円・角丸・雲・トゲ・なし）、線の太さ、塗り、しっぽを変えられます。フキダシをドラッグで移動、右下の□で大きさ、しっぽ先の○で向きを変えます。Ctrl+ドラッグでしっぽを追加します。「重なるフキダシとつなげる」で2つのフキダシを同じレイヤーにすると、線がつながります。
-- 「漫画 → 作品（複数ページ）…」で、今の原稿の設定を使ってページのファイルをフォルダーにまとめて作ります（綴じ方向に合わせて左右ページが交互になります）。既存の `.efudebook` も開けます。見開きでページを一覧し（クリックでタブに開く）、ページの追加・並べ替え・外す、ノンブル（ページ番号）の設定、全ページまたは見開きのPNG書き出し（仕上がり・裁ち落としまで・トンボ付き、カラー・グレー・モノクロ2階調）ができます。書き出しは保存済みのファイルを使うので、開いているページは先に保存してください。
+- 「漫画 → 作品（複数ページ）…」で、今の原稿の設定を使ってページのファイルをフォルダーにまとめて作ります（綴じ方向に合わせて左右ページが交互になります）。既存の `.efudebook` も開けます。見開きでページを一覧し（クリックでタブに開く）、ページの追加・並べ替え・外す、ノンブル（ページ番号）の設定、全ページまたは見開きのPNG書き出し（仕上がり・裁ち落としまで・トンボ付き、カラー・グレー・モノクロ2階調）ができます。
+- 一括PNGの確認画面には、全タブの未保存ページと既存PNGを表示します。「現在の内容で書き出す（原稿は保存しない）」か「変更したページをすべて保存してから書き出す」を選びます。閉じたページは保存済みの原稿を使います。同名PNGは表示されたファイルの置き換えを確認してから出力します。確認後にページや出力が変わった場合は確認を更新してください。保存失敗時はPNGを出さず、置換失敗時は元の出力を復元します。復元できなかった場合は原本の退避先を知らせます。
 
 ### 保存、書き出し、自動バックアップ
 
@@ -163,11 +174,17 @@ Windows MSIを使うとセットアップウィザードからインストール
 - 未保存のキャンバスも含め、変更のある各タブの復旧データを設定した間隔で別々に保存します。異常終了後の起動時にサムネイルが表示され、「ファイル → 作業の復旧…」からも選べます。復元した作品は未保存の新しいタブで開くので、別名で保存してください。正常終了時には、その実行中に作成した復旧データを削除します。保存先は `%LOCALAPPDATA%\Efude-neo\recovery\` です。
 - レイヤーを含む作品は、`.efude` 形式で定期的に保存してください。編集データの唯一のコピーにPSDだけを使わないでください。
 
+### 塗り残し・消し忘れチェック
+
+「編集 → 塗り残し・消し忘れチェック…」で、小さな透明穴・孤立した点・仕上がり範囲外の描画を強調します。対象の描画レイヤーを選び、キャンバス全体・漫画の仕上がり枠・指定矩形から範囲を選びます。透明とみなす値と穴・点の最大面積を調整してチェックします。透明穴を探すときは不透明な背景を対象から外してください。候補を押すと拡大確認でき、意図した点や塗り足しは「対象外」にできます。作品の画素と取り消し履歴は変えません。編集後はもう一度チェックしてください。
+
 ### 下絵ガイド・タイムラプス・マクロ
 
 - 「表示 → 下絵ガイド」から画像を読み込むと、描画の下に表示されます。同じメニューで表示、不透明度、位置、倍率を調整できます。ガイドは `.efude` に保存されますが、通常のPNG・JPEG・PSD書き出しには入りません。
-- 「記録 → タイムラプスの記録を開始…」では、開始前に「下絵ガイドを動画に含める」を選べます。OFFでも編集中は表示され、動画の全フレームからは除かれます。「記録 → 動画を書き出す…」で30fpsのMJPEG AVIを作ります。連番JPEGは `%LOCALAPPDATA%\Efude-neo\timelapse\` に残り、後から再書き出しできます。画面全体の録画はしません。
-- 「記録 → マクロの記録を開始」で、ラスターレイヤーの作成・複製、名前、表示、不透明度、合成モードを記録します。保存後は同じメニューから別の作品で実行できます。実行全体を1回の取り消しで戻せます。ブラシの線やポインター操作は記録しません。
+- 「記録 → タイムラプスの記録を開始…」では、開始前に「下絵ガイドを動画に含める」を選べます。OFFでも編集中は表示され、動画の全フレームからは除かれます。「記録 → 動画を書き出す…」でMP4またはMJPEG AVIを30fpsで作ります。連番JPEGは `%LOCALAPPDATA%\Efude-neo\timelapse\` に残り、「以前の記録から動画を書き出す…」で再利用できます。画面全体の録画はしません。
+- MP4はH.264で、仕上がり時間は完成画像の静止時間を含めて1〜600秒です。30秒・静止2秒なら制作過程28秒と完成画像2秒になります。寸法と「全体を収める」（白い余白）／「中央で切り抜く」を選び、プレビューで確認して出力します。`libx264`を含むFFmpegを別途用意し、PATHにあるFFmpegを使うか書き出し画面で実行ファイルを指定します。FFmpegは同梱していません。AVIはFFmpeg不要で、記録時の寸法・30fpsで出力します。時間指定と切り抜きはMP4だけに適用します。変換は中止でき、失敗や中止では既存の出力を保持します。
+- 「記録 → マクロの記録を開始」で、ラスターレイヤーの作成・複製、名前、表示、不透明度、合成モードを記録します。「マクロの手順を編集…」で手順の追加・削除・並べ替え・値の変更ができます。実行開始時のレイヤー、その時点の選択レイヤー、名前を指定したレイヤー、先行手順で作ったレイヤーを対象にできます。実行前に対応を確認し、対象不足や同名の場合はレイヤーを選びます。実行全体を1回の取り消しで戻せ、失敗時は全手順を戻します。ブラシの線やポインター操作は記録しません。
+- 旧version 1マクロは従来の選択レイヤー依存の動作で読み込めます。0.3で保存するとversion 2になり、0.2では読めなくなります。旧ファイルを0.2用に残す場合は「別のマクロとして保存」を選んでください。保存先は `%APPDATA%\Efude-neo\macros\` です。
 
 ### 入力とトラブルシューティング
 

@@ -14,7 +14,7 @@ body:
     attributes:
       label: Efude のバージョン / Efude version
       description: ヘルプ、またはダウンロードしたファイル名で確認できます / See Help or the name of the file you downloaded
-      placeholder: v0.2.0
+      placeholder: v0.3.0
     validations:
       required: true
   - type: input
