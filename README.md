@@ -95,18 +95,6 @@ The workspace is split into engine crates (`efude-core`, `efude-input`,
 described in [docs/spec](docs/spec). Releases are built by GitHub Actions; see
 [docs/RELEASING.md](docs/RELEASING.md).
 
-## Contributing
-
-- **Bug reports and feature requests** for this fork belong in its
-  [issues](https://github.com/AiWithYou/Efude-neo/issues).
-- For code contributions, see [CONTRIBUTING.md](CONTRIBUTING.md).
-- Security problems: report them privately from the Security tab, not in an issue.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details. Efude is built
-independently, from observed behavior only
-([docs/CLEAN_ROOM.md](docs/CLEAN_ROOM.md)), and commits need a DCO
-`Signed-off-by` line.
-
 ## License
 
 - Engine crates: MIT OR Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
@@ -155,14 +143,6 @@ Rust 1.95以降が必要です。
 ```powershell
 cargo run -p efude-app --release
 ```
-
-### 参加するには
-
-- **この派生版の不具合報告・要望**は [Efude-neoのIssue](https://github.com/AiWithYou/Efude-neo/issues) に投稿してください。
-- コードの提供については [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
-- セキュリティ上の問題は Issue ではなく、Security タブから非公開で知らせてください。
-
-詳しくは [CONTRIBUTING.md](CONTRIBUTING.md) をご覧ください。Efudeは他製品の挙動の観察だけをもとに独自に作っており（[docs/CLEAN_ROOM.md](docs/CLEAN_ROOM.md)）、コミットには DCO の `Signed-off-by` 行が必要です。
 
 ### ライセンス
 
