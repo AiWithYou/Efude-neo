@@ -53,6 +53,12 @@ pub(crate) struct BalloonUi {
 }
 
 impl BalloonUi {
+    pub(crate) fn clear_document_gesture(&mut self) {
+        self.selected = None;
+        self.gesture = None;
+        self.pointer = None;
+    }
+
     pub fn new() -> Self {
         Self {
             new_shape: BalloonShape::Ellipse,

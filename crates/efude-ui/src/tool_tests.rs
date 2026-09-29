@@ -1512,6 +1512,74 @@ fn ctrl_key(h: &mut Harness, key: egui::Key, shift: bool) {
 }
 
 #[test]
+fn closing_a_tab_during_a_stroke_checks_its_unsaved_changes() {
+    let mut h = Harness::new(120, 80);
+    h.use_tool(Tool::Brush);
+    h.move_to(h.screen(v(20.0, 40.0)));
+    h.button(true, egui::PointerButton::Primary);
+    h.move_to(h.screen(v(55.0, 40.0)));
+    assert!(h.app.history.is_active());
+    ctrl_key(&mut h, egui::Key::W, false);
+    assert_eq!(h.app.tabs.confirm_close, Some(0));
+    assert!(!h.app.history.is_active());
+    assert!(h.app.history.is_dirty());
+    assert!(h.app.history.can_undo());
+    assert!(h.app.doc.layers[0].pixels.pixel(35, 40)[3] > 0);
+}
+
+#[test]
+fn switching_tabs_during_a_stroke_finishes_it_without_painting_the_other_document() {
+    let mut h = Harness::new(120, 80);
+    h.app.doc_path = Some("first.efude".into());
+    h.app.open_document_tab();
+    h.app.replace_document(Document::new(120, 80), None);
+    h.app.switch_tab(0);
+    h.frames(2);
+    h.use_tool(Tool::Brush);
+    h.move_to(h.screen(v(20.0, 40.0)));
+    h.button(true, egui::PointerButton::Primary);
+    for x in [25.0, 35.0, 45.0, 55.0] {
+        h.move_to(h.screen(v(x, 40.0)));
+    }
+    assert!(h.app.history.is_active());
+    ctrl_key(&mut h, egui::Key::Tab, false);
+    assert_eq!(h.app.tabs.active, 1);
+    h.key(egui::Key::Tab, false);
+    h.move_to(h.screen(v(80.0, 40.0)));
+    h.button(false, egui::PointerButton::Primary);
+    h.frames(2);
+    assert!(!h.app.doc.layers[0].pixels.has_allocated_tiles());
+    assert!(!h.app.history.can_undo());
+    h.app.switch_tab(0);
+    assert_eq!(h.app.tabs.active, 0);
+    assert!(!h.app.history.is_active());
+    assert!(h.app.history.is_dirty());
+    assert!(h.app.history.can_undo());
+    assert!(h.app.doc.layers[0].pixels.pixel(35, 40)[3] > 0);
+    h.app.history.undo_document(&mut h.app.doc);
+    for y in 0..80 {
+        for x in 0..120 {
+            assert_eq!(h.app.doc.layers[0].pixels.pixel(x, y)[3], 0);
+        }
+    }
+    // A fresh press immediately after the switch must not be suppressed.
+    h.pointer = h.screen(v(20.0, 20.0));
+    h.frame_with(vec![
+        egui::Event::PointerMoved(h.pointer),
+        egui::Event::PointerButton {
+            pos: h.pointer,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]);
+    h.move_to(h.screen(v(60.0, 20.0)));
+    h.button(false, egui::PointerButton::Primary);
+    assert!(!h.app.history.is_active());
+    assert!(h.app.doc.layers[0].pixels.pixel(35, 20)[3] > 0);
+}
+
+#[test]
 fn common_shortcuts_select_copy_paste_and_undo() {
     let mut h = Harness::new(200, 100);
     h.fill_rect(10, 10, 40, 40, [0, 0, 255, 255]);
@@ -1547,6 +1615,65 @@ fn common_shortcuts_select_copy_paste_and_undo() {
     assert_eq!(h.app.doc.layers.len(), layers + 2);
     ctrl_key(&mut h, egui::Key::N, false);
     assert!(h.app.show_new_document);
+}
+
+#[test]
+fn oversized_paste_crops_by_its_position_and_is_undoable() {
+    let mut source = vec![0; 9 * 7 * 4];
+    for y in 0..7 {
+        for x in 0..9 {
+            let i = (y * 9 + x) * 4;
+            source[i..i + 4].copy_from_slice(&[x as u8 + 1, y as u8 + 1, 120, 255]);
+        }
+    }
+    for (ox, oy) in [(-2, -2), (-6, -4), (3, 2), (7, 1), (-20, -20)] {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(5, 4);
+        app.paste_preview = Some((9, 7, source.clone(), Vec2::new(ox as f32, oy as f32)));
+        app.commit_paste_preview();
+        for y in 0..4i32 {
+            for x in 0..5i32 {
+                let (sx, sy) = (x - ox, y - oy);
+                let expected = if (0..9).contains(&sx) && (0..7).contains(&sy) {
+                    [sx as u8 + 1, sy as u8 + 1, 120, 255]
+                } else {
+                    [0; 4]
+                };
+                assert_eq!(
+                    app.doc.layers[0].pixels.pixel(x as u32, y as u32),
+                    expected,
+                    "paste at ({ox},{oy}), destination ({x},{y})"
+                );
+            }
+        }
+        let painted = app.doc.layers[0].pixels.clone();
+        app.undo();
+        assert!(!app.doc.layers[0].pixels.has_allocated_tiles());
+        app.redo();
+        for y in 0..4 {
+            for x in 0..5 {
+                assert_eq!(app.doc.layers[0].pixels.pixel(x, y), painted.pixel(x, y));
+            }
+        }
+    }
+}
+
+#[test]
+fn refusing_a_paste_preserves_it_for_retry() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(2, 2);
+    app.doc.layers[0].locked = true;
+    app.paste_preview = Some((2, 2, [80, 90, 100, 255].repeat(4), Vec2::ZERO));
+    app.commit_paste_preview();
+    assert!(app.paste_preview.is_some());
+    assert!(!app.status.is_empty());
+    assert!(!app.history.can_undo());
+    app.doc.layers[0].locked = false;
+    app.commit_paste_preview();
+    assert!(app.paste_preview.is_none());
+    assert_eq!(app.doc.layers[0].pixels.pixel(1, 1), [80, 90, 100, 255]);
+    app.undo();
+    assert_eq!(app.doc.layers[0].pixels.pixel(1, 1), [0; 4]);
 }
 
 #[test]

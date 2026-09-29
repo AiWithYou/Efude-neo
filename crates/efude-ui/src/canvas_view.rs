@@ -5,6 +5,119 @@
 use super::*;
 
 impl EfudeApp {
+    /// Completes a gesture on its document before pen-up or a tab switch.
+    pub(crate) fn finish_canvas_gesture(&mut self, canvas_clicked: bool) {
+        if matches!(self.tool, Tool::Balloon | Tool::Text) {
+            self.balloon_drag_stop(canvas_clicked);
+        }
+        if self.tool == Tool::VectorEdit {
+            self.vector_edit_release();
+        }
+        if self.tool == Tool::PanelSplit
+            && let (Some(start), Some(end)) = (
+                self.comic_ui.split_start.take(),
+                self.comic_ui.split_end.take(),
+            )
+            && (end - start).length() > 4.0
+            && !self.split_panel(comic::to_glam(start), comic::to_glam(end))
+        {
+            self.status = self
+                .text(
+                    "コマの上を横切るように線を引いてください",
+                    "Drag a line across a panel",
+                )
+                .into();
+        }
+        if matches!(
+            self.tool,
+            Tool::Brush | Tool::Blur | Tool::Smudge | Tool::Eraser
+        ) {
+            self.finish_stroke()
+        }
+        if matches!(self.tool, Tool::SelectionBrush | Tool::QuickMask) {
+            self.active.clear();
+            self.stabilized_cursor = None;
+            self.raster.last_dab = None;
+            self.finish_selection_operation();
+        }
+        if matches!(
+            self.tool,
+            Tool::Line | Tool::EllipseRuler | Tool::PerspectiveRuler
+        ) && canvas_clicked
+        {
+            // A click (setting a vanishing point, say) draws nothing.
+            self.active.clear();
+            self.history.rollback_active(&mut self.doc);
+            self.rollback_vector_stroke();
+            self.vector_live = None;
+        } else if matches!(
+            self.tool,
+            Tool::Line | Tool::EllipseRuler | Tool::PerspectiveRuler
+        ) {
+            let start = if self.tool == Tool::PerspectiveRuler {
+                self.perspective_points
+                    .get(self.perspective_selected)
+                    .copied()
+                    .or(self.selection_start)
+            } else {
+                self.selection_start
+            };
+            // Only the ruler's own shape is drawn, not the pointer path.
+            self.active.clear();
+            if let (Some((x0, y0)), Some((x1, y1))) = (start, self.gesture_end) {
+                let n = 128usize;
+                for i in 0..=n {
+                    let t = i as f32 / n as f32;
+                    let (x, y) = if matches!(self.tool, Tool::Line | Tool::PerspectiveRuler) {
+                        (
+                            x0 as f32 + (x1 - x0) as f32 * t,
+                            y0 as f32 + (y1 - y0) as f32 * t,
+                        )
+                    } else {
+                        let cx = (x0 + x1) as f32 / 2.;
+                        let cy = (y0 + y1) as f32 / 2.;
+                        let rx = (x1 - x0).abs() as f32 / 2.;
+                        let ry = (y1 - y0).abs() as f32 / 2.;
+                        let a = std::f32::consts::TAU * t;
+                        (cx + rx * a.cos(), cy + ry * a.sin())
+                    };
+                    let p = InkPoint::new(x, y, 1., i as u64);
+                    self.active.push(p);
+                    self.dab(p);
+                }
+            }
+            self.finish_stroke();
+        }
+        if matches!(self.tool, Tool::LassoSelect) {
+            self.selection
+                .polygon(self.doc.width, self.doc.height, &self.selection_points);
+            self.selection_points.clear();
+        }
+        if matches!(
+            self.tool,
+            Tool::RectangleSelect | Tool::EllipseSelect | Tool::LassoSelect
+        ) {
+            self.apply_selection_symmetry();
+            self.finish_selection_operation();
+        }
+        if matches!(self.tool, Tool::Move) {
+            self.finish_vector_move();
+            self.move_origin = None;
+            if let Some((before_active, before)) = self.selection_before_gesture.take() {
+                self.history.record_selection_change(
+                    before_active,
+                    before,
+                    self.selection.active,
+                    self.selection.mask.clone(),
+                );
+            }
+            self.history.commit();
+        }
+        self.selection_start = None;
+        self.pan_start = None;
+        self.gesture_end = None
+    }
+
     /// Draws the canvas into `ui` and handles pointer input on it.
     pub(crate) fn canvas_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.painter().rect_filled(
@@ -562,6 +675,15 @@ impl EfudeApp {
         self.paint_finishing_check(&painter, &to_screen);
         self.paint_balloon_overlay(&painter, &to_screen);
         self.paint_vector_overlay(&painter, &to_screen);
+        // A held pointer belongs to the document where it went down.
+        // Consume its release too; only a new press may edit this document.
+        if self.canvas_gesture_interrupted
+            && !response.drag_started_by(egui::PointerButton::Primary)
+        {
+            self.canvas_gesture_interrupted = ctx.input(|input| input.pointer.primary_down());
+            return;
+        }
+        self.canvas_gesture_interrupted = false;
         if response.drag_started_by(egui::PointerButton::Primary)
             && self.paste_preview.is_none()
             && let Some(pos) = response.interact_pointer_pos()
@@ -817,115 +939,7 @@ impl EfudeApp {
             }
         }
         if response.drag_stopped_by(egui::PointerButton::Primary) && self.paste_preview.is_none() {
-            if matches!(self.tool, Tool::Balloon | Tool::Text) {
-                self.balloon_drag_stop(canvas_clicked);
-            }
-            if self.tool == Tool::VectorEdit {
-                self.vector_edit_release();
-            }
-            if self.tool == Tool::PanelSplit
-                && let (Some(start), Some(end)) = (
-                    self.comic_ui.split_start.take(),
-                    self.comic_ui.split_end.take(),
-                )
-                && (end - start).length() > 4.0
-                && !self.split_panel(comic::to_glam(start), comic::to_glam(end))
-            {
-                self.status = self
-                    .text(
-                        "コマの上を横切るように線を引いてください",
-                        "Drag a line across a panel",
-                    )
-                    .into();
-            }
-            if matches!(
-                self.tool,
-                Tool::Brush | Tool::Blur | Tool::Smudge | Tool::Eraser
-            ) {
-                self.finish_stroke()
-            }
-            if matches!(self.tool, Tool::SelectionBrush | Tool::QuickMask) {
-                self.active.clear();
-                self.stabilized_cursor = None;
-                self.raster.last_dab = None;
-                self.finish_selection_operation();
-            }
-            if matches!(
-                self.tool,
-                Tool::Line | Tool::EllipseRuler | Tool::PerspectiveRuler
-            ) && canvas_clicked
-            {
-                // A click (setting a vanishing point, say) draws nothing.
-                self.active.clear();
-                self.history.rollback_active(&mut self.doc);
-                self.rollback_vector_stroke();
-                self.vector_live = None;
-            } else if matches!(
-                self.tool,
-                Tool::Line | Tool::EllipseRuler | Tool::PerspectiveRuler
-            ) {
-                let start = if self.tool == Tool::PerspectiveRuler {
-                    self.perspective_points
-                        .get(self.perspective_selected)
-                        .copied()
-                        .or(self.selection_start)
-                } else {
-                    self.selection_start
-                };
-                // Only the ruler's own shape is drawn, not the pointer path.
-                self.active.clear();
-                if let (Some((x0, y0)), Some((x1, y1))) = (start, self.gesture_end) {
-                    let n = 128usize;
-                    for i in 0..=n {
-                        let t = i as f32 / n as f32;
-                        let (x, y) = if matches!(self.tool, Tool::Line | Tool::PerspectiveRuler) {
-                            (
-                                x0 as f32 + (x1 - x0) as f32 * t,
-                                y0 as f32 + (y1 - y0) as f32 * t,
-                            )
-                        } else {
-                            let cx = (x0 + x1) as f32 / 2.;
-                            let cy = (y0 + y1) as f32 / 2.;
-                            let rx = (x1 - x0).abs() as f32 / 2.;
-                            let ry = (y1 - y0).abs() as f32 / 2.;
-                            let a = std::f32::consts::TAU * t;
-                            (cx + rx * a.cos(), cy + ry * a.sin())
-                        };
-                        let p = InkPoint::new(x, y, 1., i as u64);
-                        self.active.push(p);
-                        self.dab(p);
-                    }
-                }
-                self.finish_stroke();
-            }
-            if matches!(self.tool, Tool::LassoSelect) {
-                self.selection
-                    .polygon(self.doc.width, self.doc.height, &self.selection_points);
-                self.selection_points.clear();
-            }
-            if matches!(
-                self.tool,
-                Tool::RectangleSelect | Tool::EllipseSelect | Tool::LassoSelect
-            ) {
-                self.apply_selection_symmetry();
-                self.finish_selection_operation();
-            }
-            if matches!(self.tool, Tool::Move) {
-                self.finish_vector_move();
-                self.move_origin = None;
-                if let Some((before_active, before)) = self.selection_before_gesture.take() {
-                    self.history.record_selection_change(
-                        before_active,
-                        before,
-                        self.selection.active,
-                        self.selection.mask.clone(),
-                    );
-                }
-                self.history.commit();
-            }
-            self.selection_start = None;
-            self.pan_start = None;
-            self.gesture_end = None
+            self.finish_canvas_gesture(canvas_clicked);
         }
         if response.dragged_by(egui::PointerButton::Primary)
             && let (Some(pointer), Some((paste_w, paste_h, _, _))) =

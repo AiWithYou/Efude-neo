@@ -848,6 +848,7 @@ pub struct History {
     document_id: u64,
     content_revision: u64,
     selection_update: Option<(bool, Vec<u8>)>,
+    error: Option<String>,
 }
 static HISTORY_STATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 impl Default for History {
@@ -873,6 +874,7 @@ impl Default for History {
             document_id,
             content_revision: 0,
             selection_update: None,
+            error: None,
         }
     }
 }
@@ -1460,10 +1462,14 @@ impl History {
         }
         Some(path)
     }
-    fn load_spill(path: &std::path::Path) -> Option<HistoryEntry> {
-        let bytes = std::fs::read(path).ok()?;
-        let payload = bytes.strip_prefix(HISTORY_MAGIC)?;
-        postcard::from_bytes(payload).ok()
+    fn load_spill(path: &std::path::Path) -> Result<HistoryEntry, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("Cannot read history {}: {e}", path.display()))?;
+        let payload = bytes
+            .strip_prefix(HISTORY_MAGIC)
+            .ok_or_else(|| format!("Invalid history file: {}", path.display()))?;
+        postcard::from_bytes(payload)
+            .map_err(|e| format!("Invalid history data {}: {e}", path.display()))
     }
     fn clear_redo(&mut self) {
         self.redo.clear();
@@ -1510,6 +1516,8 @@ impl History {
             if let Some(path) = Self::spill_path(&oldest) {
                 self.undo_spills.push(path);
             } else {
+                self.error =
+                    Some("Cannot store Undo history on disk; it has been kept in memory".into());
                 self.undo_bytes = self.undo_bytes.saturating_add(Self::entry_size(&oldest));
                 self.undo.insert(0, oldest);
                 break;
@@ -1525,6 +1533,8 @@ impl History {
             if let Some(path) = Self::spill_path(&oldest) {
                 self.redo_spills.push(path);
             } else {
+                self.error =
+                    Some("Cannot store Redo history on disk; it has been kept in memory".into());
                 self.redo_bytes = self.redo_bytes.saturating_add(Self::entry_size(&oldest));
                 self.redo.insert(0, oldest);
                 break;
@@ -1548,20 +1558,36 @@ impl History {
             self.undo_bytes = self.undo_bytes.saturating_sub(Self::entry_size(&entry));
             return Some(entry);
         }
-        let path = self.undo_spills.pop()?;
-        let entry = Self::load_spill(&path);
-        let _ = std::fs::remove_file(path);
-        entry
+        let path = self.undo_spills.last()?;
+        match Self::load_spill(path) {
+            Ok(entry) => {
+                let path = self.undo_spills.pop().unwrap();
+                let _ = std::fs::remove_file(path);
+                Some(entry)
+            }
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
     }
     fn pop_redo_entry(&mut self) -> Option<HistoryEntry> {
         if let Some(entry) = self.redo.pop() {
             self.redo_bytes = self.redo_bytes.saturating_sub(Self::entry_size(&entry));
             return Some(entry);
         }
-        let path = self.redo_spills.pop()?;
-        let entry = Self::load_spill(&path);
-        let _ = std::fs::remove_file(path);
-        entry
+        let path = self.redo_spills.last()?;
+        match Self::load_spill(path) {
+            Ok(entry) => {
+                let path = self.redo_spills.pop().unwrap();
+                let _ = std::fs::remove_file(path);
+                Some(entry)
+            }
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
     }
     pub fn checkpoint(&mut self, layer: &Layer) {
         self.current.clear();
@@ -1931,6 +1957,11 @@ impl History {
     }
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty() || !self.redo_spills.is_empty()
+    }
+    /// Takes the latest storage error. A failed read leaves the history
+    /// entry in place so an older, incompatible difference is never applied.
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 }
 impl Drop for History {
@@ -3683,6 +3714,73 @@ mod guide_history_tests {
         history.undo_document(&mut doc);
         assert_eq!(history.state_token(), saved);
         assert!(!history.is_dirty());
+    }
+
+    #[test]
+    fn unreadable_undo_spill_does_not_skip_an_entry_or_change_saved_state() {
+        let mut doc = Document::new(8, 8);
+        let mut history = History::default();
+        history.insert_layer(&mut doc.layers, 1, Layer::new(2, "saved", 8, 8));
+        let saved = history.state_token();
+        history.mark_saved(saved);
+        history.insert_layer(&mut doc.layers, 2, Layer::new(3, "later", 8, 8));
+        for entry in history.undo.drain(..) {
+            history
+                .undo_spills
+                .push(History::spill_path(&entry).unwrap());
+        }
+        history.undo_bytes = 0;
+        let newest = history.undo_spills.last().unwrap().clone();
+        let valid = std::fs::read(&newest).unwrap();
+        std::fs::write(&newest, b"corrupted history").unwrap();
+        let token = history.state_token();
+        for _ in 0..2 {
+            history.undo_document(&mut doc);
+            assert_eq!(doc.layers.len(), 3);
+            assert_eq!(history.state_token(), token);
+            assert!(history.is_dirty());
+            assert_eq!(history.undo_spills.len(), 2);
+            assert!(newest.exists());
+            assert!(history.take_error().is_some());
+        }
+        std::fs::write(&newest, valid).unwrap();
+        history.undo_document(&mut doc);
+        assert_eq!(doc.layers.len(), 2);
+        assert_eq!(history.state_token(), saved);
+        assert!(!history.is_dirty());
+        assert!(history.take_error().is_none());
+        history.redo_document(&mut doc);
+        assert_eq!(doc.layers.len(), 3);
+        assert_eq!(history.state_token(), token);
+    }
+
+    #[test]
+    fn missing_redo_spill_can_be_retried_without_skipping_history() {
+        let mut doc = Document::new(8, 8);
+        let mut history = History::default();
+        history.insert_layer(&mut doc.layers, 1, Layer::new(2, "later", 8, 8));
+        let later = history.state_token();
+        history.undo_document(&mut doc);
+        let token = history.state_token();
+        let entry = history.redo.pop().unwrap();
+        let path = History::spill_path(&entry).unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        history.redo_spills.push(path.clone());
+        history.redo_bytes = 0;
+        std::fs::remove_file(&path).unwrap();
+        for _ in 0..2 {
+            history.redo_document(&mut doc);
+            assert_eq!(doc.layers.len(), 1);
+            assert_eq!(history.state_token(), token);
+            assert_eq!(history.redo_spills.len(), 1);
+            assert!(history.can_redo());
+            assert!(history.take_error().is_some());
+        }
+        std::fs::write(&path, valid).unwrap();
+        history.redo_document(&mut doc);
+        assert_eq!(doc.layers.len(), 2);
+        assert_eq!(history.state_token(), later);
+        assert!(history.take_error().is_none());
     }
 
     #[test]

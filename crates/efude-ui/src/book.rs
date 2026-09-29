@@ -161,12 +161,14 @@ fn render_page(
         loaded = efude_io::load(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         &loaded
     };
-    let spec = doc
+    let mut spec = doc
         .metadata
         .get("comic")
         .and_then(|text| serde_json::from_str::<comic::ComicDoc>(text).ok())
         .map(|comic| comic.page)
         .unwrap_or_else(|| book.page_spec(index));
+    // A stored page may have moved to the other side since it was created.
+    spec.right_page = book.is_right_page(index);
     let geometry = spec.geometry();
     let mut image = Image {
         width: doc.width,
@@ -453,13 +455,48 @@ pub(crate) fn execute_export(
     (receipts, result)
 }
 
+/// Keeps the previous manifest intact until the replacement is complete.
+fn write_book_file(path: &Path, book: &Book, overwrite: bool) -> Result<(), String> {
+    use std::io::Write;
+    let folder = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(folder).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec_pretty(book).map_err(|e| e.to_string())?;
+    temporary.write_all(&bytes).map_err(|e| e.to_string())?;
+    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    let result = if overwrite {
+        temporary.persist(path)
+    } else {
+        temporary.persist_noclobber(path)
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn save_new_page(path: &Path, document: &Document) -> Result<(), String> {
+    let folder = path.parent().unwrap_or(Path::new("."));
+    let temporary = tempfile::NamedTempFile::new_in(folder)
+        .map_err(|e| e.to_string())?
+        .into_temp_path();
+    efude_io::save(&temporary, document).map_err(|e| e.to_string())?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 impl EfudeApp {
-    fn save_book(&mut self) {
-        if let Some((path, book)) = &self.book_ui.book
-            && let Err(error) = std::fs::write(path, book.to_json())
-        {
-            self.status = format!("{}: {error}", path.display());
-        }
+    fn update_book(&mut self, change: impl FnOnce(&mut Book)) -> Result<(), String> {
+        let Some((path, current)) = &self.book_ui.book else {
+            return Ok(());
+        };
+        let mut updated = current.clone();
+        change(&mut updated);
+        write_book_file(path, &updated, true)?;
+        self.book_ui.book.as_mut().unwrap().1 = updated;
+        Ok(())
     }
 
     /// Creates a book of `pages` blank pages in `folder`.
@@ -470,24 +507,42 @@ impl EfudeApp {
         pages: u32,
         spec: efude_comic::PageSpec,
     ) -> Result<(), String> {
-        std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
-        let mut book = Book::new(title, spec);
-        for n in 1..=pages.max(1) as usize {
-            let file = Book::page_file_name(n);
-            book.pages.push(BookPage { file: file.clone() });
-            let path = folder.join(&file);
-            if !path.exists() {
-                let doc = blank_page(&book, n - 1);
-                efude_io::save(&path, &doc).map_err(|e| format!("{}: {e}", path.display()))?;
-            }
-        }
         let name = if title.trim().is_empty() {
             "book"
         } else {
             title.trim()
         };
+        if name == "."
+            || name == ".."
+            || name.ends_with('.')
+            || name
+                .chars()
+                .any(|ch| ch.is_control() || "/\\:*?\"<>|".contains(ch))
+        {
+            return Err("作品名にはファイル名として使える文字を指定してください".into());
+        }
         let path = folder.join(format!("{name}.{}", book::EXTENSION));
-        std::fs::write(&path, book.to_json()).map_err(|e| e.to_string())?;
+        let mut book = Book::new(title, spec);
+        for n in 1..=pages.max(1) as usize {
+            let file = Book::page_file_name(n);
+            book.pages.push(BookPage { file });
+        }
+        for target in
+            std::iter::once(path.clone()).chain(book.pages.iter().map(|p| folder.join(&p.file)))
+        {
+            if target.try_exists().map_err(|e| e.to_string())? {
+                return Err(format!(
+                    "既存の作品・原稿は上書きしません。別のフォルダーを選んでください: {}",
+                    target.display()
+                ));
+            }
+        }
+        std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+        for (index, page) in book.pages.iter().enumerate() {
+            let target = folder.join(&page.file);
+            save_new_page(&target, &blank_page(&book, index))?;
+        }
+        write_book_file(&path, &book, false)?;
         self.book_ui.book = Some((path, book));
         self.book_ui.thumbnails.clear();
         Ok(())
@@ -502,19 +557,28 @@ impl EfudeApp {
     }
 
     fn add_book_page(&mut self) -> Result<(), String> {
-        let Some((path, book)) = &mut self.book_ui.book else {
+        let Some((path, book)) = &self.book_ui.book else {
             return Ok(());
         };
         let folder = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let mut n = book.pages.len() + 1;
-        while folder.join(Book::page_file_name(n)).exists() {
+        while folder
+            .join(Book::page_file_name(n))
+            .try_exists()
+            .map_err(|e| e.to_string())?
+            || book
+                .pages
+                .iter()
+                .any(|page| page.file == Book::page_file_name(n))
+        {
             n += 1;
         }
         let file = Book::page_file_name(n);
         let doc = blank_page(book, book.pages.len());
-        efude_io::save(&folder.join(&file), &doc).map_err(|e| e.to_string())?;
-        book.pages.push(BookPage { file });
-        self.save_book();
+        let page_path = folder.join(&file);
+        save_new_page(&page_path, &doc)?;
+        self.update_book(|book| book.pages.push(BookPage { file }))
+            .map_err(|error| format!("作品目次を保存できなかったため、ページは追加していません。作成した原稿は {} に残っています: {error}", page_path.display()))?;
         Ok(())
     }
 
@@ -1171,22 +1235,21 @@ impl EfudeApp {
             }
             Some(BookAction::Refresh) => self.book_ui.thumbnails.clear(),
             Some(BookAction::Move(from, to)) => {
-                if let Some((_, book)) = &mut self.book_ui.book {
-                    book.pages.swap(from, to);
+                if let Err(error) = self.update_book(|book| book.pages.swap(from, to)) {
+                    self.status = error;
                 }
-                self.save_book();
             }
             Some(BookAction::Remove(index)) => {
-                if let Some((_, book)) = &mut self.book_ui.book {
+                if let Err(error) = self.update_book(|book| {
                     book.pages.remove(index);
+                }) {
+                    self.status = error;
                 }
-                self.save_book();
             }
             Some(BookAction::Nombre(nombre)) => {
-                if let Some((_, book)) = &mut self.book_ui.book {
-                    book.nombre = nombre;
+                if let Err(error) = self.update_book(|book| book.nombre = nombre) {
+                    self.status = error;
                 }
-                self.save_book();
             }
             Some(BookAction::Export) => {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder()
@@ -1249,6 +1312,168 @@ pub(crate) fn export_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn reordered_pages_print_numbers_on_the_current_inner_or_outer_side() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("book.efudebook");
+        let mut spec = tiny_page_spec();
+        spec.trim_mm = [40.0, 50.0];
+        spec.inner_margins_mm = [4.0, 8.0, 4.0, 6.0];
+        spec.dpi = 100.0;
+        spec.binding = efude_comic::Binding::Right;
+        let mut book = Book::new("book", spec);
+        for index in 0..2 {
+            let file = Book::page_file_name(index + 1);
+            efude_io::save(&directory.path().join(&file), &blank_page(&book, index)).unwrap();
+            book.pages.push(BookPage { file });
+        }
+        book.pages.swap(0, 1);
+        let fonts = text::system_fonts();
+        let info = fonts.first().expect("Windows system font");
+        let font = (Arc::new(std::fs::read(&info.path).unwrap()), info.index);
+        for position in [NombrePosition::BottomOuter, NombrePosition::BottomInner] {
+            book.nombre.position = position;
+            for index in 0..2 {
+                let image = render_page(
+                    &book,
+                    &path,
+                    index,
+                    &ExportOptions::default(),
+                    Some(&font),
+                    &Default::default(),
+                )
+                .unwrap();
+                let dark_x: Vec<_> = image
+                    .rgba
+                    .chunks_exact(4)
+                    .enumerate()
+                    .filter(|(_, pixel)| pixel[0] < 200)
+                    .map(|(i, _)| (i as u32 % image.width) as f32)
+                    .collect();
+                assert!(!dark_x.is_empty(), "page number must be visible");
+                let centre = dark_x.iter().sum::<f32>() / dark_x.len() as f32;
+                let on_right = (position == NombrePosition::BottomOuter) == (index == 1);
+                if on_right {
+                    assert!(centre > image.width as f32 * 0.75);
+                } else {
+                    assert!(centre < image.width as f32 * 0.25);
+                }
+            }
+        }
+    }
+
+    fn tiny_page_spec() -> efude_comic::PageSpec {
+        let mut spec = efude_comic::PageSpec::presets().remove(0).2;
+        spec.trim_mm = [8.0, 8.0];
+        spec.bleed_mm = 0.0;
+        spec.inner_margins_mm = [0.0; 4];
+        spec.dpi = 25.4;
+        spec
+    }
+
+    #[test]
+    fn creating_a_book_rejects_existing_manifest_or_page_without_changing_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = EfudeApp::default();
+        app.create_book(directory.path(), "existing", 2, tiny_page_spec())
+            .unwrap();
+        app.update_book(|book| book.pages.swap(0, 1)).unwrap();
+        let path = directory.path().join("existing.efudebook");
+        let before = std::fs::read(&path).unwrap();
+        let page = std::fs::read(directory.path().join("001.efude")).unwrap();
+        assert!(
+            app.create_book(directory.path(), "existing", 1, tiny_page_spec())
+                .is_err()
+        );
+        assert!(
+            app.create_book(directory.path(), "different", 3, tiny_page_spec())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(directory.path().join("001.efude")).unwrap(),
+            page
+        );
+        assert!(!directory.path().join("003.efude").exists());
+        assert!(!directory.path().join("different.efudebook").exists());
+        assert_eq!(app.book_ui.book.as_ref().unwrap().1.pages.len(), 2);
+    }
+
+    #[test]
+    fn a_new_page_never_overwrites_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("001.efude");
+        std::fs::write(&path, b"another writer's original").unwrap();
+        assert!(save_new_page(&path, &Document::new(8, 8)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"another writer's original");
+    }
+
+    #[test]
+    fn invalid_book_names_cannot_escape_the_selected_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = directory.path().join("selected");
+        let mut app = EfudeApp::default();
+        for name in [
+            "../outside",
+            "..\\outside",
+            "part/name",
+            "bad:name",
+            "name.",
+        ] {
+            assert!(
+                app.create_book(&selected, name, 1, tiny_page_spec())
+                    .is_err()
+            );
+        }
+        assert!(!selected.exists());
+        assert!(!directory.path().join("outside.efudebook").exists());
+    }
+
+    #[test]
+    fn a_failed_page_add_keeps_the_book_unchanged_and_reports_the_retained_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blocked.efudebook");
+        std::fs::create_dir(&path).unwrap();
+        let book = Book::new("Test", tiny_page_spec());
+        let mut app = EfudeApp::default();
+        app.book_ui.book = Some((path.clone(), book));
+        let error = app.add_book_page().unwrap_err();
+        assert!(error.contains("001.efude"));
+        assert!(app.book_ui.book.as_ref().unwrap().1.pages.is_empty());
+        assert!(directory.path().join("001.efude").exists());
+        assert!(path.is_dir());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_manifest_replacement_preserves_the_previous_file_and_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.efudebook");
+        let book = Book::new("Original", tiny_page_spec());
+        write_book_file(&path, &book, false).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let mut app = EfudeApp::default();
+        app.book_ui.book = Some((path.clone(), book));
+        let result = app.update_book(|book| {
+            book.title = "Changed".into();
+            book.pages.push(BookPage {
+                file: "001.efude".into(),
+            });
+        });
+        std::fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let current = &app.book_ui.book.as_ref().unwrap().1;
+        assert_eq!(current.title, "Original");
+        assert!(current.pages.is_empty());
+    }
+
     fn small_book(root: &Path) -> (PathBuf, Book) {
         let path = root.join("test.efudebook");
         let mut book = Book::new("Test", efude_comic::PageSpec::presets().remove(0).2);

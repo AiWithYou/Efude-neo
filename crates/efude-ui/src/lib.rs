@@ -1043,6 +1043,7 @@ pub struct EfudeApp {
     grid_size: u32,
     grid_snap: bool,
     gesture_end: Option<(i32, i32)>,
+    canvas_gesture_interrupted: bool,
     symmetry_x: bool,
     symmetry_y: bool,
     symmetry_count: u32,
@@ -1536,6 +1537,7 @@ impl Default for EfudeApp {
             grid_size: 64,
             grid_snap: false,
             gesture_end: None,
+            canvas_gesture_interrupted: false,
             symmetry_x: false,
             symmetry_y: false,
             symmetry_count: 1,
@@ -4423,12 +4425,19 @@ impl EfudeApp {
         }
     }
     fn commit_paste_preview(&mut self) {
+        if self.paste_preview.is_none() {
+            return;
+        }
         if self.doc.layers[self.selected_layer].locked
             || self.is_reference_layer(self.selected_layer)
             || self.doc.layers[self.selected_layer].kind != LayerKind::Raster
         {
-            self.paste_preview = None;
-            self.paste_texture = None;
+            self.status = self
+                .text(
+                    "貼り付け先がロック・参照・非ラスターです。描画できるレイヤーを選んでください",
+                    "Choose an unlocked, non-reference raster layer to paste into",
+                )
+                .into();
             return;
         }
         let Some((w, h, pixels, position)) = self.paste_preview.take() else {
@@ -4437,9 +4446,13 @@ impl EfudeApp {
         self.paste_texture = None;
         let ox = position.x.round() as i32;
         let oy = position.y.round() as i32;
+        let x_start = (-i64::from(ox)).clamp(0, i64::from(w)) as u32;
+        let y_start = (-i64::from(oy)).clamp(0, i64::from(h)) as u32;
+        let x_end = (i64::from(self.doc.width) - i64::from(ox)).clamp(0, i64::from(w)) as u32;
+        let y_end = (i64::from(self.doc.height) - i64::from(oy)).clamp(0, i64::from(h)) as u32;
         self.history.begin();
-        for y in 0..h.min(self.doc.height) {
-            for x in 0..w.min(self.doc.width) {
+        for y in y_start..y_end {
+            for x in x_start..x_end {
                 let dx = ox + x as i32;
                 let dy = oy + y as i32;
                 if dx < 0 || dy < 0 || dx >= self.doc.width as i32 || dy >= self.doc.height as i32 {
@@ -4968,6 +4981,9 @@ impl EfudeApp {
         }
         self.sync_tool_change();
         self.tidy_layers();
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.finish_pending_canvas_gesture();
+        }
         let other_dirty_tabs = self
             .dirty_tabs()
             .into_iter()
@@ -5607,6 +5623,14 @@ impl EfudeApp {
         self.brush_import_dialog(ctx);
         self.book_export_dialog(ctx);
         self.finishing_check_dialog(ctx);
+        if let Some(error) = self.history.take_error() {
+            ctx.request_repaint();
+            self.status = if self.language_english {
+                format!("History storage error: {error}")
+            } else {
+                format!("取り消し履歴の保存・読み込みに失敗しました: {error}")
+            };
+        }
         let english = self.language_english;
         egui::Window::new(if english { "Efude Help" } else { "Efude ヘルプ" })
             .open(&mut self.show_help)

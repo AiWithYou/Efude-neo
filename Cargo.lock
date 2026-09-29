@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "efude"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "efude-brush",
  "efude-canvas",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "efude-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "eframe",
  "efude-ui",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "efude-brush"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "efude-canvas",
  "efude-core",
@@ -782,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "efude-canvas"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "efude-core",
  "postcard",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "efude-comic"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ab_glyph",
  "glam",
@@ -803,14 +803,14 @@ dependencies = [
 
 [[package]]
 name = "efude-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "glam",
 ]
 
 [[package]]
 name = "efude-gpu"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "efude-brush",
  "efude-canvas",
@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "efude-input"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "crossbeam-queue",
  "efude-core",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "efude-io"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "efude-canvas",
  "image",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "efude-stroke"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "efude-core",
  "glam",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "efude-ui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "eframe",
  "efude-brush",

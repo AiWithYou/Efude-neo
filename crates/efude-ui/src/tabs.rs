@@ -25,6 +25,8 @@ pub(crate) struct DocumentTab {
     fill_reference_layer: u64,
     selection_reference_layer: u64,
     effect_layer: Option<u64>,
+    paste_preview: Option<(u32, u32, Vec<u8>, Vec2)>,
+    paste_texture: Option<egui::TextureHandle>,
 }
 
 /// A tab: its number for untitled documents, and the parked document
@@ -84,7 +86,18 @@ impl EfudeApp {
         tab.history.set_guide(&mut tab.doc, Some(guide));
         true
     }
+    pub(crate) fn finish_pending_canvas_gesture(&mut self) {
+        if self.selection_start.is_some()
+            || self.stroke_builder.is_some()
+            || !self.active.is_empty()
+        {
+            self.finish_canvas_gesture(false);
+            self.canvas_gesture_interrupted = true;
+        }
+    }
+
     fn park_active(&mut self) -> DocumentTab {
+        self.finish_pending_canvas_gesture();
         self.commit_pending_guide_edit();
         let size = (self.doc.width, self.doc.height);
         DocumentTab {
@@ -105,6 +118,8 @@ impl EfudeApp {
             fill_reference_layer: self.fill_reference_layer,
             selection_reference_layer: self.selection_reference_layer,
             effect_layer: self.comic_ui.effect_layer.take(),
+            paste_preview: self.paste_preview.take(),
+            paste_texture: self.paste_texture.take(),
         }
     }
 
@@ -126,19 +141,24 @@ impl EfudeApp {
         self.fill_reference_layer = tab.fill_reference_layer;
         self.selection_reference_layer = tab.selection_reference_layer;
         self.comic_ui.effect_layer = tab.effect_layer;
+        self.paste_preview = tab.paste_preview;
+        self.paste_texture = tab.paste_texture;
         self.canvas_width_input = self.doc.width;
         self.canvas_height_input = self.doc.height;
         self.canvas_dpi_input = self.doc.dpi;
     }
 
-    /// Drops in-progress gestures and redraws everything: called whenever
-    /// the active document changes.
+    /// Clears gestures finished on the old document and redraws everything
+    /// whenever the active document changes.
     fn reset_transient_state(&mut self) {
         self.active.clear();
         self.stroke_builder = None;
         self.provisional = None;
         self.pending_provisional.clear();
         self.vector_live = None;
+        self.vector_edit = Default::default();
+        self.move_origin = None;
+        self.balloon_ui.clear_document_gesture();
         self.layer_drag = None;
         self.paste_preview = None;
         self.paste_texture = None;
@@ -147,6 +167,7 @@ impl EfudeApp {
         self.selection_points.clear();
         self.bezier_points.clear();
         self.gesture_end = None;
+        self.canvas_gesture_interrupted = true;
         self.pan_start = None;
         self.setting_vanishing_point = false;
         self.comic_ui.split_start = None;
@@ -161,6 +182,7 @@ impl EfudeApp {
     /// opened document may simply replace.
     fn active_tab_is_pristine(&self) -> bool {
         self.doc_path.is_none()
+            && self.paste_preview.is_none()
             && !self.history.is_dirty()
             && !self.history.can_undo()
             && self
@@ -201,9 +223,9 @@ impl EfudeApp {
         };
         let parked = self.park_active();
         self.tabs.slots[self.tabs.active].parked = Some(parked);
+        self.reset_transient_state();
         self.unpark(target);
         self.tabs.active = index;
-        self.reset_transient_state();
     }
 
     fn tab_is_dirty(&self, index: usize) -> bool {
@@ -464,6 +486,9 @@ impl EfudeApp {
 
     /// Closes a tab, asking first when it has unsaved changes.
     pub(crate) fn request_close_tab(&mut self, index: usize) {
+        if index == self.tabs.active {
+            self.finish_pending_canvas_gesture();
+        }
         let Some(slot) = self.tabs.slots.get(index) else {
             return;
         };
@@ -560,5 +585,46 @@ impl EfudeApp {
             Some(false) => self.tabs.confirm_close = None,
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_paste_and_texture_survive_a_tab_round_trip() {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(8, 8);
+        app.doc.layers[0].pixels.set_pixel(0, 0, [0, 0, 0, 255]);
+        app.open_document_tab();
+        let pixels = vec![255; 16];
+        let texture = egui::Context::default().load_texture(
+            "pending-paste-test",
+            egui::ColorImage::from_rgba_unmultiplied([2, 2], &pixels),
+            egui::TextureOptions::LINEAR,
+        );
+        let id = texture.id();
+        app.paste_preview = Some((2, 2, pixels.clone(), Vec2::new(-1.0, 3.0)));
+        app.paste_texture = Some(texture);
+        app.switch_tab(0);
+        assert!(app.paste_preview.is_none());
+        app.switch_tab(1);
+        let preview = app.paste_preview.as_ref().unwrap();
+        assert_eq!(preview.2, pixels);
+        assert_eq!(preview.3, Vec2::new(-1.0, 3.0));
+        assert_eq!(app.paste_texture.as_ref().unwrap().id(), id);
+    }
+
+    #[test]
+    fn opening_a_document_preserves_a_paste_on_an_otherwise_blank_tab() {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(8, 8);
+        app.paste_preview = Some((2, 2, vec![255; 16], Vec2::ZERO));
+        app.open_document_tab();
+        assert_eq!(app.tabs.slots.len(), 2);
+        assert!(app.paste_preview.is_none());
+        app.switch_tab(0);
+        assert!(app.paste_preview.is_some());
     }
 }
