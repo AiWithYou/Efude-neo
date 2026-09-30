@@ -1636,6 +1636,22 @@ impl History {
                     mask, doc.width, doc.height, width, height, offset_x, offset_y, true,
                 ));
             }
+            if (offset_x != 0 || offset_y != 0)
+                && let Some(strokes) = &mut layer.vector
+            {
+                // Pixels are only the vector layer's cache. Keep its editable
+                // geometry aligned, without changing relative curve handles.
+                for stroke in strokes {
+                    for point in &mut stroke.points {
+                        point.x += offset_x as f32;
+                        point.y += offset_y as f32;
+                    }
+                    for anchor in &mut stroke.anchors {
+                        anchor.x += offset_x as f32;
+                        anchor.y += offset_y as f32;
+                    }
+                }
+            }
         }
         if let Some(guide) = &mut doc.guide {
             guide.offset_x += offset_x as f32;
@@ -3836,6 +3852,213 @@ mod guide_history_tests {
         assert_eq!(doc.guide.as_ref().unwrap().offset_y, before.offset_y + 1.0);
         history.undo_document(&mut doc);
         assert!(doc.guide.as_ref().unwrap() == &before);
+    }
+}
+
+#[cfg(test)]
+mod vector_resize_tests {
+    use super::*;
+
+    fn vector_document() -> Document {
+        let mut doc = Document::new(16, 16);
+        doc.layers[0].pixels.set_pixel(6, 7, [80, 40, 20, 255]);
+        let mut layer = Layer::new(2, "Vector", 16, 16);
+        layer.vector = Some(vec![VectorStroke::fitted(
+            vec![
+                VectorPoint {
+                    x: 3.5,
+                    y: 6.5,
+                    width: 2.0,
+                },
+                VectorPoint {
+                    x: 12.5,
+                    y: 8.5,
+                    width: 3.0,
+                },
+            ],
+            [10, 20, 30, 200],
+            0.8,
+        )]);
+        vector::render_all(&mut layer, 16, 16, None);
+        doc.layers.push(layer);
+        doc
+    }
+
+    #[test]
+    fn canvas_resize_keeps_vector_geometry_aligned_with_pixels() {
+        for (width, height, dx, dy) in [(21, 23, 2.0, 3.0), (11, 9, -2.0, -3.0)] {
+            let mut doc = vector_document();
+            let before = doc.layers[1].vector.as_ref().unwrap()[0].clone();
+            let mut history = History::default();
+            history
+                .resize_document(&mut doc, width, height, 300.0)
+                .unwrap();
+            let after = &doc.layers[1].vector.as_ref().unwrap()[0];
+            assert_eq!(after.points.len(), before.points.len());
+            assert_eq!(after.anchors.len(), before.anchors.len());
+            for (old, new) in before.points.iter().zip(&after.points) {
+                assert_eq!((new.x, new.y), (old.x + dx, old.y + dy));
+                assert_eq!(new.width, old.width);
+            }
+            for (old, new) in before.anchors.iter().zip(&after.anchors) {
+                assert_eq!((new.x, new.y), (old.x + dx, old.y + dy));
+                assert_eq!((new.in_x, new.in_y), (old.in_x, old.in_y));
+                assert_eq!((new.out_x, new.out_y), (old.out_x, old.out_y));
+                assert_eq!(new.width, old.width);
+                assert_eq!(new.corner, old.corner);
+            }
+            assert_eq!(after.color, before.color);
+            assert_eq!(after.hardness, before.hardness);
+            assert_eq!(
+                doc.layers[0]
+                    .pixels
+                    .pixel((6.0 + dx) as u32, (7.0 + dy) as u32),
+                [80, 40, 20, 255]
+            );
+            // Editing a curve redraws its pixels. That redraw must not make
+            // the resized line jump back to its old canvas coordinates.
+            let cached = doc.layers[1].pixels.to_dense();
+            vector::render_all(&mut doc.layers[1], width, height, None);
+            assert_eq!(doc.layers[1].pixels.to_dense(), cached);
+        }
+    }
+
+    #[test]
+    fn canvas_resize_undo_redo_restores_vector_geometry_and_pixels() {
+        for (width, height) in [(20, 22), (11, 9)] {
+            let mut doc = vector_document();
+            let before = doc.clone();
+            let mut history = History::default();
+            history.begin();
+            history
+                .resize_document(&mut doc, width, height, 600.0)
+                .unwrap();
+            history.commit();
+            let after = doc.clone();
+            for _ in 0..2 {
+                history.undo_document(&mut doc);
+                assert_eq!((doc.width, doc.height, doc.dpi), (16, 16, before.dpi));
+                assert_eq!(doc.layers[1].vector, before.layers[1].vector);
+                assert_eq!(
+                    doc.layers[1].pixels.to_dense(),
+                    before.layers[1].pixels.to_dense()
+                );
+                history.redo_document(&mut doc);
+                assert_eq!((doc.width, doc.height, doc.dpi), (width, height, 600.0));
+                assert_eq!(doc.layers[1].vector, after.layers[1].vector);
+                assert_eq!(
+                    doc.layers[1].pixels.to_dense(),
+                    after.layers[1].pixels.to_dense()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_resize_preserves_point_only_strokes_outside_the_cropped_canvas() {
+        let mut doc = Document::new(16, 16);
+        doc.layers[0].vector = Some(vec![VectorStroke {
+            points: vec![
+                VectorPoint {
+                    x: 1.5,
+                    y: 4.5,
+                    width: 2.0,
+                },
+                VectorPoint {
+                    x: 10.5,
+                    y: 7.5,
+                    width: 2.0,
+                },
+            ],
+            color: [10, 20, 30, 255],
+            hardness: 1.0,
+            anchors: Vec::new(),
+        }]);
+        vector::render_all(&mut doc.layers[0], 16, 16, None);
+        let mut history = History::default();
+        history.resize_document(&mut doc, 11, 9, 300.0).unwrap();
+        let stroke = &doc.layers[0].vector.as_ref().unwrap()[0];
+        assert_eq!(stroke.points.len(), 2);
+        assert_eq!(
+            stroke.points[0],
+            VectorPoint {
+                x: -0.5,
+                y: 1.5,
+                width: 2.0
+            }
+        );
+        assert_eq!(
+            stroke.points[1],
+            VectorPoint {
+                x: 8.5,
+                y: 4.5,
+                width: 2.0
+            }
+        );
+        assert!(stroke.anchors.is_empty());
+        let cached = doc.layers[0].pixels.to_dense();
+        vector::render_all(&mut doc.layers[0], 11, 9, None);
+        assert_eq!(doc.layers[0].pixels.to_dense(), cached);
+    }
+
+    #[test]
+    fn canvas_resize_preserves_curved_stroke_handles() {
+        let mut doc = Document::new(16, 16);
+        let mut expected = VectorStroke::fitted(
+            vec![
+                VectorPoint {
+                    x: 3.5,
+                    y: 5.5,
+                    width: 2.0,
+                },
+                VectorPoint {
+                    x: 7.5,
+                    y: 10.5,
+                    width: 2.5,
+                },
+                VectorPoint {
+                    x: 12.5,
+                    y: 4.5,
+                    width: 3.0,
+                },
+            ],
+            [10, 20, 30, 200],
+            0.8,
+        );
+        assert!(expected.points.iter().any(|point| point.y > 8.0));
+        doc.layers[0].vector = Some(vec![expected.clone()]);
+        vector::render_all(&mut doc.layers[0], 16, 16, None);
+        History::default()
+            .resize_document(&mut doc, 20, 22, 300.0)
+            .unwrap();
+        for point in &mut expected.points {
+            point.x += 2.0;
+            point.y += 3.0;
+        }
+        for anchor in &mut expected.anchors {
+            anchor.x += 2.0;
+            anchor.y += 3.0;
+        }
+        assert_eq!(doc.layers[0].vector, Some(vec![expected]));
+    }
+
+    #[test]
+    fn dpi_only_resize_does_not_change_vector_geometry() {
+        let mut doc = vector_document();
+        let before = doc.clone();
+        let mut history = History::default();
+        assert!(history.resize_document(&mut doc, 16, 16, 600.0).unwrap());
+        assert_eq!(doc.layers[1].vector, before.layers[1].vector);
+        assert_eq!(
+            doc.layers[1].pixels.to_dense(),
+            before.layers[1].pixels.to_dense()
+        );
+        let token = history.state_token();
+        assert!(!history.resize_document(&mut doc, 16, 16, 600.0).unwrap());
+        assert_eq!(history.state_token(), token);
+        // Integer centering also produces zero offsets for a one-pixel change.
+        assert!(history.resize_document(&mut doc, 17, 15, 600.0).unwrap());
+        assert_eq!(doc.layers[1].vector, before.layers[1].vector);
     }
 }
 

@@ -2080,6 +2080,52 @@ mod tests {
     }
 
     #[test]
+    fn resized_vector_geometry_stays_aligned_after_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resized-vector.efude");
+        let mut doc = Document::new(16, 16);
+        doc.layers[0].vector = Some(vec![efude_canvas::VectorStroke::fitted(
+            vec![
+                efude_canvas::VectorPoint {
+                    x: 4.5,
+                    y: 6.5,
+                    width: 2.0,
+                },
+                efude_canvas::VectorPoint {
+                    x: 10.5,
+                    y: 6.5,
+                    width: 2.0,
+                },
+            ],
+            [10, 20, 30, 255],
+            1.0,
+        )]);
+        efude_canvas::vector::render_all(&mut doc.layers[0], 16, 16, None);
+        efude_canvas::History::default()
+            .resize_document(&mut doc, 20, 22, 300.0)
+            .unwrap();
+        save(&path, &doc).unwrap();
+        let mut loaded = load(&path).unwrap();
+        assert_eq!((loaded.width, loaded.height), (20, 22));
+        assert_eq!(loaded.layers[0].vector, doc.layers[0].vector);
+        let point = loaded.layers[0].vector.as_ref().unwrap()[0].points[0];
+        assert_eq!((point.x, point.y), (6.5, 9.5));
+        let cached = loaded.layers[0].pixels.to_dense();
+        assert_eq!(cached, doc.layers[0].pixels.to_dense());
+        efude_canvas::vector::render_all(&mut loaded.layers[0], 20, 22, None);
+        // Translating f32 coordinates can round antialias coverage by one
+        // level; the saved pixels themselves above must round-trip exactly.
+        assert!(
+            loaded.layers[0]
+                .pixels
+                .to_dense()
+                .iter()
+                .zip(&cached)
+                .all(|(&rendered, &saved)| rendered.abs_diff(saved) <= 1)
+        );
+    }
+
+    #[test]
     fn vector_strokes_round_trip_and_folders_load_in_panel_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vector.efude");
