@@ -759,12 +759,14 @@ impl EfudeApp {
     }
 
     pub(crate) fn undo(&mut self) {
+        self.finish_pending_canvas_gesture();
         self.commit_pending_guide_edit();
         self.history.undo_document(&mut self.doc);
         self.after_history_step();
     }
 
     pub(crate) fn redo(&mut self) {
+        self.finish_pending_canvas_gesture();
         self.commit_pending_guide_edit();
         self.history.redo_document(&mut self.doc);
         self.after_history_step();

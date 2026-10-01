@@ -36,6 +36,7 @@ enum IoCompletion {
         rgba: Vec<u8>,
     },
     ImageLoaded {
+        document_id: u64,
         path: std::path::PathBuf,
         width: u32,
         height: u32,
@@ -133,6 +134,7 @@ enum IoTask {
         repaint: egui::Context,
     },
     LoadImageLayer {
+        document_id: u64,
         path: std::path::PathBuf,
         max_width: u32,
         max_height: u32,
@@ -1158,6 +1160,7 @@ impl Default for EfudeApp {
                             repaint.request_repaint();
                         }
                         IoTask::LoadImageLayer {
+                            document_id,
                             path,
                             max_width,
                             max_height,
@@ -1166,6 +1169,7 @@ impl Default for EfudeApp {
                             let decoded = decode_limited_image(&path, max_width, max_height);
                             let completion = match decoded {
                                 Ok((width, height, rgba)) => IoCompletion::ImageLoaded {
+                                    document_id,
                                     path,
                                     width,
                                     height,
@@ -2225,6 +2229,7 @@ impl EfudeApp {
         let Some(path) = self.choose_native_save_path() else {
             return Ok(false);
         };
+        self.finish_pending_canvas_gesture();
         self.commit_pending_guide_edit();
         self.queue_document_save(path, false, ctx)?;
         self.last_backup = std::time::Instant::now();
@@ -2262,6 +2267,7 @@ impl EfudeApp {
     ) -> Result<(), String> {
         self.io_task_sender
             .send(IoTask::LoadImageLayer {
+                document_id: self.history.document_id(),
                 path,
                 max_width: self.doc.width,
                 max_height: self.doc.height,
@@ -2435,34 +2441,27 @@ impl EfudeApp {
             .collect::<Vec<_>>();
         self.record_macro_creation(macros::Step::DuplicateActive, root_id, &created);
     }
-    fn install_image_layer(
-        &mut self,
-        path: std::path::PathBuf,
+    fn insert_image_layer(
+        doc: &mut Document,
+        history: &mut History,
+        path: &std::path::Path,
         width: u32,
         height: u32,
         rgba: Vec<u8>,
-    ) {
-        let id = self
-            .doc
-            .layers
-            .iter()
-            .map(|layer| layer.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
+    ) -> usize {
+        let id = doc.layers.iter().map(|layer| layer.id).max().unwrap_or(0) + 1;
         let name = path
             .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or("画像")
             .to_string();
-        let mut layer = efude_canvas::Layer::new(id, name.clone(), self.doc.width, self.doc.height);
-        let x_offset = self.doc.width.saturating_sub(width) / 2;
-        let y_offset = self.doc.height.saturating_sub(height) / 2;
-        self.history.begin();
-        let index = self.doc.layers.len();
-        self.history
-            .insert_layer(&mut self.doc.layers, index, layer.clone());
-        layer = self.doc.layers[index].clone();
+        let mut layer = efude_canvas::Layer::new(id, name, doc.width, doc.height);
+        let x_offset = doc.width.saturating_sub(width) / 2;
+        let y_offset = doc.height.saturating_sub(height) / 2;
+        history.begin();
+        let index = doc.layers.len();
+        history.insert_layer(&mut doc.layers, index, layer.clone());
+        layer = doc.layers[index].clone();
         for y in 0..height {
             for x in 0..width {
                 let src = ((y * width + x) * 4) as usize;
@@ -2470,20 +2469,19 @@ impl EfudeApp {
                 if pixel[3] != 0 {
                     let dx = x + x_offset;
                     let dy = y + y_offset;
-                    let pixel_index = (dy * self.doc.width + dx) as usize * 4;
-                    self.history.record_pixel(&layer, pixel_index);
-                    self.history.record_pixel(&layer, pixel_index + 1);
-                    self.history.record_pixel(&layer, pixel_index + 2);
-                    self.history.record_pixel(&layer, pixel_index + 3);
+                    let pixel_index = (dy * doc.width + dx) as usize * 4;
+                    history.record_pixel(&layer, pixel_index);
+                    history.record_pixel(&layer, pixel_index + 1);
+                    history.record_pixel(&layer, pixel_index + 2);
+                    history.record_pixel(&layer, pixel_index + 3);
                     layer.pixels.set_pixel(dx, dy, pixel);
                 }
             }
         }
         layer.pixels.prune_empty_tiles();
-        self.doc.layers[index] = layer;
-        self.history.commit();
-        self.selected_layer = index;
-        self.status = format!("画像を新しいレイヤーに読み込みました: {name}");
+        doc.layers[index] = layer;
+        history.commit();
+        index
     }
     fn install_system_font(ctx: &egui::Context) {
         let mut candidates = Vec::new();
@@ -5345,14 +5343,47 @@ impl EfudeApp {
                     };
                 }
                 IoCompletion::ImageLoaded {
+                    document_id,
                     path,
                     width,
                     height,
                     rgba,
                 } => {
-                    self.install_image_layer(path, width, height, rgba);
-                    self.canvas_texture_dirty = true;
-                    self.navigator_texture_dirty = true;
+                    let name = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("image");
+                    let installed = if self.history.document_id() == document_id {
+                        self.finish_pending_canvas_gesture();
+                        self.commit_pending_guide_edit();
+                        self.selected_layer = Self::insert_image_layer(
+                            &mut self.doc,
+                            &mut self.history,
+                            &path,
+                            width,
+                            height,
+                            rgba,
+                        );
+                        self.editing_mask = false;
+                        self.canvas_texture_dirty = true;
+                        self.navigator_texture_dirty = true;
+                        true
+                    } else {
+                        self.install_image_in_parked_tab(document_id, &path, width, height, rgba)
+                    };
+                    self.status = if installed {
+                        if self.language_english {
+                            format!("Imported image as a new layer: {name}")
+                        } else {
+                            format!("画像を新しいレイヤーに読み込みました: {name}")
+                        }
+                    } else {
+                        self.text(
+                            "読み込み先のタブが閉じられたため、画像の読み込みを取り消しました",
+                            "Image import cancelled because its destination tab was closed",
+                        )
+                        .into()
+                    };
                 }
                 IoCompletion::ReferenceLoaded {
                     path,

@@ -63,6 +63,29 @@ impl Tabs {
 }
 
 impl EfudeApp {
+    pub(crate) fn install_image_in_parked_tab(
+        &mut self,
+        document_id: u64,
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> bool {
+        let Some(tab) = self
+            .tabs
+            .slots
+            .iter_mut()
+            .filter_map(|slot| slot.parked.as_mut())
+            .find(|tab| tab.history.document_id() == document_id)
+        else {
+            return false;
+        };
+        tab.selected_layer =
+            Self::insert_image_layer(&mut tab.doc, &mut tab.history, path, width, height, rgba);
+        tab.editing_mask = false;
+        true
+    }
+
     pub(crate) fn install_guide_in_parked_tab(
         &mut self,
         document_id: u64,
@@ -591,6 +614,152 @@ impl EfudeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finish_io(app: &mut EfudeApp, ctx: &egui::Context) {
+        for _ in 0..200 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.update_ui(ctx));
+            if app.io_task_sender.busy.get() == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("I/O did not finish: {}", app.status);
+    }
+
+    #[test]
+    fn pending_image_import_stays_with_its_original_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.png");
+        let color = [10, 20, 30, 255];
+        image::RgbaImage::from_pixel(2, 2, image::Rgba(color))
+            .save(&path)
+            .unwrap();
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(8, 8);
+        app.doc_path = Some(directory.path().join("original.efude"));
+        let origin_id = app.history.document_id();
+        let ctx = egui::Context::default();
+        app.queue_image_layer(path, &ctx).unwrap();
+
+        // Completion is only polled during a UI frame, so switch first even
+        // if the worker has already finished decoding this small fixture.
+        app.open_document_tab();
+        app.replace_document(Document::new(16, 12), None);
+        let active_id = app.history.document_id();
+        finish_io(&mut app, &ctx);
+        assert_eq!(app.history.document_id(), active_id);
+        assert_eq!(app.doc.layers.len(), 1, "import changed the active tab");
+        assert!(!app.history.is_dirty());
+        assert_eq!(app.selected_layer, 0);
+
+        app.switch_tab(0);
+        assert_eq!(app.history.document_id(), origin_id);
+        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(app.selected_layer, 1);
+        assert_eq!(app.doc.layers[1].pixels.pixel(3, 3), color);
+        assert!(app.history.is_dirty());
+        app.undo();
+        assert_eq!(app.doc.layers.len(), 1, "import must be one undo step");
+        app.redo();
+        assert_eq!(app.doc.layers[1].pixels.pixel(3, 3), color);
+    }
+
+    #[test]
+    fn pending_image_import_is_discarded_when_its_tab_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .unwrap();
+        let mut app = EfudeApp::default();
+        app.language_english = true;
+        app.doc = Document::new(8, 8);
+        let ctx = egui::Context::default();
+        app.queue_image_layer(path, &ctx).unwrap();
+        app.close_tab_now(0);
+        let replacement_id = app.history.document_id();
+        finish_io(&mut app, &ctx);
+        assert_eq!(app.history.document_id(), replacement_id);
+        assert_eq!(app.doc.layers.len(), 1, "import changed a replacement tab");
+        assert!(!app.history.is_dirty());
+        assert!(app.status.contains("closed"), "{}", app.status);
+    }
+
+    #[test]
+    fn pending_image_import_is_discarded_when_a_pristine_tab_is_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .unwrap();
+        for open_file in [false, true] {
+            let mut app = EfudeApp::default();
+            app.doc = Document::new(8, 8);
+            let ctx = egui::Context::default();
+            app.queue_image_layer(path.clone(), &ctx).unwrap();
+            if open_file {
+                app.install_document(Document::new(16, 12), directory.path().join("other.efude"));
+            } else {
+                app.canvas_width_input = 16;
+                app.canvas_height_input = 12;
+                assert!(app.new_document());
+            }
+            let replacement_id = app.history.document_id();
+            finish_io(&mut app, &ctx);
+            assert_eq!(app.tabs.slots.len(), 1);
+            assert_eq!(app.history.document_id(), replacement_id);
+            assert_eq!(app.doc.layers.len(), 1, "import changed a replacement tab");
+            assert!(!app.history.is_dirty());
+        }
+    }
+
+    #[test]
+    fn pending_image_imports_preserve_queue_order_and_independent_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let colors = [[10, 20, 30, 255], [40, 50, 60, 255]];
+        for parked in [false, true] {
+            let mut app = EfudeApp::default();
+            app.doc = Document::new(8, 8);
+            app.doc_path = Some(directory.path().join("original.efude"));
+            let ctx = egui::Context::default();
+            for (index, color) in colors.iter().enumerate() {
+                let path = directory.path().join(format!("import-{index}.png"));
+                image::RgbaImage::from_pixel(2, 2, image::Rgba(*color))
+                    .save(&path)
+                    .unwrap();
+                app.queue_image_layer(path, &ctx).unwrap();
+            }
+            if parked {
+                app.open_document_tab();
+                app.replace_document(Document::new(16, 12), None);
+            }
+            finish_io(&mut app, &ctx);
+            if parked {
+                assert_eq!(app.doc.layers.len(), 1);
+                assert!(!app.history.is_dirty());
+                app.switch_tab(0);
+            }
+            assert_eq!(app.doc.layers.len(), 3);
+            assert_eq!(app.selected_layer, 2);
+            for (index, color) in colors.iter().enumerate() {
+                assert_eq!(app.doc.layers[index + 1].pixels.pixel(3, 3), *color);
+            }
+            app.undo();
+            assert_eq!(app.doc.layers.len(), 2);
+            assert_eq!(app.doc.layers[1].pixels.pixel(3, 3), colors[0]);
+            app.undo();
+            assert_eq!(app.doc.layers.len(), 1);
+            assert!(!app.history.is_dirty());
+            app.redo();
+            app.redo();
+            assert_eq!(app.doc.layers.len(), 3);
+            assert_eq!(app.doc.layers[2].pixels.pixel(3, 3), colors[1]);
+        }
+    }
 
     #[test]
     fn pending_paste_and_texture_survive_a_tab_round_trip() {

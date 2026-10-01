@@ -1612,6 +1612,181 @@ fn closing_a_tab_during_a_stroke_checks_its_unsaved_changes() {
 }
 
 #[test]
+fn undo_during_a_stroke_finishes_it_and_pen_up_does_not_repaint() {
+    let mut h = Harness::new(120, 80);
+    h.use_tool(Tool::Brush);
+    h.drag(&[v(20.0, 20.0), v(55.0, 20.0)]);
+    let before = h.app.doc.layers[0].pixels.to_dense();
+    let before_token = h.app.history.state_token();
+    h.move_to(h.screen(v(20.0, 50.0)));
+    h.button(true, egui::PointerButton::Primary);
+    for x in [25.0, 35.0, 45.0, 55.0] {
+        h.move_to(h.screen(v(x, 50.0)));
+    }
+    assert!(h.app.history.is_active());
+    ctrl_key(&mut h, egui::Key::Z, false);
+    assert!(!h.app.history.is_active());
+    assert!(h.app.stroke_builder.is_none());
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), before);
+    assert_eq!(h.app.history.state_token(), before_token);
+    assert!(h.app.history.can_redo());
+
+    h.key(egui::Key::Z, false);
+    h.move_to(h.screen(v(90.0, 50.0)));
+    h.button(false, egui::PointerButton::Primary);
+    h.frames(2);
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), before);
+    assert_eq!(h.app.history.state_token(), before_token);
+
+    ctrl_key(&mut h, egui::Key::Z, true);
+    let finished = h.app.doc.layers[0].pixels.to_dense();
+    let finished_token = h.app.history.state_token();
+    assert!(h.pixel(35, 50)[3] > 0);
+    assert_eq!(h.pixel(90, 50)[3], 0);
+    for _ in 0..3 {
+        ctrl_key(&mut h, egui::Key::Z, false);
+        assert_eq!(h.app.doc.layers[0].pixels.to_dense(), before);
+        assert_eq!(h.app.history.state_token(), before_token);
+        ctrl_key(&mut h, egui::Key::Z, true);
+        assert_eq!(h.app.doc.layers[0].pixels.to_dense(), finished);
+        assert_eq!(h.app.history.state_token(), finished_token);
+    }
+    h.drag(&[v(20.0, 70.0), v(55.0, 70.0)]);
+    assert!(h.pixel(35, 70)[3] > 0, "a new gesture still works");
+}
+
+#[test]
+fn redo_during_a_stroke_finishes_the_new_branch_before_redo() {
+    let mut h = Harness::new(120, 80);
+    h.use_tool(Tool::Brush);
+    h.drag(&[v(20.0, 20.0), v(55.0, 20.0)]);
+    let before = h.app.doc.layers[0].pixels.to_dense();
+    h.drag(&[v(20.0, 40.0), v(55.0, 40.0)]);
+    ctrl_key(&mut h, egui::Key::Z, false);
+    h.key(egui::Key::Z, false);
+    assert!(h.app.history.can_redo());
+
+    h.move_to(h.screen(v(20.0, 60.0)));
+    h.button(true, egui::PointerButton::Primary);
+    for x in [25.0, 35.0, 45.0, 55.0] {
+        h.move_to(h.screen(v(x, 60.0)));
+    }
+    assert!(h.app.history.is_active());
+    ctrl_key(&mut h, egui::Key::Z, true);
+    assert!(!h.app.history.is_active());
+    assert!(h.app.stroke_builder.is_none());
+    assert!(!h.app.history.can_redo());
+    assert!(h.pixel(35, 60)[3] > 0);
+    assert_eq!(h.pixel(35, 40)[3], 0, "old redo branch was discarded");
+    let finished = h.app.doc.layers[0].pixels.to_dense();
+    h.key(egui::Key::Z, false);
+    h.move_to(h.screen(v(90.0, 60.0)));
+    h.button(false, egui::PointerButton::Primary);
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), finished);
+    ctrl_key(&mut h, egui::Key::Z, false);
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), before);
+    ctrl_key(&mut h, egui::Key::Z, true);
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), finished);
+}
+
+#[test]
+fn saving_during_a_stroke_preserves_the_saved_state_after_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("held-stroke.efude");
+    let mut h = Harness::new(120, 80);
+    h.app.doc_path = Some(path.clone());
+    h.use_tool(Tool::Brush);
+    h.move_to(h.screen(v(20.0, 40.0)));
+    h.button(true, egui::PointerButton::Primary);
+    for x in [25.0, 35.0, 45.0, 55.0] {
+        h.move_to(h.screen(v(x, 40.0)));
+    }
+    assert!(h.app.history.is_active());
+    assert!(h.app.request_native_save(&h.ctx).unwrap());
+    h.button(false, egui::PointerButton::Primary);
+    let finished = h.app.doc.layers[0].pixels.to_dense();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.app.io_task_sender.busy.get() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.frames(1);
+    }
+    assert_eq!(h.app.io_task_sender.busy.get(), 0);
+    let saved = efude_io::load(&path).unwrap();
+    assert!(saved.layers[0].pixels.pixel(35, 40)[3] > 0);
+    ctrl_key(&mut h, egui::Key::Z, false);
+    assert!(
+        h.app.history.is_dirty(),
+        "undo differs from the saved stroke"
+    );
+    assert_eq!(saved.layers[0].pixels.to_dense(), finished);
+    assert!(!h.app.doc.layers[0].pixels.has_allocated_tiles());
+    ctrl_key(&mut h, egui::Key::Z, true);
+    assert!(!h.app.history.is_dirty());
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), finished);
+}
+
+#[test]
+fn image_import_during_a_stroke_keeps_separate_undo_steps() {
+    let mut h = Harness::new(120, 80);
+    h.use_tool(Tool::Brush);
+    h.move_to(h.screen(v(20.0, 40.0)));
+    h.button(true, egui::PointerButton::Primary);
+    for x in [25.0, 35.0, 45.0, 55.0] {
+        h.move_to(h.screen(v(x, 40.0)));
+    }
+    assert!(h.app.history.is_active());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    h.app.io_receiver = receiver;
+    sender
+        .send(IoCompletion::ImageLoaded {
+            document_id: h.app.history.document_id(),
+            path: "imported.png".into(),
+            width: 2,
+            height: 2,
+            rgba: [80, 90, 100, 255].repeat(4),
+        })
+        .unwrap();
+    h.frames(1);
+    assert_eq!(h.app.doc.layers.len(), 2);
+    assert_eq!(h.app.selected_layer, 1);
+    assert!(!h.app.history.is_active());
+    assert!(h.app.stroke_builder.is_none());
+    let stroke = h.app.doc.layers[0].pixels.to_dense();
+    let imported = h.app.doc.layers[1].pixels.to_dense();
+    h.move_to(h.screen(v(90.0, 40.0)));
+    h.button(false, egui::PointerButton::Primary);
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), stroke);
+    assert_eq!(h.app.doc.layers[1].pixels.to_dense(), imported);
+    ctrl_key(&mut h, egui::Key::Z, false);
+    assert_eq!(h.app.doc.layers.len(), 1);
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), stroke);
+    assert!(h.app.history.can_undo(), "stroke remains a separate step");
+    ctrl_key(&mut h, egui::Key::Z, false);
+    assert!(!h.app.doc.layers[0].pixels.has_allocated_tiles());
+    assert!(!h.app.history.is_dirty());
+    ctrl_key(&mut h, egui::Key::Z, true);
+    ctrl_key(&mut h, egui::Key::Z, true);
+    assert_eq!(h.app.doc.layers[0].pixels.to_dense(), stroke);
+    assert_eq!(h.app.doc.layers[1].pixels.to_dense(), imported);
+}
+
+#[test]
+fn clicking_a_ruler_without_drawing_closes_its_history_transaction() {
+    for tool in [Tool::Line, Tool::EllipseRuler, Tool::PerspectiveRuler] {
+        let mut h = Harness::new(120, 80);
+        h.use_tool(tool);
+        h.click(v(40.0, 40.0));
+        assert!(
+            !h.app.history.is_active(),
+            "click left history active for {tool:?}"
+        );
+        assert!(!h.app.history.is_dirty());
+        assert!(!h.app.history.can_undo());
+        assert!(!h.app.doc.layers[0].pixels.has_allocated_tiles());
+    }
+}
+
+#[test]
 fn switching_tabs_during_a_stroke_finishes_it_without_painting_the_other_document() {
     let mut h = Harness::new(120, 80);
     h.app.doc_path = Some("first.efude".into());

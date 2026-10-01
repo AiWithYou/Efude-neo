@@ -228,6 +228,7 @@ impl EfudeApp {
             .set_file_name(self.suggested_save_name())
             .save_file()
         {
+            self.finish_pending_canvas_gesture();
             self.commit_pending_guide_edit();
             self.last_backup = std::time::Instant::now();
             self.status = match self.queue_document_save(path, false, ctx) {

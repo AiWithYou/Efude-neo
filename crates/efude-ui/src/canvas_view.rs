@@ -50,6 +50,7 @@ impl EfudeApp {
             self.history.rollback_active(&mut self.doc);
             self.rollback_vector_stroke();
             self.vector_live = None;
+            self.history.commit();
         } else if matches!(
             self.tool,
             Tool::Line | Tool::EllipseRuler | Tool::PerspectiveRuler
