@@ -114,6 +114,56 @@ impl EfudeApp {
         self.history.set_metadata(&mut self.doc, METADATA_KEY, text);
     }
 
+    /// Deletes a layer subtree and its editable comic data in the same
+    /// history action. Layer IDs may be reused after deletion.
+    pub(crate) fn delete_document_layer(&mut self, index: usize) {
+        let selected = self.doc.layers.get(self.selected_layer).map(|l| l.id);
+        let before: Vec<u64> = self.doc.layers.iter().map(|l| l.id).collect();
+        let was_active = self.history.is_active();
+        if !was_active {
+            self.history.begin();
+        }
+        self.history.delete_layer(&mut self.doc.layers, index);
+        let removed: Vec<u64> = before
+            .into_iter()
+            .filter(|id| !self.doc.layers.iter().any(|l| l.id == *id))
+            .collect();
+        if !removed.is_empty() {
+            self.remove_balloon_layer_data(&removed);
+            if let Some(mut comic) = self.comic_doc() {
+                let count = comic.layout.panels.len();
+                comic.layout.panels.retain(|panel| {
+                    !removed.contains(&panel.folder_id) && !removed.contains(&panel.border_id)
+                });
+                if comic.layout.panels.len() != count {
+                    self.store_comic(&comic);
+                }
+            }
+            if removed.contains(&self.fill_reference_layer) {
+                self.fill_reference_layer = 0;
+            }
+            if removed.contains(&self.selection_reference_layer) {
+                self.selection_reference_layer = 0;
+            }
+            if self
+                .comic_ui
+                .effect_layer
+                .is_some_and(|id| removed.contains(&id))
+            {
+                self.comic_ui.effect_layer = None;
+            }
+            if let Some(index) = selected.and_then(|id| self.layer_index(id)) {
+                self.selected_layer = index;
+                self.sync_mask_edit_mode();
+            } else {
+                self.select_layer(self.selected_layer);
+            }
+        }
+        if !was_active {
+            self.history.commit();
+        }
+    }
+
     fn next_layer_id(&self) -> u64 {
         self.doc
             .layers
@@ -1255,4 +1305,169 @@ pub(crate) fn tone_settings_ui(ui: &mut egui::Ui, tone: &mut ToneSettings, engli
     });
     tone.color = [color.r(), color.g(), color.b()];
     *tone != before
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel_app() -> EfudeApp {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(128, 96);
+        let comic = ComicDoc {
+            page: PageSpec::presets()[0].2.clone(),
+            layout: PanelLayout::for_dpi(72.0),
+        };
+        app.doc
+            .metadata
+            .insert(METADATA_KEY.into(), serde_json::to_string(&comic).unwrap());
+        app.create_panel(Some([
+            glam::Vec2::new(8.0, 8.0),
+            glam::Vec2::new(120.0, 88.0),
+        ]));
+        app
+    }
+
+    #[test]
+    fn deleting_panel_folder_or_border_removes_stale_metadata_and_undo_restores_it() {
+        for delete_border in [false, true] {
+            let mut app = panel_app();
+            let panel = app.comic_doc().unwrap().layout.panels[0].clone();
+            let removed_id = if delete_border {
+                panel.border_id
+            } else {
+                panel.folder_id
+            };
+            let before = app.doc.clone();
+            app.history = Default::default();
+            let index = app.layer_index(removed_id).unwrap();
+            app.delete_document_layer(index);
+            for _ in 0..3 {
+                assert!(
+                    app.comic_doc().unwrap().layout.panels.is_empty(),
+                    "deleted layer references must not survive to attach to a reused ID"
+                );
+                app.undo();
+                assert_eq!(app.doc.metadata, before.metadata);
+                assert_eq!(app.doc.layers.len(), before.layers.len());
+                app.redo();
+            }
+            app.add_raster_layer();
+            let at = app.selected_layer;
+            app.doc.layers[at].pixels.set_pixel(8, 8, [17, 31, 49, 255]);
+            app.apply_panel_settings(1.0, 1.0, 1.0);
+            assert_eq!(app.doc.layers[at].pixels.pixel(8, 8), [17, 31, 49, 255]);
+        }
+    }
+
+    #[test]
+    fn deleting_panel_with_balloon_preserves_outer_transaction_rollback() {
+        let mut app = panel_app();
+        let panel = app.comic_doc().unwrap().layout.panels[0].clone();
+        app.create_balloon(
+            glam::Vec2::new(64.0, 48.0),
+            Some(glam::Vec2::splat(30.0)),
+            efude_comic::BalloonShape::Ellipse,
+        );
+        app.doc.layers.last_mut().unwrap().parent_id = Some(panel.folder_id);
+        let before = app.doc.clone();
+        app.history = Default::default();
+        app.history.begin();
+        app.history
+            .set_metadata(&mut app.doc, "earlier-step", Some("pending".into()));
+        let index = app.layer_index(panel.folder_id).unwrap();
+        app.delete_document_layer(index);
+        assert!(
+            app.history.is_active(),
+            "helper must not commit an outer action"
+        );
+        assert!(app.balloons().is_empty());
+        assert!(app.comic_doc().unwrap().layout.panels.is_empty());
+        app.history.cancel(&mut app.doc);
+        assert_eq!(app.doc.metadata, before.metadata);
+        assert_eq!(app.doc.layers.len(), before.layers.len());
+        for (actual, expected) in app.doc.layers.iter().zip(&before.layers) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.pixels.to_dense(), expected.pixels.to_dense());
+        }
+        assert!(!app.history.can_undo());
+    }
+
+    #[test]
+    fn deleting_layers_clears_only_removed_cached_targets() {
+        let mut app = panel_app();
+        let panel = app.comic_doc().unwrap().layout.panels[0].clone();
+        app.history.insert_layer(
+            &mut app.doc.layers,
+            4,
+            efude_canvas::Layer::new(5, "Other", 128, 96),
+        );
+        app.fill_reference_layer = panel.border_id;
+        app.selection_reference_layer = panel.border_id;
+        app.comic_ui.effect_layer = Some(panel.border_id);
+        let metadata = app.doc.metadata.clone();
+        app.delete_document_layer(0);
+        assert_eq!(app.fill_reference_layer, panel.border_id);
+        assert_eq!(app.selection_reference_layer, panel.border_id);
+        assert_eq!(app.comic_ui.effect_layer, Some(panel.border_id));
+        assert_eq!(app.doc.metadata, metadata);
+
+        app.delete_document_layer(app.layer_index(panel.folder_id).unwrap());
+        assert_eq!(app.fill_reference_layer, 0);
+        assert_eq!(app.selection_reference_layer, 0);
+        assert_eq!(app.comic_ui.effect_layer, None);
+        assert_eq!(app.doc.layers.len(), 1);
+        assert_eq!(app.doc.layers[0].id, 5);
+
+        // Refusing to delete the document's only layer removes no target.
+        app.fill_reference_layer = 5;
+        app.selection_reference_layer = 5;
+        app.comic_ui.effect_layer = Some(5);
+        let state = app.history.state_token();
+        app.delete_document_layer(0);
+        assert_eq!(app.fill_reference_layer, 5);
+        assert_eq!(app.selection_reference_layer, 5);
+        assert_eq!(app.comic_ui.effect_layer, Some(5));
+        assert_eq!(app.history.state_token(), state);
+    }
+
+    #[test]
+    fn deleting_another_layer_preserves_the_selected_mask_edit_mode() {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(128, 96);
+        app.doc.layers[0].mask = Some(TilePixels::new(128, 96));
+        app.doc
+            .layers
+            .push(efude_canvas::Layer::new(2, "Other", 128, 96));
+        app.selected_layer = 0;
+        app.editing_mask = true;
+
+        app.delete_document_layer(1);
+        assert_eq!(app.doc.layers[app.selected_layer].id, 1);
+        assert!(
+            app.editing_mask,
+            "deleting another layer must not redirect painting from the selected mask into its artwork"
+        );
+
+        app.doc
+            .layers
+            .insert(0, efude_canvas::Layer::new(2, "Below", 128, 96));
+        app.selected_layer = 1;
+        app.delete_document_layer(0);
+        assert_eq!(app.selected_layer, 0);
+        assert!(
+            app.editing_mask,
+            "remapping the retained layer's index must keep mask editing"
+        );
+
+        app.doc
+            .layers
+            .push(efude_canvas::Layer::new(2, "Replacement", 128, 96));
+        app.delete_document_layer(0);
+        assert_eq!(app.doc.layers[app.selected_layer].id, 2);
+        assert!(
+            !app.editing_mask,
+            "deleting the selected target must leave mask editing"
+        );
+    }
 }

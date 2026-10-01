@@ -1043,6 +1043,28 @@ impl EfudeApp {
                         .map(|l| l.id)
                         .collect(),
                 );
+                // Normal UI frames tidy the folder stack before the next
+                // operation. Replay must do so too, after capturing the same
+                // creation offsets as recording, within this transaction.
+                let selected_id = self.doc.layers[self.selected_layer].id;
+                for (to, id) in efude_canvas::layer_tree_order(&self.doc.layers)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let from = self
+                        .doc
+                        .layers
+                        .iter()
+                        .position(|layer| layer.id == id)
+                        .unwrap();
+                    self.history.move_layer(&mut self.doc.layers, from, to);
+                }
+                self.selected_layer = self
+                    .doc
+                    .layers
+                    .iter()
+                    .position(|layer| layer.id == selected_id)
+                    .unwrap();
             }
         }
         self.macro_replaying = false;
@@ -1204,6 +1226,70 @@ mod tests {
     }
 
     #[test]
+    fn repeated_folder_duplicates_replay_the_order_seen_while_recording() {
+        let mut h = crate::tool_tests::Harness::new(8, 8);
+        for id in [2, 3] {
+            let mut child = efude_canvas::Layer::new(id, format!("Child{id}"), 8, 8);
+            child.parent_id = Some(4);
+            h.app.doc.layers.push(child);
+        }
+        let mut folder = efude_canvas::Layer::new(4, "Folder", 8, 8);
+        folder.kind = LayerKind::Folder;
+        h.app.doc.layers.push(folder);
+        h.app.selected_layer = 3;
+        h.frames(1);
+        let original = h.app.doc.clone();
+        h.app.macro_recording = Some(Recording::new(&h.app));
+        for _ in 0..2 {
+            h.app.duplicate_layer_subtree();
+            // Normal UI frames normalize the folder stack before the next click.
+            h.frames(1);
+        }
+        let recording = h.app.macro_recording.take().unwrap();
+        let names = |app: &EfudeApp| {
+            app.doc
+                .layers
+                .iter()
+                .map(|layer| (layer.id, layer.parent_id, layer.name.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = names(&h.app);
+        h.app.doc = original;
+        h.app.history = History::default();
+        h.app.selected_layer = 3;
+        let before = names(&h.app);
+        let mut definition = Definition {
+            version: 2,
+            name: "Duplicate folder twice".into(),
+            steps: recording.steps,
+        };
+        h.app.run_macro(&definition).unwrap();
+        h.frames(1);
+        assert_eq!(names(&h.app), expected);
+        h.app.undo();
+        h.frames(1);
+        assert_eq!(names(&h.app), before);
+        assert!(!h.app.history.can_undo());
+        let token = h.app.history.state_token();
+        definition.steps.push(command(
+            3,
+            Target::Created {
+                step_id: 2,
+                offset: 1999,
+            },
+            Step::SetOpacity { value: 0.5 },
+        ));
+        assert!(h.app.run_macro(&definition).is_err());
+        h.frames(1);
+        assert_eq!(names(&h.app), before);
+        assert_eq!(h.app.history.state_token(), token);
+        assert!(h.app.history.can_redo());
+        h.app.redo();
+        h.frames(1);
+        assert_eq!(names(&h.app), expected);
+    }
+
+    #[test]
     fn legacy_files_load_and_v2_round_trip_preserves_stable_references() {
         let old: Definition = serde_json::from_str(r#"{"version":1,"name":"Old","steps":[{"op":"new_raster"},{"op":"set_name","name":"Ink"}]}"#).unwrap();
         let mut definition = normalize(old);
@@ -1290,6 +1376,92 @@ mod tests {
         app.run_macro(&definition).unwrap();
         assert_eq!(app.doc.layers[0].opacity, 0.8);
         assert_eq!(app.doc.layers[1].opacity, 0.4);
+    }
+
+    #[test]
+    fn recording_visibility_on_selected_and_unselected_rows_replays_the_operated_layer() {
+        for target_index in 0..2 {
+            let mut app = EfudeApp::default();
+            app.doc = Document::new(8, 8);
+            app.doc
+                .layers
+                .push(efude_canvas::Layer::new(2, "Other", 8, 8));
+            app.macro_recording = Some(Recording::new(&app));
+            let target_id = app.doc.layers[target_index].id;
+            let ctx = egui::Context::default();
+            let frame = |app: &mut EfudeApp, events| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 800.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.layers_ui(ui, ctx));
+                    },
+                );
+            };
+            frame(&mut app, Vec::new());
+            let row = app
+                .layer_rows
+                .iter()
+                .find(|(id, _)| *id == target_id)
+                .unwrap()
+                .1;
+            let eye = Pos2::new(row.left() + 31.0, row.center().y);
+            frame(&mut app, vec![egui::Event::PointerMoved(eye)]);
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![egui::Event::PointerButton {
+                        pos: eye,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            assert!(
+                !app.doc.layers[target_index].visible,
+                "the operated row was hidden"
+            );
+            assert_eq!(app.selected_layer, 0, "the eye does not change selection");
+            let recording = app.macro_recording.take().unwrap();
+            assert_eq!(recording.steps.len(), 1);
+            let expected_target = if target_index == 0 {
+                Target::Start
+            } else {
+                Target::External {
+                    key: target_id,
+                    name: "Other".into(),
+                }
+            };
+            assert_eq!(recording.steps[0].target, expected_target);
+            assert!(matches!(
+                recording.steps[0].step,
+                Step::SetVisibility { visible: false }
+            ));
+            app.undo();
+            assert!(app.doc.layers.iter().all(|layer| layer.visible));
+            assert!(!app.history.can_undo());
+            app.redo();
+            assert!(!app.doc.layers[target_index].visible);
+            app.undo();
+            app.run_macro(&Definition {
+                version: 2,
+                name: "Hide operated layer".into(),
+                steps: recording.steps,
+            })
+            .unwrap();
+            assert!(!app.doc.layers[target_index].visible);
+            assert!(app.doc.layers[1 - target_index].visible);
+            app.undo();
+            assert!(app.doc.layers.iter().all(|layer| layer.visible));
+            assert!(!app.history.can_undo());
+            app.redo();
+            assert!(!app.doc.layers[target_index].visible);
+            assert!(app.doc.layers[1 - target_index].visible);
+        }
     }
 
     #[test]

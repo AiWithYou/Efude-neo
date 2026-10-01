@@ -93,6 +93,24 @@ impl EfudeApp {
         self.history.set_metadata(&mut self.doc, METADATA_KEY, text);
     }
 
+    /// Drops editable objects with their deleted layers, inside the
+    /// caller's history action, before a new layer can reuse an ID.
+    pub(crate) fn remove_balloon_layer_data(&mut self, removed: &[u64]) {
+        let mut balloons = self.balloons();
+        let count = balloons.len();
+        balloons.retain(|b| !removed.contains(&b.layer_id));
+        if balloons.len() != count {
+            self.store_balloons(&balloons);
+            if self
+                .balloon_ui
+                .selected
+                .is_some_and(|id| !balloons.iter().any(|b| b.id == id))
+            {
+                self.balloon_ui.clear_document_gesture();
+            }
+        }
+    }
+
     fn system_fonts(&mut self) -> &[FontInfo] {
         self.balloon_ui.fonts.get_or_insert_with(text::system_fonts)
     }
@@ -289,7 +307,13 @@ impl EfudeApp {
                 .iter()
                 .position(|l| l.id == removed.layer_id)
             {
-                self.history.delete_layer(&mut self.doc.layers, index);
+                if self.doc.layers.len() == 1 {
+                    // Documents always retain one layer. Clear the last
+                    // balloon's pixels in the same step as its metadata.
+                    self.redraw_balloon_layer(&balloons, removed.layer_id);
+                } else {
+                    self.delete_document_layer(index);
+                }
                 self.selected_layer = self
                     .selected_layer
                     .min(self.doc.layers.len().saturating_sub(1));
@@ -333,13 +357,19 @@ impl EfudeApp {
             self.redraw_balloon_layer(&balloons, partner);
             if now_empty {
                 if let Some(i) = self.doc.layers.iter().position(|l| l.id == old_layer) {
-                    self.history.delete_layer(&mut self.doc.layers, i);
+                    self.delete_document_layer(i);
                 }
             } else {
                 self.redraw_balloon_layer(&balloons, old_layer);
             }
             self.history.commit();
         } else {
+            if !balloons
+                .iter()
+                .any(|b| b.id != id && b.layer_id == old_layer)
+            {
+                return;
+            }
             let layer_id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
             let name = if self.language_english {
                 "Balloon"
@@ -360,6 +390,14 @@ impl EfudeApp {
             self.redraw_balloon_layer(&balloons, layer_id);
             self.redraw_balloon_layer(&balloons, old_layer);
             self.history.commit();
+        }
+        if let Some(layer) = self
+            .doc
+            .layers
+            .iter()
+            .position(|layer| layer.id == balloons[index].layer_id)
+        {
+            self.selected_layer = layer;
         }
         self.canvas_texture_dirty = true;
     }
@@ -766,5 +804,186 @@ impl EfudeApp {
         if !open {
             self.balloon_ui.selected = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_app() -> EfudeApp {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(128, 96);
+        app.selected_layer = 0;
+        app
+    }
+
+    fn add_balloon(app: &mut EfudeApp, center: glam::Vec2) -> u64 {
+        app.create_balloon(center, Some(glam::Vec2::splat(40.0)), BalloonShape::Ellipse)
+    }
+
+    #[test]
+    fn deleting_the_last_balloon_layer_clears_pixels_and_undoes_together() {
+        let mut app = small_app();
+        let id = add_balloon(&mut app, glam::Vec2::new(64.0, 48.0));
+        app.history.delete_layer(&mut app.doc.layers, 0);
+        app.selected_layer = 0;
+        app.history = Default::default();
+        let before = app.doc.clone();
+
+        app.delete_balloon(id);
+        assert!(app.balloons().is_empty());
+        assert_eq!(app.doc.layers.len(), 1);
+        assert!(
+            !app.doc.layers[0].pixels.has_allocated_tiles(),
+            "deleting the last balloon must not leave a visible, uneditable ghost"
+        );
+        for _ in 0..3 {
+            app.undo();
+            assert_eq!(app.doc.metadata, before.metadata);
+            assert_eq!(
+                app.doc.layers[0].pixels.to_dense(),
+                before.layers[0].pixels.to_dense()
+            );
+            app.redo();
+            assert!(app.balloons().is_empty());
+            assert!(!app.doc.layers[0].pixels.has_allocated_tiles());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleted-balloon.efude");
+        efude_io::save(&path, &app.doc).unwrap();
+        let loaded = efude_io::load(&path).unwrap();
+        assert!(!loaded.metadata.contains_key(METADATA_KEY));
+        assert!(!loaded.layers[0].pixels.has_allocated_tiles());
+    }
+
+    #[test]
+    fn joining_and_separating_balloon_tracks_its_surviving_layer() {
+        let mut app = small_app();
+        let first = add_balloon(&mut app, glam::Vec2::new(54.0, 48.0));
+        let second = add_balloon(&mut app, glam::Vec2::new(74.0, 48.0));
+        let first_layer = app
+            .balloons()
+            .iter()
+            .find(|b| b.id == first)
+            .unwrap()
+            .layer_id;
+        app.join_balloon(second, true);
+        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(
+            app.doc.layers.get(app.selected_layer).map(|l| l.id),
+            Some(first_layer),
+            "joining must select the surviving layer rather than a deleted index"
+        );
+        app.join_balloon(second, false);
+        let second_layer = app
+            .balloons()
+            .iter()
+            .find(|b| b.id == second)
+            .unwrap()
+            .layer_id;
+        assert_ne!(second_layer, first_layer);
+        assert_eq!(app.doc.layers[app.selected_layer].id, second_layer);
+    }
+
+    #[test]
+    fn separating_an_already_separate_balloon_is_a_noop() {
+        let mut app = small_app();
+        let id = add_balloon(&mut app, glam::Vec2::new(64.0, 48.0));
+        let before = app.doc.clone();
+        app.history = Default::default();
+        for _ in 0..3 {
+            app.join_balloon(id, false);
+            assert_eq!(
+                app.doc.layers.len(),
+                before.layers.len(),
+                "Separate must not accumulate empty layers"
+            );
+            assert_eq!(app.doc.metadata, before.metadata);
+        }
+        assert!(!app.history.can_undo());
+    }
+
+    #[test]
+    fn deleted_balloon_layer_cannot_attach_to_reused_raster_id() {
+        let mut app = small_app();
+        add_balloon(&mut app, glam::Vec2::new(64.0, 48.0));
+        let old_layer = app.balloons()[0].layer_id;
+        app.delete_document_layer(1);
+        app.add_raster_layer();
+        assert_eq!(app.doc.layers[1].id, old_layer);
+        app.doc.layers[1]
+            .pixels
+            .set_pixel(64, 48, [17, 31, 49, 255]);
+        // The balloon tool edits what its hit test finds under the pointer.
+        if let Some((mut hit, _)) = app.balloon_at(glam::Vec2::new(64.0, 48.0)) {
+            hit.center.x += 40.0;
+            app.update_balloon(hit);
+        }
+        assert_eq!(
+            app.doc.layers[1].pixels.pixel(64, 48),
+            [17, 31, 49, 255],
+            "a deleted balloon must not erase unrelated art on its reused layer ID"
+        );
+    }
+
+    #[test]
+    fn balloon_layer_deletion_metadata_survives_undo_redo_and_save_load() {
+        let mut app = small_app();
+        add_balloon(&mut app, glam::Vec2::new(64.0, 48.0));
+        let original = app.doc.clone();
+        let balloon_layer = app.balloons()[0].layer_id;
+        app.history = Default::default();
+        app.delete_document_layer(1);
+        for _ in 0..3 {
+            assert!(
+                app.balloons().is_empty(),
+                "layer deletion must remove its editable balloon data"
+            );
+            app.undo();
+            assert_eq!(app.doc.metadata, original.metadata);
+            assert_eq!(
+                app.doc.layers[1].pixels.to_dense(),
+                original.layers[1].pixels.to_dense()
+            );
+            app.redo();
+        }
+        app.add_raster_layer();
+        assert_eq!(
+            app.doc.layers[1].id, balloon_layer,
+            "exercise the reused ID"
+        );
+        app.doc.layers[1]
+            .pixels
+            .set_pixel(64, 48, [17, 31, 49, 255]);
+        assert!(
+            app.balloon_at(glam::Vec2::new(64.0, 48.0)).is_none(),
+            "new raster art must not act like a deleted balloon"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reused-layer.efude");
+        efude_io::save(&path, &app.doc).unwrap();
+        app.doc = efude_io::load(&path).unwrap();
+        assert!(app.balloons().is_empty());
+        assert_eq!(app.doc.layers[1].pixels.pixel(64, 48), [17, 31, 49, 255]);
+    }
+
+    #[test]
+    fn clearing_all_layers_removes_balloon_data_in_the_same_undo_step() {
+        let mut app = small_app();
+        add_balloon(&mut app, glam::Vec2::new(64.0, 48.0));
+        let before = app.doc.clone();
+        app.history = Default::default();
+        app.clear_all_layers();
+        assert!(app.balloons().is_empty());
+        assert_eq!(app.doc.layers.len(), 1);
+        app.undo();
+        assert_eq!(app.doc.metadata, before.metadata);
+        assert_eq!(app.doc.layers.len(), before.layers.len());
+        assert_eq!(
+            app.doc.layers[1].pixels.to_dense(),
+            before.layers[1].pixels.to_dense()
+        );
+        assert!(!app.history.can_undo());
     }
 }

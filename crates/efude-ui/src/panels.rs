@@ -275,7 +275,7 @@ impl EfudeApp {
         self.history.insert_layer(&mut self.doc.layers, at, layer);
         while self.doc.layers.len() > 1 {
             let before = self.doc.layers.len();
-            self.history.delete_layer(&mut self.doc.layers, 0);
+            self.delete_document_layer(0);
             if self.doc.layers.len() == before {
                 break;
             }
@@ -3230,9 +3230,7 @@ impl EfudeApp {
                 self.duplicate_layer_subtree();
             }
             if ui.button(self.text("削除", "Delete")).clicked() && self.doc.layers.len() > 1 {
-                self.history
-                    .delete_layer(&mut self.doc.layers, self.selected_layer);
-                self.selected_layer = self.selected_layer.min(self.doc.layers.len() - 1);
+                self.delete_document_layer(self.selected_layer);
             }
         });
         let layer_count = self.doc.layers.len();
@@ -3284,7 +3282,7 @@ impl EfudeApp {
                 .any(|child| child.parent_id == Some(self.doc.layers[i].id));
             let layer_id = self.doc.layers[i].id;
             let property_before = self.doc.layers[i].property_state();
-            let macro_before = if i == self.selected_layer {
+            let macro_before = if self.macro_recording.is_some() {
                 let layer = &self.doc.layers[i];
                 Some((
                     layer.name.clone(),

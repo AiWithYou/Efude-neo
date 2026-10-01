@@ -34,10 +34,21 @@ pub(crate) enum Task {
 }
 
 pub(crate) enum Completion {
-    Frame { document_id: u64, index: u32 },
-    Exported { path: PathBuf, count: u32 },
+    Frame {
+        document_id: u64,
+        session_folder: PathBuf,
+        index: u32,
+    },
+    Exported {
+        path: PathBuf,
+        count: u32,
+    },
     ExportFailed(String),
-    Failed { document_id: u64, message: String },
+    Failed {
+        document_id: u64,
+        session_folder: PathBuf,
+        message: String,
+    },
 }
 
 pub(crate) struct Worker {
@@ -67,10 +78,10 @@ impl Worker {
                             let result = timelapse::write_frame(&session, index, &document);
                             (
                                 match result {
-                                    Ok(_) => Completion::Frame { document_id, index },
+                                    Ok(_) => Completion::Frame { document_id, session_folder: session.folder, index },
                                     Err(error) => {
-                                        failed_sessions.insert(session.folder);
-                                        Completion::Failed { document_id, message: format!("タイムラプスの保存に失敗: {error}") }
+                                        failed_sessions.insert(session.folder.clone());
+                                        Completion::Failed { document_id, session_folder: session.folder, message: format!("タイムラプスの保存に失敗: {error}") }
                                     },
                                 },
                                 repaint,
@@ -721,8 +732,14 @@ impl EfudeApp {
     pub(crate) fn poll_timelapse_worker(&mut self) {
         while let Ok(completion) = self.timelapse_worker.receiver.try_recv() {
             match completion {
-                Completion::Frame { document_id, index } => {
-                    if let Some(state) = self.timelapse_sessions.get_mut(&document_id) {
+                Completion::Frame {
+                    document_id,
+                    session_folder,
+                    index,
+                } => {
+                    if let Some(state) = self.timelapse_sessions.get_mut(&document_id)
+                        && state.session.folder == session_folder
+                    {
                         state.frames_written = state.frames_written.max(index);
                     }
                 }
@@ -739,14 +756,19 @@ impl EfudeApp {
                 }
                 Completion::Failed {
                     document_id,
+                    session_folder,
                     message,
                 } => {
-                    if let Some(state) = self.timelapse_sessions.get_mut(&document_id) {
+                    // A finished recording can still have queued captures when
+                    // another recording starts on the same document.
+                    if let Some(state) = self.timelapse_sessions.get_mut(&document_id)
+                        && state.session.folder == session_folder
+                    {
                         state.paused = true;
-                        self.timelapse_export
-                            .failures
-                            .insert(state.session.folder.clone(), message.clone());
                     }
+                    self.timelapse_export
+                        .failures
+                        .insert(session_folder, message.clone());
                     self.status = message;
                 }
             }
@@ -782,6 +804,96 @@ pub(crate) type Sessions = HashMap<u64, Recording>;
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    fn deliver_capture_after_restart(
+        fail: bool,
+        restart: bool,
+    ) -> (EfudeApp, tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(32, 16);
+        let id = app.history.document_id();
+        let old = timelapse::create_session(root.path(), &app.doc, false, 720).unwrap();
+        let old_folder = old.folder.clone();
+        if fail {
+            std::fs::rename(&old.folder, root.path().join("moved-recording")).unwrap();
+        }
+        app.timelapse_worker
+            .sender
+            .send(Task::Frame {
+                document_id: id,
+                index: 1,
+                document: app.doc.clone(),
+                session: old.clone(),
+                repaint: egui::Context::default(),
+            })
+            .unwrap();
+        let session = if restart {
+            timelapse::create_session(root.path(), &app.doc, false, 720).unwrap()
+        } else {
+            old
+        };
+        let current_folder = session.folder.clone();
+        app.timelapse_sessions.insert(
+            id,
+            Recording {
+                session,
+                next_index: 1,
+                frames_written: 0,
+                last_content_revision: app.history.content_revision(),
+                last_capture: Instant::now(),
+                recording: true,
+                paused: false,
+            },
+        );
+        // Deliver the real worker result only after the recording was restarted.
+        let completion = app
+            .timelapse_worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender.send(completion).unwrap();
+        app.timelapse_worker.receiver = receiver;
+        app.poll_timelapse_worker();
+        (app, root, old_folder, current_folder)
+    }
+
+    #[test]
+    fn old_capture_completion_does_not_change_a_restarted_recording_count() {
+        let (app, _root, old, current) = deliver_capture_after_restart(false, true);
+        assert_ne!(old, current);
+        assert!(old.join("frame_00000001.jpg").exists());
+        let state = &app.timelapse_sessions[&app.history.document_id()];
+        assert_eq!(
+            state.frames_written, 0,
+            "old frames do not belong to the new recording"
+        );
+        assert!(!state.paused);
+    }
+
+    #[test]
+    fn old_capture_failure_does_not_pause_or_poison_a_restarted_recording() {
+        let (app, _root, old, current) = deliver_capture_after_restart(true, true);
+        let state = &app.timelapse_sessions[&app.history.document_id()];
+        assert!(
+            !state.paused,
+            "a previous recording's failure must not stop the new one"
+        );
+        assert!(app.timelapse_export.failures.contains_key(&old));
+        assert!(!app.timelapse_export.failures.contains_key(&current));
+    }
+
+    #[test]
+    fn current_capture_completion_still_updates_counts_and_reports_failure() {
+        for fail in [false, true] {
+            let (app, _root, _, current) = deliver_capture_after_restart(fail, false);
+            let state = &app.timelapse_sessions[&app.history.document_id()];
+            assert_eq!(state.frames_written, u32::from(!fail));
+            assert_eq!(state.paused, fail);
+            assert_eq!(app.timelapse_export.failures.contains_key(&current), fail);
+        }
+    }
 
     #[test]
     fn switching_to_avi_refreshes_preview_dimensions_and_crop() {
@@ -891,6 +1003,7 @@ mod tests {
                 Completion::Frame {
                     document_id: 2,
                     index: 1,
+                    ..
                 } => break,
                 Completion::Frame { .. } => {}
                 _ => panic!("capture was blocked or failed during encoding"),
