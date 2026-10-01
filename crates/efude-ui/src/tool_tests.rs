@@ -1936,6 +1936,123 @@ fn refusing_a_paste_preserves_it_for_retry() {
 }
 
 #[test]
+fn switching_to_vector_layer_during_paste_preserves_preview_for_retry() {
+    let mut h = Harness::new(8, 8);
+    h.app.add_vector_layer();
+    let vector_index = h.app.selected_layer;
+    h.app.select_layer(0);
+    h.app.paste_preview = Some((2, 2, [80, 90, 100, 255].repeat(4), Vec2::ZERO));
+    let before = h.app.history.state_token();
+    h.app.select_layer(vector_index);
+    h.key(egui::Key::Enter, true);
+    h.key(egui::Key::Enter, false);
+    assert!(
+        h.app.paste_preview.is_some(),
+        "keep the image available to retry"
+    );
+    assert!(!h.app.doc.layers[vector_index].pixels.has_allocated_tiles());
+    assert_eq!(
+        h.app.doc.layers[vector_index]
+            .vector
+            .as_ref()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(h.app.history.state_token(), before);
+
+    h.app.select_layer(0);
+    h.key(egui::Key::Enter, true);
+    h.key(egui::Key::Enter, false);
+    assert!(h.app.paste_preview.is_none());
+    assert_eq!(h.pixel(1, 1), [80, 90, 100, 255]);
+    h.app.undo();
+    assert_eq!(h.pixel(1, 1), [0; 4]);
+    h.app.redo();
+    assert_eq!(h.pixel(1, 1), [80, 90, 100, 255]);
+}
+
+#[test]
+fn fill_respects_soft_selection_coverage_and_undo_redo() {
+    for (original, transparent, expected) in [
+        (
+            [0; 4],
+            false,
+            [
+                [20, 100, 220, 255],
+                [20, 100, 220, 128],
+                [20, 100, 220, 64],
+                [0; 4],
+            ],
+        ),
+        (
+            [220, 100, 20, 255],
+            false,
+            [
+                [20, 100, 220, 255],
+                [120, 100, 120, 255],
+                [170, 100, 70, 255],
+                [220, 100, 20, 255],
+            ],
+        ),
+        (
+            [220, 100, 20, 255],
+            true,
+            [
+                [0; 4],
+                [220, 100, 20, 127],
+                [220, 100, 20, 191],
+                [220, 100, 20, 255],
+            ],
+        ),
+        (
+            [200, 100, 0, 128],
+            false,
+            [
+                [20, 100, 220, 255],
+                [80, 100, 147, 192],
+                [128, 100, 88, 160],
+                [200, 100, 0, 128],
+            ],
+        ),
+        (
+            [200, 100, 0, 128],
+            true,
+            [
+                [0; 4],
+                [200, 100, 0, 64],
+                [200, 100, 0, 96],
+                [200, 100, 0, 128],
+            ],
+        ),
+    ] {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(4, 1);
+        for x in 0..4 {
+            app.doc.layers[0].pixels.set_pixel(x, 0, original);
+        }
+        app.selection = Selection {
+            active: true,
+            mask: vec![255, 128, 64, 0],
+        };
+        app.color = Color32::from_rgb(20, 100, 220);
+        app.transparent_color = transparent;
+        app.fill_at(0, 0);
+        for (x, pixel) in expected.iter().enumerate() {
+            assert_eq!(app.doc.layers[0].pixels.pixel(x as u32, 0), *pixel);
+        }
+        app.undo();
+        for x in 0..4 {
+            assert_eq!(app.doc.layers[0].pixels.pixel(x, 0), original);
+        }
+        app.redo();
+        for (x, pixel) in expected.iter().enumerate() {
+            assert_eq!(app.doc.layers[0].pixels.pixel(x as u32, 0), *pixel);
+        }
+    }
+}
+
+#[test]
 fn ctrl_plus_and_minus_zoom_the_canvas_on_any_layout() {
     let mut h = Harness::new(200, 100);
     let start = h.app.zoom;

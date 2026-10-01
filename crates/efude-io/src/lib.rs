@@ -86,6 +86,17 @@ fn write_or_reuse_tile<W: Write + Seek>(
     Ok(())
 }
 
+fn optional_entry<'a, R: Read + Seek>(
+    archive: &'a mut ZipArchive<R>,
+    name: &str,
+) -> Result<Option<zip::read::ZipFile<'a>>, zip::result::ZipError> {
+    match archive.by_name(name) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(zip::result::ZipError::FileNotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn reserve_efude_tile_memory(used: &mut u64) -> Result<(), Box<dyn std::error::Error>> {
     let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
     *used = used
@@ -407,7 +418,7 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
         if meta["has_mask"].as_bool().unwrap_or(false) {
             l.mask = Some(efude_canvas::TilePixels::new(width, height));
         }
-        if let Ok(mut entry) = z.by_name(&format!("vectors/{id}.json")) {
+        if let Some(mut entry) = optional_entry(&mut z, &format!("vectors/{id}.json"))? {
             if entry.size() > 256 * 1024 * 1024 {
                 return Err(".efude vector strokes exceed the size limit".into());
             }
@@ -430,7 +441,7 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
                 let th = TILE_SIZE.min(height - ty * TILE_SIZE);
                 let expected = (tw * th * 4) as usize;
                 let compressed_name = format!("tiles/{id}/{tx}_{ty}.bin");
-                let tile = if let Ok(mut entry) = z.by_name(&compressed_name) {
+                let tile = if let Some(mut entry) = optional_entry(&mut z, &compressed_name)? {
                     let max_packed = expected.saturating_add(65_536);
                     if entry.size() < 4 || entry.size() > max_packed as u64 {
                         return Err(".efude compressed tile exceeds the size limit".into());
@@ -451,7 +462,9 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
                         return Err(".efude tile has an invalid LZ4 payload".into());
                     }
                     Some(decoded)
-                } else if let Ok(mut entry) = z.by_name(&format!("tiles/{id}/{tx}_{ty}.rgba")) {
+                } else if let Some(mut entry) =
+                    optional_entry(&mut z, &format!("tiles/{id}/{tx}_{ty}.rgba"))?
+                {
                     if entry.size() != expected as u64 {
                         return Err(".efude legacy tile has an invalid size".into());
                     }
@@ -491,7 +504,9 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
                 for tx in 0..width.div_ceil(TILE_SIZE) {
                     let tw = TILE_SIZE.min(width - tx * TILE_SIZE);
                     let th = TILE_SIZE.min(height - ty * TILE_SIZE);
-                    if let Ok(mut entry) = z.by_name(&format!("masks/{id}/{tx}_{ty}.gray")) {
+                    if let Some(mut entry) =
+                        optional_entry(&mut z, &format!("masks/{id}/{tx}_{ty}.gray"))?
+                    {
                         let expected = (tw * th) as usize;
                         if entry.size() != expected as u64 {
                             return Err(".efude mask tile has an invalid size".into());
@@ -555,7 +570,7 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
         }
     }
     let mut metadata = std::collections::BTreeMap::new();
-    if let Ok(mut entry) = z.by_name("metadata.json") {
+    if let Some(mut entry) = optional_entry(&mut z, "metadata.json")? {
         if entry.size() > 16 * 1024 * 1024 {
             return Err(".efude metadata exceeds the size limit".into());
         }
@@ -932,9 +947,7 @@ pub fn export_psd_report(
             .collect::<Vec<_>>()
         } else {
             layer
-                .unwrap()
-                .mask
-                .as_ref()
+                .and_then(|layer| layer.mask.as_ref())
                 .map_or_else(Vec::new, |_| vec![-2])
         };
         for (channel_index, id) in channel_ids.into_iter().enumerate() {
@@ -980,13 +993,15 @@ pub fn export_psd_report(
         records.push(0);
         let mut extra = Vec::new();
         if layer.is_some_and(|l| l.mask.is_some()) {
-            extra.extend_from_slice(&18u32.to_be_bytes());
+            // The mask header is 18 bytes followed by two bytes of padding.
+            // Include all 20 bytes in its length so subsequent fields stay aligned.
+            extra.extend_from_slice(&20u32.to_be_bytes());
             for v in [0i32, 0, doc.height as i32, doc.width as i32] {
                 extra.extend_from_slice(&v.to_be_bytes());
             }
             extra.push(255);
             extra.push(0);
-            extra.push(0);
+            extra.extend_from_slice(&[0; 2]);
         } else {
             extra.extend_from_slice(&0u32.to_be_bytes());
         }
@@ -1649,6 +1664,17 @@ fn parse_psd_layers(
     let mut cmyk_scratch_bytes = 0usize;
     for record in records {
         if record.section == Some(3) {
+            // Section dividers can have empty channel payloads too. They do not
+            // become layers, but their bytes must not be read as the next layer.
+            for channel in record.channels {
+                let end = (r.position() as usize)
+                    .checked_add(channel.len)
+                    .ok_or("PSD section-divider channel size overflow")?;
+                if channel.len < 2 || end > r.get_ref().len() {
+                    return Err("invalid PSD section-divider channel data".into());
+                }
+                r.set_position(end as u64);
+            }
             group_stack.pop();
             continue;
         }
@@ -2063,6 +2089,68 @@ mod tests {
     }
 
     #[test]
+    fn save_and_image_exports_accept_filename_only_paths() {
+        let document = sample_document();
+        let mut failures = Vec::new();
+        for extension in ["efude", "png", "jpg"] {
+            let output = tempfile::Builder::new()
+                .suffix(&format!(".{extension}"))
+                .tempfile_in(".")
+                .unwrap()
+                .into_temp_path();
+            let relative = Path::new(output.file_name().unwrap());
+            let result = match extension {
+                "efude" => save(relative, &document),
+                "png" => export_png(relative, &document),
+                "jpg" => export_jpeg(relative, &document, 90),
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(()) => assert!(fs::metadata(relative).unwrap().len() > 0),
+                Err(error) => failures.push(format!("{extension}: {error}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[test]
+    fn efude_rejects_unreadable_optional_entries_instead_of_losing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut document = sample_document();
+        document.layers[0].vector = Some(Vec::new());
+        let mut mask = efude_canvas::TilePixels::new(4, 3);
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        document.layers[0].mask = Some(mask);
+        document
+            .metadata
+            .insert("comic".into(), "important settings".into());
+        for entry_name in [
+            "tiles/1/0_0.bin",
+            "vectors/1.json",
+            "masks/1/0_0.gray",
+            "metadata.json",
+        ] {
+            let path = directory.path().join("unreadable.efude");
+            save(&path, &document).unwrap();
+            let (local, central) = {
+                let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+                let entry = archive.by_name(entry_name).unwrap();
+                (
+                    entry.header_start() as usize,
+                    entry.central_header_start() as usize,
+                )
+            };
+            let mut bytes = fs::read(&path).unwrap();
+            // Mark the existing entry as encrypted. It exists, but cannot be
+            // opened without a password and must never be treated as absent.
+            bytes[local + 6] |= 1;
+            bytes[central + 8] |= 1;
+            fs::write(&path, bytes).unwrap();
+            assert!(load(&path).is_err(), "silently discarded {entry_name}");
+        }
+    }
+
+    #[test]
     fn efude_round_trip_preserves_canvas_and_pixels() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("round-trip.efude");
@@ -2116,6 +2204,117 @@ mod tests {
         export_psd(&path, &document).unwrap();
         let loaded = import_psd(&path).unwrap();
         assert_eq!(loaded.layers[0].name, "線画 レイヤー1");
+    }
+
+    #[test]
+    fn psd_import_consumes_folder_end_marker_channels() {
+        // Public PSD layer records store all channel payloads after all records,
+        // including empty channels on the folder's section-divider record.
+        let mut records = Vec::new();
+        let mut channel_data = Vec::new();
+        for (name, section, empty, rgba) in [
+            ("folder", Some(1u32), true, [0; 4]),
+            ("child", None, false, [10, 20, 30, 255]),
+            ("end", Some(3), true, [0; 4]),
+            ("background", None, false, [40, 50, 60, 255]),
+        ] {
+            for bound in [0i32, 0, i32::from(!empty), i32::from(!empty)] {
+                records.extend_from_slice(&bound.to_be_bytes());
+            }
+            records.extend_from_slice(&4u16.to_be_bytes());
+            for (channel, value) in [0i16, 1, 2, -1].into_iter().zip(rgba) {
+                records.extend_from_slice(&channel.to_be_bytes());
+                records.extend_from_slice(&(if empty { 2u32 } else { 3 }).to_be_bytes());
+                channel_data.extend_from_slice(&0u16.to_be_bytes());
+                if !empty {
+                    channel_data.push(value);
+                }
+            }
+            records.extend_from_slice(b"8BIMnorm");
+            records.extend_from_slice(&[255, 0, 0, 0]);
+            let mut extra = vec![0; 8]; // no mask or blending ranges
+            extra.push(name.len() as u8);
+            extra.extend_from_slice(name.as_bytes());
+            while !extra.len().is_multiple_of(4) {
+                extra.push(0);
+            }
+            if let Some(section) = section {
+                extra.extend_from_slice(b"8BIMlsct");
+                extra.extend_from_slice(&4u32.to_be_bytes());
+                extra.extend_from_slice(&section.to_be_bytes());
+            }
+            records.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+            records.extend_from_slice(&extra);
+        }
+        let mut info = 4u16.to_be_bytes().to_vec();
+        info.extend_from_slice(&records);
+        info.extend_from_slice(&channel_data);
+        let mut section = (info.len() as u32).to_be_bytes().to_vec();
+        section.extend_from_slice(&info);
+        let (layers, unsupported, _, _) = parse_psd_layers(&section, 1, 1, 3, 8).unwrap();
+        assert!(!unsupported);
+        let layers = layers.unwrap();
+        assert_eq!(layers.len(), 3);
+        let background = layers.iter().find(|l| l.name == "background").unwrap();
+        assert_eq!(background.pixels.pixel(0, 0), [40, 50, 60, 255]);
+        let child = layers.iter().find(|l| l.name == "child").unwrap();
+        assert_eq!(child.pixels.pixel(0, 0), [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn psd_round_trip_preserves_nested_folders() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("folders.psd");
+        let mut document = sample_document();
+        let mut folder = Layer::new(2, "folder", 4, 3);
+        folder.kind = LayerKind::Folder;
+        folder.expanded = false;
+        let mut nested = Layer::new(3, "nested", 4, 3);
+        nested.kind = LayerKind::Folder;
+        nested.parent_id = Some(2);
+        let mut child = Layer::new(4, "child", 4, 3);
+        child.parent_id = Some(3);
+        child.pixels.set_pixel(0, 0, [1, 2, 3, 255]);
+        document.layers.extend([child, nested, folder]);
+
+        export_psd(&path, &document).unwrap();
+        let report = import_psd_report(&path).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let loaded = report.document;
+        assert_eq!(loaded.layers.len(), 4);
+        assert_eq!(composite(&loaded), composite(&document));
+        let folder = loaded.layers.iter().find(|l| l.name == "folder").unwrap();
+        let nested = loaded.layers.iter().find(|l| l.name == "nested").unwrap();
+        let child = loaded.layers.iter().find(|l| l.name == "child").unwrap();
+        assert_eq!(folder.kind, LayerKind::Folder);
+        assert!(!folder.expanded);
+        assert_eq!(nested.parent_id, Some(folder.id));
+        assert_eq!(child.parent_id, Some(nested.id));
+        assert_eq!(child.pixels.pixel(0, 0), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn psd_round_trip_preserves_masked_layer_names_and_pixels() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mask.psd");
+        let mut document = sample_document();
+        document.layers[0].name = "線画 mask".into();
+        let mut mask = efude_canvas::TilePixels::new(4, 3);
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        mask.set_pixel(1, 1, [0; 4]);
+        mask.set_pixel(2, 1, [128; 4]);
+        document.layers[0].mask = Some(mask);
+
+        export_psd(&path, &document).unwrap();
+        let report = import_psd_report(&path).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let loaded = report.document;
+        assert_eq!(loaded.layers[0].name, document.layers[0].name);
+        assert_eq!(composite(&loaded), composite(&document));
+        let mask = loaded.layers[0].mask.as_ref().unwrap();
+        assert_eq!(mask.pixel(1, 1)[0], 0);
+        assert_eq!(mask.pixel(2, 1)[0], 128);
+        assert_eq!(mask.pixel(0, 0)[0], 255);
     }
 
     #[test]

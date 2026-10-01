@@ -4426,6 +4426,11 @@ impl EfudeApp {
         if self.paste_preview.is_none() {
             return;
         }
+        // The selected layer can change while the preview is being placed.
+        // Vector pixels are only a render cache and would discard pasted paint.
+        if self.refuse_on_vector_layer() {
+            return;
+        }
         if self.doc.layers[self.selected_layer].locked
             || self.is_reference_layer(self.selected_layer)
             || self.doc.layers[self.selected_layer].kind != LayerKind::Raster
@@ -4818,7 +4823,12 @@ impl EfudeApp {
                 continue;
             }
             visited[pi] = true;
-            if self.selection.active && self.selection.mask.get(pi).copied().unwrap_or(0) == 0 {
+            let coverage = if self.selection.active {
+                self.selection.mask.get(pi).copied().unwrap_or(0) as f32 / 255.0
+            } else {
+                1.0
+            };
+            if coverage == 0.0 {
                 continue;
             }
             let i = pi * 4;
@@ -4826,7 +4836,24 @@ impl EfudeApp {
                 self.history
                     .record_pixel(&self.doc.layers[self.selected_layer], i + c);
             }
-            self.doc.layers[self.selected_layer].pixels[i..i + 4].copy_from_slice(&replacement);
+            let pixels = &mut self.doc.layers[self.selected_layer].pixels;
+            // A soft selection blends the replacement with the old pixel.
+            // Weight RGB by alpha so filling/erasing a feathered edge does not
+            // introduce dark fringes or erase the whole partially selected pixel.
+            let old_weight = pixels[i + 3] as f32 * (1.0 - coverage);
+            let new_weight = replacement[3] as f32 * coverage;
+            let alpha = old_weight + new_weight;
+            let mut output = [0; 4];
+            if alpha > 0.0 {
+                for channel in 0..3 {
+                    output[channel] = ((pixels[i + channel] as f32 * old_weight
+                        + replacement[channel] as f32 * new_weight)
+                        / alpha)
+                        .round() as u8;
+                }
+                output[3] = alpha.round() as u8;
+            }
+            pixels[i..i + 4].copy_from_slice(&output);
             let cx = pi % w as usize;
             let cy = pi / w as usize;
             if cx > 0 {
@@ -5891,6 +5918,8 @@ mod vector_tools;
 
 #[cfg(test)]
 mod golden_tests;
+#[cfg(test)]
+mod layer_operation_tests;
 #[cfg(test)]
 mod tool_tests;
 

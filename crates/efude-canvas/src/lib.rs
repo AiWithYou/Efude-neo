@@ -2381,7 +2381,9 @@ pub fn composite_transparent(doc: &Document) -> Vec<u8> {
                     if !layer.clipping
                         && let Some(values) = &mut base_alpha
                     {
-                        values[pixel_index] = oa;
+                        // Clipped layers affect output alpha, but must not
+                        // enlarge the coverage used by later clipping runs.
+                        values[pixel_index] = sa + values[pixel_index] * (1.0 - sa);
                     }
                 }
             }
@@ -2569,10 +2571,19 @@ fn sample_composite_pixel_from_indices(
             continue;
         }
         for c in 0..3 {
-            let s = src[c] as f32 / 255.;
-            let d = dst[c] as f32 / 255.;
+            let mut s = src[c] as f32 / 255.;
+            let mut d = dst[c] as f32 / 255.;
+            if layer.linear_blend {
+                s = srgb_to_linear(s);
+                d = srgb_to_linear(d);
+            }
             let mixed = blend_channel(layer.blend, s, d);
-            dst[c] = ((mixed * a + d * (1. - a)) * 255.)
+            let result = mixed * a + d * (1. - a);
+            dst[c] = ((if layer.linear_blend {
+                linear_to_srgb(result)
+            } else {
+                result
+            }) * 255.)
                 .round()
                 .clamp(0.0, 255.0) as u8;
         }
@@ -3730,6 +3741,112 @@ pub fn apply_tone_curve(layer: &mut Layer, points: [f32; 5]) {
         }
     }
     layer.pixels.prune_empty_tiles();
+}
+
+#[cfg(test)]
+mod composite_regression_tests {
+    use super::*;
+
+    #[test]
+    fn flattening_separate_clipping_runs_preserves_the_displayed_picture() {
+        let mut doc = Document::new(1, 1);
+        doc.layers.clear();
+        for (index, (pixel, clipping)) in [
+            ([0, 0, 0, 128], false),
+            ([0, 0, 0, 255], true),
+            ([0, 0, 0, 128], false),
+            ([255, 0, 0, 255], true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut layer = Layer::new(index as u64 + 1, "layer", 1, 1);
+            layer.clipping = clipping;
+            layer.pixels.set_pixel(0, 0, pixel);
+            doc.layers.push(layer);
+        }
+        let displayed = composite(&doc);
+        let mut flattened = Document::new(1, 1);
+        flattened.layers[0].pixels = TilePixels::from_dense(1, 1, &composite_transparent(&doc));
+        let merged = composite(&flattened);
+        for (before, after) in displayed.iter().zip(&merged) {
+            assert!(
+                before.abs_diff(*after) <= 1,
+                "before={displayed:?}, after={merged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sampling_a_linear_blend_layer_matches_the_displayed_picture() {
+        let mut doc = Document::new(1, 1);
+        doc.layers[0].linear_blend = true;
+        doc.layers[0].pixels.set_pixel(0, 0, [0, 0, 0, 128]);
+        assert_eq!(
+            sample_composite_pixel(&doc, 0, 0).as_slice(),
+            composite(&doc)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sampling_consistency_tests {
+    use super::*;
+
+    #[test]
+    fn sampling_matches_display_for_every_blend_mode_with_opacity_and_masks() {
+        for mode in [
+            BlendMode::Normal,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+            BlendMode::Darken,
+            BlendMode::Lighten,
+            BlendMode::ColorDodge,
+            BlendMode::ColorBurn,
+            BlendMode::HardLight,
+            BlendMode::SoftLight,
+            BlendMode::Difference,
+            BlendMode::Exclusion,
+            BlendMode::Add,
+            BlendMode::Subtract,
+        ] {
+            for linear in [false, true] {
+                for masked in [false, true] {
+                    for opacity in [0.0, 0.7, 1.0] {
+                        let mut doc = Document::new(2, 1);
+                        doc.layers[0].pixels.set_pixel(0, 0, [30, 90, 160, 190]);
+                        doc.layers[0].pixels.set_pixel(1, 0, [230, 170, 100, 80]);
+                        let mut layer = Layer::new(2, "blend", 2, 1);
+                        layer.pixels.set_pixel(0, 0, [210, 130, 70, 160]);
+                        layer.pixels.set_pixel(1, 0, [60, 140, 200, 220]);
+                        layer.blend = mode;
+                        layer.linear_blend = linear;
+                        layer.opacity = opacity;
+                        if masked {
+                            let mut mask = TilePixels::new(2, 1);
+                            mask.set_mask_pixel(0, 0, [100; 4]);
+                            layer.mask = Some(mask);
+                        }
+                        doc.layers.push(layer);
+                        let displayed = composite(&doc);
+                        let sampler = CompositeSampler::new(&doc);
+                        for x in 0..2 {
+                            assert_eq!(
+                                sampler.sample(&doc, x, 0).as_slice(),
+                                &displayed[x as usize * 4..x as usize * 4 + 4],
+                                "mode={mode:?}, linear={linear}, masked={masked}, opacity={opacity}, x={x}"
+                            );
+                            assert_eq!(
+                                sampler.sample_below(&doc, doc.layers.len(), x, 0),
+                                sampler.sample(&doc, x, 0)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
