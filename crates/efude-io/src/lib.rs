@@ -1942,18 +1942,29 @@ pub fn save_backup(
         .unwrap_or("document");
     let backup = dir.join(format!("{stem}.{stamp}.efude"));
     save(&backup, doc)?;
+    let prefix = format!("{stem}.");
     let mut entries = fs::read_dir(&dir)?
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().is_ok_and(|kind| kind.is_file())
-                && e.file_name().to_str().is_some_and(|name| {
-                    name.starts_with(&format!("{stem}.")) && name.ends_with(".efude")
-                })
+        .filter_map(|entry| {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                return None;
+            }
+            let name = entry.file_name();
+            let timestamp = name
+                .to_str()?
+                .strip_prefix(&prefix)?
+                .strip_suffix(".efude")?;
+            // Only this document's numeric timestamp may follow its exact stem.
+            // For example, "chapter.rough.*.efude" belongs to another document.
+            if timestamp.is_empty() || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            Some((timestamp.parse::<u128>().ok()?, entry))
         })
         .collect::<Vec<_>>();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(|(timestamp, _)| *timestamp);
     let excess = entries.len().saturating_sub(generations.max(1));
-    for entry in entries.into_iter().take(excess) {
+    for (_, entry) in entries.into_iter().take(excess) {
         let _ = fs::remove_file(entry.path());
     }
     Ok(())
@@ -1975,6 +1986,80 @@ mod tests {
             .pixels
             .set_pixel(2, 1, [18, 90, 240, 127]);
         document
+    }
+
+    #[test]
+    fn backup_retention_keeps_documents_with_overlapping_stems_separate() {
+        for other_stem in ["chapter.rough", "chapter.1"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut other = sample_document();
+            other.layers[0].pixels.set_pixel(0, 0, [7, 8, 9, 255]);
+            save_backup(
+                &directory.path().join(format!("{other_stem}.efude")),
+                &other,
+                1,
+            )
+            .unwrap();
+            let backup_dir = directory.path().join(".efude-backups");
+            let other_backup = fs::read_dir(&backup_dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+
+            let current = sample_document();
+            save_backup(&directory.path().join("chapter.efude"), &current, 1).unwrap();
+            let backups = fs::read_dir(&backup_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            assert_eq!(backups.len(), 2, "overlapping stem: {other_stem}");
+            assert!(
+                other_backup.exists(),
+                "the other document's backup was deleted"
+            );
+            assert_eq!(
+                load(&other_backup).unwrap().layers[0].pixels.pixel(0, 0),
+                [7, 8, 9, 255]
+            );
+            let current_backup = backups.iter().find(|path| **path != other_backup).unwrap();
+            assert_eq!(
+                load(current_backup).unwrap().layers[0].pixels.to_dense(),
+                current.layers[0].pixels.to_dense()
+            );
+        }
+    }
+
+    #[test]
+    fn backup_retention_prunes_only_timestamped_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup_dir = directory.path().join(".efude-backups");
+        fs::create_dir(&backup_dir).unwrap();
+        let document = sample_document();
+        let oldest = backup_dir.join("chapter.100.efude");
+        let newer = backup_dir.join("chapter.101.efude");
+        save(&oldest, &document).unwrap();
+        save(&newer, &document).unwrap();
+        let unrelated = [
+            "chapter..efude",
+            "chapter.notes.efude",
+            "chapter.1.102.efude",
+        ];
+        for name in unrelated {
+            save(&backup_dir.join(name), &document).unwrap();
+        }
+
+        save_backup(&directory.path().join("chapter.efude"), &document, 2).unwrap();
+        assert!(!oldest.exists());
+        assert!(newer.exists());
+        for name in unrelated {
+            assert!(
+                backup_dir.join(name).exists(),
+                "unrelated file deleted: {name}"
+            );
+        }
+        assert_eq!(fs::read_dir(&backup_dir).unwrap().count(), 5);
     }
 
     #[test]

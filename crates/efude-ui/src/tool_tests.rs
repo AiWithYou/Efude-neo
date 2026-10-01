@@ -614,6 +614,90 @@ fn undo_and_redo_buttons_work() {
 }
 
 #[test]
+fn layer_mask_inversion_preserves_sparse_tiles_and_history() {
+    let (width, height) = (513, 257);
+    let mut h = Harness::new(width, height);
+    h.app.language_english = true;
+    // Give the layer controls a full-height pane so the mask buttons are visible.
+    h.app.workspace = egui_dock::DockState::new(vec![layout::Pane::Canvas]);
+    h.app.workspace.main_surface_mut().split_right(
+        egui_dock::NodeIndex::root(),
+        0.6,
+        vec![layout::Pane::Layers],
+    );
+    h.frames(2);
+    h.click_label("+ Layer Mask");
+    assert!(
+        h.app.doc.layers[0]
+            .mask
+            .as_ref()
+            .unwrap()
+            .tile_keys()
+            .is_empty(),
+        "a new mask starts as sparse white tiles"
+    );
+    let values = |h: &Harness| {
+        let mask = h.app.doc.layers[0].mask.as_ref().unwrap();
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| mask.pixel_or_tile_default(x, y, [255; 4])[0]))
+            .collect::<Vec<_>>()
+    };
+    let white = vec![255; (width * height) as usize];
+    let black = vec![0; (width * height) as usize];
+    assert!(values(&h) == white, "mask should be entirely white");
+    h.click_label("Invert Mask");
+    assert!(values(&h) == black, "every sparse tile must become black");
+    h.click_label("Invert Mask");
+    assert!(values(&h) == white, "inverting twice restores the mask");
+    h.app.undo();
+    assert!(values(&h) == black, "mask should be entirely black");
+    h.app.redo();
+    assert!(values(&h) == white, "mask should be entirely white");
+
+    // Return to the sparse new mask before drawing into two of its tiles.
+    h.app.undo();
+    h.app.undo();
+    assert!(
+        h.app.doc.layers[0]
+            .mask
+            .as_ref()
+            .unwrap()
+            .tile_keys()
+            .is_empty()
+    );
+    // A real mask stroke leaves partial coverage in an allocated tile,
+    // while the other tiles keep their original white values.
+    h.app.editing_mask = true;
+    h.use_tool(Tool::Brush);
+    h.app.size = 12.0;
+    h.drag(&[v(245.0, 100.0), v(270.0, 100.0)]);
+    let painted = values(&h);
+    assert!(painted.iter().any(|&value| value < 255));
+    assert!(painted.iter().any(|&value| value > 0 && value < 255));
+    let inverted = painted.iter().map(|&value| 255 - value).collect::<Vec<_>>();
+    h.click_label("Invert Mask");
+    assert!(
+        values(&h) == inverted,
+        "inverted coverage must match exactly"
+    );
+    h.click_label("Invert Mask");
+    assert!(
+        values(&h) == painted,
+        "painted coverage must be restored exactly"
+    );
+    h.app.undo();
+    assert!(
+        values(&h) == inverted,
+        "inverted coverage must match exactly"
+    );
+    h.app.redo();
+    assert!(
+        values(&h) == painted,
+        "painted coverage must be restored exactly"
+    );
+}
+
+#[test]
 fn new_document_replaces_the_picture() {
     let mut h = Harness::new(400, 300);
     h.fill_rect(0, 0, 400, 300, [200, 30, 30, 255]);

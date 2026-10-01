@@ -116,6 +116,19 @@ impl TilePixels {
         let i = ((y * self.width + x) * 4) as usize;
         self[i..i + 4].copy_from_slice(&px)
     }
+    // Missing mask tiles mean fully visible, unlike transparent paint tiles.
+    fn set_mask_pixel(&mut self, x: u32, y: u32, pixel: [u8; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        if !self.has_tile(x, y) {
+            self.ensure_tile_filled(x, y, [255; 4]);
+        }
+        self.set_pixel(x, y, pixel);
+    }
+    fn prune_white_tiles(&mut self) {
+        self.tiles.retain(|_, tile| tile.iter().any(|&b| b != 255));
+    }
     pub fn tiles(&self) -> impl Iterator<Item = ((u32, u32), &[u8])> {
         self.tiles.iter().map(|(&key, data)| (key, data.as_slice()))
     }
@@ -2588,7 +2601,7 @@ impl Selection {
         }
         self.mask.resize((width * height) as usize, 0);
         for value in &mut self.mask {
-            *value = if *value == 0 { 255 } else { 0 };
+            *value = 255 - *value;
         }
     }
     pub fn expand(&mut self, width: u32, height: u32, radius: u32) {
@@ -3003,7 +3016,7 @@ pub fn translate_selection(
         }
         next.set_pixel(x, y, pixel);
         if let Some(layer_mask) = &mut next_layer_mask {
-            layer_mask.set_pixel(x, y, [255; 4]);
+            layer_mask.set_mask_pixel(x, y, [255; 4]);
         }
     }
     for (src, dst, coverage) in moves {
@@ -3028,7 +3041,7 @@ pub fn translate_selection(
         next.set_pixel(dst as u32 % width, dst as u32 / width, dst_px);
         next_mask[dst] = next_mask[dst].max(coverage);
         if let Some(layer_mask) = &mut next_layer_mask {
-            layer_mask.set_pixel(
+            layer_mask.set_mask_pixel(
                 dst as u32 % width,
                 dst as u32 / width,
                 original_layer_mask
@@ -3049,7 +3062,7 @@ pub fn translate_selection(
     mask.mask = next_mask;
     layer.pixels.prune_empty_tiles();
     if let Some(layer_mask) = &mut layer.mask {
-        layer_mask.prune_empty_tiles();
+        layer_mask.prune_white_tiles();
     }
 }
 
@@ -3064,6 +3077,9 @@ pub fn transform_selection(
     angle: f32,
     history: &mut History,
 ) {
+    if scale_x == 1.0 && scale_y == 1.0 && angle == 0.0 {
+        return;
+    }
     let selected = selection.active;
     let mut bounds = (width as i32, height as i32, -1i32, -1i32);
     if selected {
@@ -3169,7 +3185,7 @@ pub fn transform_selection(
                 .map(|source| source.pixel_or_tile_default(x, y, [255; 4])[0])
                 .unwrap_or(255) as f32;
             let cleared = old + (255.0 - old) * (coverage as f32 / 255.0);
-            next_layer_mask.set_pixel(x, y, [cleared.round() as u8; 4]);
+            next_layer_mask.set_mask_pixel(x, y, [cleared.round() as u8; 4]);
         }
     }
     for (src, dst, coverage) in moves {
@@ -3211,7 +3227,7 @@ pub fn transform_selection(
         for (pixel, (weighted_value, total_weight)) in moved_mask {
             if total_weight > 0.0 {
                 let value = (weighted_value / total_weight).round().clamp(0.0, 255.0) as u8;
-                mask.set_pixel(pixel as u32 % width, pixel as u32 / width, [value; 4]);
+                mask.set_mask_pixel(pixel as u32 % width, pixel as u32 / width, [value; 4]);
             }
         }
     }
@@ -3222,7 +3238,7 @@ pub fn transform_selection(
     }
     layer.pixels.prune_empty_tiles();
     if let Some(mask) = &mut layer.mask {
-        mask.prune_empty_tiles();
+        mask.prune_white_tiles();
     }
 }
 
@@ -3280,6 +3296,21 @@ fn bilinear_layer_pixel(pixels: &TilePixels, width: u32, height: u32, x: f32, y:
         (premultiplied[2] / alpha).round().clamp(0.0, 255.0) as u8,
         (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
     ]
+}
+
+// A layer mask stores coverage in its first channel. Do not premultiply it
+// by its unused alpha channel, and keep absent tiles fully visible.
+fn bilinear_layer_mask_value(mask: &TilePixels, width: u32, height: u32, x: f32, y: f32) -> u8 {
+    let x0 = x.floor().clamp(0.0, width.saturating_sub(1) as f32) as u32;
+    let y0 = y.floor().clamp(0.0, height.saturating_sub(1) as f32) as u32;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = (x - x.floor()).clamp(0.0, 1.0);
+    let fy = (y - y.floor()).clamp(0.0, 1.0);
+    let value = |sx, sy| mask.pixel_or_tile_default(sx, sy, [255; 4])[0] as f32;
+    let top = value(x0, y0) * (1.0 - fx) + value(x1, y0) * fx;
+    let bottom = value(x0, y1) * (1.0 - fx) + value(x1, y1) * fx;
+    (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8
 }
 
 fn bilinear_mask_value(mask: &[u8], width: u32, height: u32, x: f32, y: f32) -> u8 {
@@ -3400,7 +3431,7 @@ pub fn mesh_warp_grid(
                         .map(|source| source.pixel_or_tile_default(x as u32, y as u32, [255; 4])[0])
                         .unwrap_or(255) as f32;
                     let cleared = old + (255.0 - old) * (coverage as f32 / 255.0);
-                    mask.set_pixel(x as u32, y as u32, [cleared.round() as u8; 4]);
+                    mask.set_mask_pixel(x as u32, y as u32, [cleared.round() as u8; 4]);
                 }
             }
         }
@@ -3452,9 +3483,10 @@ pub fn mesh_warp_grid(
             if let Some(mask) = &mut next_layer_mask {
                 let value = original_mask
                     .as_ref()
-                    .map(|source| bilinear_layer_pixel(source, width, height, sx, sy))
-                    .unwrap_or([255; 4]);
-                mask.set_pixel(x as u32, y as u32, value);
+                    .map(|source| bilinear_layer_mask_value(source, width, height, sx, sy))
+                    .unwrap_or(255);
+                let value = [value; 4];
+                mask.set_mask_pixel(x as u32, y as u32, value);
             }
         }
     }
@@ -3473,7 +3505,7 @@ pub fn mesh_warp_grid(
     }
     layer.pixels.prune_empty_tiles();
     if let Some(mask) = &mut layer.mask {
-        mask.prune_empty_tiles();
+        mask.prune_white_tiles();
     }
 }
 
@@ -4311,5 +4343,183 @@ mod layer_tree_tests {
         history.undo_document(&mut doc);
         assert_eq!(ids(&doc.layers), vec![1, 3, 2, 4]);
         assert_eq!(doc.layers[3].parent_id, None);
+    }
+}
+
+#[cfg(test)]
+mod selection_mask_regression_tests {
+    use super::*;
+
+    fn sparse_mask_layer(width: u32) -> Layer {
+        let mut layer = Layer::new(1, "masked", width, 1);
+        for x in 0..width {
+            layer.pixels.set_pixel(x, 0, [180, 40, 20, 255]);
+        }
+        layer.mask = Some(TilePixels::new(width, 1));
+        layer
+    }
+
+    fn mask_value(layer: &Layer, x: u32) -> u8 {
+        layer
+            .mask
+            .as_ref()
+            .unwrap()
+            .pixel_or_tile_default(x, 0, [255; 4])[0]
+    }
+
+    #[test]
+    fn invert_selection_preserves_soft_coverage_and_round_trips() {
+        let original = vec![0, 1, 64, 128, 254, 255];
+        let mut selection = Selection {
+            mask: original.clone(),
+            active: true,
+        };
+        selection.invert(6, 1);
+        assert_eq!(selection.mask, vec![255, 254, 191, 127, 1, 0]);
+        selection.invert(6, 1);
+        assert_eq!(selection.mask, original);
+        assert!(selection.active);
+    }
+
+    #[test]
+    fn identity_transform_keeps_soft_selection_pixels_masks_and_history_unchanged() {
+        let mut layer = sparse_mask_layer(4);
+        let original = layer.pixels.to_dense();
+        let mut selection = Selection {
+            mask: vec![0, 64, 128, 255],
+            active: true,
+        };
+        let original_selection = selection.mask.clone();
+        let mut history = History::default();
+        history.begin();
+        transform_selection(&mut layer, &mut selection, 4, 1, 1., 1., 0., &mut history);
+        history.commit();
+        assert_eq!(layer.pixels.to_dense(), original);
+        assert_eq!(selection.mask, original_selection);
+        assert!(!layer.mask.as_ref().unwrap().has_allocated_tiles());
+        assert!(!history.can_undo());
+        assert!(!history.is_dirty());
+    }
+
+    #[test]
+    fn moving_selection_preserves_unselected_sparse_mask_pixels() {
+        let mut layer = sparse_mask_layer(4);
+        let mut selection = Selection {
+            mask: vec![255, 0, 0, 0],
+            active: true,
+        };
+        translate_selection(&mut layer, &mut selection, 4, 1, 1, 0);
+        for x in 0..4 {
+            assert_eq!(mask_value(&layer, x), 255, "mask at {x}");
+        }
+    }
+
+    #[test]
+    fn transforming_selection_preserves_unselected_sparse_mask_pixels() {
+        let mut layer = sparse_mask_layer(4);
+        let mut selection = Selection {
+            mask: vec![255, 0, 0, 0],
+            active: true,
+        };
+        let mut history = History::default();
+        history.begin();
+        transform_selection(&mut layer, &mut selection, 4, 1, -1., 1., 0., &mut history);
+        history.commit();
+        for x in 0..4 {
+            assert_eq!(mask_value(&layer, x), 255, "mask at {x}");
+        }
+        history.undo(&mut layer);
+        assert!(!layer.mask.as_ref().unwrap().has_allocated_tiles());
+        history.redo(&mut layer);
+        for x in 0..4 {
+            assert_eq!(mask_value(&layer, x), 255);
+        }
+    }
+
+    #[test]
+    fn mesh_warp_preserves_sparse_white_mask_and_history() {
+        let mut layer = sparse_mask_layer(4);
+        let mut selection = Selection::default();
+        let mut history = History::default();
+        history.begin();
+        mesh_warp(
+            &mut layer,
+            &mut selection,
+            4,
+            1,
+            [(1., 0.); 4],
+            &mut history,
+        );
+        history.commit();
+        for x in 1..4 {
+            assert_eq!(mask_value(&layer, x), 255, "mask at {x}");
+            assert_eq!(layer.pixels.pixel(x, 0)[3], 255);
+        }
+        for _ in 0..2 {
+            history.undo(&mut layer);
+            assert!(!layer.mask.as_ref().unwrap().has_allocated_tiles());
+            history.redo(&mut layer);
+            for x in 1..4 {
+                assert_eq!(mask_value(&layer, x), 255);
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_warp_interpolates_mask_coverage_without_alpha_weighting() {
+        let mut layer = sparse_mask_layer(4);
+        let mask = layer.mask.as_mut().unwrap();
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        mask.set_pixel(0, 0, [0; 4]);
+        let mut selection = Selection::default();
+        mesh_warp(
+            &mut layer,
+            &mut selection,
+            4,
+            1,
+            [(0.5, 0.); 4],
+            &mut History::default(),
+        );
+        assert_eq!(mask_value(&layer, 1), 128);
+    }
+
+    #[test]
+    fn transforms_preserve_unrelated_fully_black_mask_tiles() {
+        let width = TILE_SIZE * 2;
+        for operation in 0..3 {
+            let mut layer = sparse_mask_layer(width);
+            layer
+                .mask
+                .as_mut()
+                .unwrap()
+                .ensure_tile_filled(TILE_SIZE, 0, [0; 4]);
+            let mut selection = Selection {
+                mask: vec![0; width as usize],
+                active: true,
+            };
+            selection.mask[0] = 255;
+            match operation {
+                0 => translate_selection(&mut layer, &mut selection, width, 1, 1, 0),
+                1 => transform_selection(
+                    &mut layer,
+                    &mut selection,
+                    width,
+                    1,
+                    -1.,
+                    1.,
+                    0.,
+                    &mut History::default(),
+                ),
+                _ => mesh_warp(
+                    &mut layer,
+                    &mut selection,
+                    width,
+                    1,
+                    [(1., 0.); 4],
+                    &mut History::default(),
+                ),
+            }
+            assert_eq!(mask_value(&layer, TILE_SIZE), 0, "operation {operation}");
+        }
     }
 }

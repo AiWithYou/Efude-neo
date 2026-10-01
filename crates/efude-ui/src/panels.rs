@@ -3796,6 +3796,11 @@ impl EfudeApp {
                 if action == 0 {
                     for y in 0..height {
                         for x in 0..width {
+                            // Missing mask tiles are white; allocate them before
+                            // the first write so later pixels keep that default.
+                            if !mask.has_tile(x, y) {
+                                mask.ensure_tile_filled(x, y, [255; 4]);
+                            }
                             let old = mask.pixel_or_tile_default(x, y, [255; 4])[0];
                             mask.set_pixel(x, y, [255 - old; 4]);
                         }

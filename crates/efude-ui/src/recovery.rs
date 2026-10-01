@@ -626,6 +626,114 @@ impl EfudeApp {
 mod tests {
     use super::*;
 
+    fn paint_pixel(app: &mut EfudeApp, color: [u8; 4]) {
+        app.history.begin();
+        app.history.record_pixel(&app.doc.layers[0], 0);
+        app.doc.layers[0].pixels.set_pixel(0, 0, color);
+        app.history.commit();
+    }
+
+    fn finish_io(app: &mut EfudeApp, ctx: &egui::Context) {
+        for _ in 0..200 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.update_ui(ctx));
+            if app.io_task_sender.busy.get() == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("I/O did not finish: {}", app.status);
+    }
+
+    #[test]
+    fn recovery_snapshots_resume_after_saving_then_undoing() {
+        for save_in_parked_tab in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut app = EfudeApp::default();
+            app.recovery.finish_cleanly();
+            app.recovery = Store::new_in(root.path().join("recovery"));
+            app.doc = Document::new(8, 8);
+            let ctx = egui::Context::default();
+            paint_pixel(&mut app, [10, 20, 30, 255]);
+            let document_id = app.history.document_id();
+            let first_token = app.history.state_token();
+            let (snapshot, _) = app
+                .recovery
+                .snapshot_paths(document_id, first_token)
+                .unwrap();
+            assert_eq!(app.queue_recovery_snapshots(&ctx).unwrap(), 1);
+            finish_io(&mut app, &ctx);
+            assert!(snapshot.exists());
+
+            paint_pixel(&mut app, [40, 50, 60, 255]);
+            app.queue_document_save(root.path().join("saved.efude"), false, &ctx)
+                .unwrap();
+            if save_in_parked_tab {
+                app.open_document_tab();
+            }
+            finish_io(&mut app, &ctx);
+            if save_in_parked_tab {
+                app.switch_tab(0);
+            }
+            assert!(!app.history.is_dirty());
+            assert!(!snapshot.exists());
+
+            app.history.undo_document(&mut app.doc);
+            assert_eq!(app.history.state_token(), first_token);
+            assert!(app.history.is_dirty());
+            assert_eq!(app.queue_recovery_snapshots(&ctx).unwrap(), 1);
+            finish_io(&mut app, &ctx);
+            assert_eq!(
+                efude_io::load(&snapshot).unwrap().layers[0]
+                    .pixels
+                    .pixel(0, 0),
+                [10, 20, 30, 255]
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_keeps_a_newer_snapshot_queued_while_saving() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = EfudeApp::default();
+        app.recovery.finish_cleanly();
+        app.recovery = Store::new_in(root.path().join("recovery"));
+        app.doc = Document::new(8, 8);
+        let ctx = egui::Context::default();
+        paint_pixel(&mut app, [10, 20, 30, 255]);
+        let document_id = app.history.document_id();
+        let saved_token = app.history.state_token();
+        let (saved_snapshot, _) = app
+            .recovery
+            .snapshot_paths(document_id, saved_token)
+            .unwrap();
+        assert_eq!(app.queue_recovery_snapshots(&ctx).unwrap(), 1);
+        app.queue_document_save(root.path().join("saved.efude"), false, &ctx)
+            .unwrap();
+
+        // Queue another generation before processing the save completion.
+        paint_pixel(&mut app, [40, 50, 60, 255]);
+        let newer_token = app.history.state_token();
+        let (newer_snapshot, _) = app
+            .recovery
+            .snapshot_paths(document_id, newer_token)
+            .unwrap();
+        assert_eq!(app.queue_recovery_snapshots(&ctx).unwrap(), 1);
+        finish_io(&mut app, &ctx);
+        assert!(app.history.is_dirty());
+        assert!(!saved_snapshot.exists());
+        assert_eq!(
+            efude_io::load(&newer_snapshot).unwrap().layers[0]
+                .pixels
+                .pixel(0, 0),
+            [40, 50, 60, 255]
+        );
+        assert_eq!(app.queue_recovery_snapshots(&ctx).unwrap(), 0);
+    }
+
     #[test]
     fn two_unsaved_tabs_survive_an_unclean_session_and_keep_their_thumbnails() {
         let root = tempfile::tempdir().unwrap();

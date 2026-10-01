@@ -5158,13 +5158,26 @@ impl EfudeApp {
                                 .find(|tab| tab.history.document_id() == document_id)
                                 .map(|tab| tab.history.state_token())
                         };
-                        let _ = self.io_task_sender.send(IoTask::ClearRecovery {
-                            directory: directory.to_path_buf(),
-                            document_id,
-                            saved_token: (current_token != Some(state_token))
-                                .then_some(state_token),
-                            repaint: ctx.clone(),
-                        });
+                        let saved_token =
+                            (current_token != Some(state_token)).then_some(state_token);
+                        if self
+                            .io_task_sender
+                            .send(IoTask::ClearRecovery {
+                                directory: directory.to_path_buf(),
+                                document_id,
+                                saved_token,
+                                repaint: ctx.clone(),
+                            })
+                            .is_ok()
+                            && (saved_token.is_none()
+                                || self.recovery.queued_tokens.get(&document_id)
+                                    == saved_token.as_ref())
+                        {
+                            // A later Undo may need to snapshot a cleared state again.
+                            // Invalidate when queuing the clear, before a newer snapshot
+                            // can be queued behind it; preserve unrelated in-flight tokens.
+                            self.recovery.queued_tokens.remove(&document_id);
+                        }
                     }
                     let mut close_was_blocked_by_new_changes = false;
                     if self.close_after_save {
