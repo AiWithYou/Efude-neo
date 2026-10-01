@@ -259,6 +259,30 @@ fn run_filter(
     }
 }
 
+/// Mixes an edit through a soft selection without darkening transparent edges.
+fn blend_selection_pixel(before: [u8; 4], after: [u8; 4], coverage: f32) -> [u8; 4] {
+    if coverage <= 0.0 {
+        return before;
+    }
+    if coverage >= 1.0 {
+        return after;
+    }
+    let old_weight = before[3] as f32 * (1.0 - coverage);
+    let new_weight = after[3] as f32 * coverage;
+    let alpha = old_weight + new_weight;
+    let mut output = [0; 4];
+    output[3] = alpha.round() as u8;
+    if output[3] != 0 {
+        for channel in 0..3 {
+            output[channel] = ((before[channel] as f32 * old_weight
+                + after[channel] as f32 * new_weight)
+                / alpha)
+                .round() as u8;
+        }
+    }
+    output
+}
+
 fn decode_limited_image(
     path: &std::path::Path,
     max_width: u32,
@@ -1383,13 +1407,7 @@ impl Default for EfudeApp {
                                         }
                                         let old = before.pixel(x, y);
                                         let filtered = pixels.pixel(x, y);
-                                        let result = std::array::from_fn(|channel| {
-                                            (old[channel] as f32 * (1.0 - coverage)
-                                                + filtered[channel] as f32 * coverage)
-                                                .round()
-                                                .clamp(0.0, 255.0)
-                                                as u8
-                                        });
+                                        let result = blend_selection_pixel(old, filtered, coverage);
                                         pixels.set_pixel(x, y, result);
                                     }
                                 }
@@ -2349,6 +2367,7 @@ impl EfudeApp {
         self.navigator_texture_dirty = true;
     }
     fn duplicate_layer_subtree(&mut self) {
+        self.finish_pending_canvas_gesture();
         let Some(root) = self.doc.layers.get(self.selected_layer) else {
             return;
         };
@@ -3468,16 +3487,22 @@ impl EfudeApp {
         enabled: bool,
         tool_keys: &[(egui::Key, Tool, bool)],
     ) {
-        let pointer_down = ctx.input(|input| input.pointer.any_down());
+        let (pointer_down, pointer_released) =
+            ctx.input(|input| (input.pointer.any_down(), input.pointer.any_released()));
+        let pointer_busy = pointer_down || pointer_released;
         if let Some(held) = &mut self.held_tool_key {
-            if pointer_down {
+            if pointer_busy {
                 held.used = true;
             }
             if !ctx.input(|input| input.key_down(held.key)) {
                 held.released = true;
             }
-            // Never switch in the middle of a stroke or drag.
-            if held.released && !pointer_down {
+            // Canvas processing later in this frame must finish with the tool
+            // that started the gesture, including on the pointer-up frame.
+            if held.released && pointer_released {
+                ctx.request_repaint();
+            }
+            if held.released && !pointer_busy {
                 let held = self.held_tool_key.take().unwrap();
                 let spring_back =
                     held.hold_only || held.used || held.pressed_at.elapsed() >= TOOL_KEY_HOLD;
@@ -3487,7 +3512,7 @@ impl EfudeApp {
             }
             return;
         }
-        if !enabled || pointer_down {
+        if !enabled || pointer_busy {
             return;
         }
         for &(key, tool, hold_only) in tool_keys {
@@ -4238,6 +4263,7 @@ impl EfudeApp {
             .into();
     }
     fn copy_selection(&mut self, cut: bool) {
+        self.finish_pending_canvas_gesture();
         let w = self.doc.width;
         let h = self.doc.height;
         let layer = &self.doc.layers[self.selected_layer];
@@ -4304,6 +4330,7 @@ impl EfudeApp {
     /// Deletes the selected pixels of the current layer (the whole layer
     /// when nothing is selected). Undoable.
     fn delete_selected_pixels(&mut self) {
+        self.finish_pending_canvas_gesture();
         let (w, h) = (self.doc.width, self.doc.height);
         let layer = &self.doc.layers[self.selected_layer];
         if layer.locked
@@ -4837,22 +4864,8 @@ impl EfudeApp {
                     .record_pixel(&self.doc.layers[self.selected_layer], i + c);
             }
             let pixels = &mut self.doc.layers[self.selected_layer].pixels;
-            // A soft selection blends the replacement with the old pixel.
-            // Weight RGB by alpha so filling/erasing a feathered edge does not
-            // introduce dark fringes or erase the whole partially selected pixel.
-            let old_weight = pixels[i + 3] as f32 * (1.0 - coverage);
-            let new_weight = replacement[3] as f32 * coverage;
-            let alpha = old_weight + new_weight;
-            let mut output = [0; 4];
-            if alpha > 0.0 {
-                for channel in 0..3 {
-                    output[channel] = ((pixels[i + channel] as f32 * old_weight
-                        + replacement[channel] as f32 * new_weight)
-                        / alpha)
-                        .round() as u8;
-                }
-                output[3] = alpha.round() as u8;
-            }
+            let before = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
+            let output = blend_selection_pixel(before, replacement, coverage);
             pixels[i..i + 4].copy_from_slice(&output);
             let cx = pi % w as usize;
             let cy = pi / w as usize;
@@ -5916,6 +5929,8 @@ mod timelapse;
 mod vector_edit;
 mod vector_tools;
 
+#[cfg(test)]
+mod gesture_command_tests;
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]

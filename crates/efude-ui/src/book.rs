@@ -35,6 +35,11 @@ pub(crate) struct SaveReceipt {
     pub token: u64,
 }
 
+struct ClosedSource {
+    path: PathBuf,
+    disk_stamp: Option<(u64, std::time::SystemTime)>,
+}
+
 pub(crate) struct ExportRequest {
     book: Book,
     book_path: PathBuf,
@@ -42,7 +47,7 @@ pub(crate) struct ExportRequest {
     options: ExportOptions,
     font: Option<(Arc<Vec<u8>>, u32)>,
     snapshots: std::collections::HashMap<String, PageSnapshot>,
-    closed_sources: std::collections::HashMap<String, Option<(u64, std::time::SystemTime)>>,
+    closed_sources: std::collections::HashMap<String, ClosedSource>,
     pub done: Arc<AtomicUsize>,
     pub save_first: bool,
     overwrite: bool,
@@ -282,26 +287,34 @@ fn closed_source_stamps(
     book: &Book,
     path: &Path,
     snapshots: &std::collections::HashMap<String, PageSnapshot>,
-) -> Result<std::collections::HashMap<String, Option<(u64, std::time::SystemTime)>>, String> {
+) -> Result<std::collections::HashMap<String, ClosedSource>, String> {
     book.pages
         .iter()
         .filter_map(|page| {
             let page = page_path(path, page);
             let key = path_key(&page);
-            (!snapshots.contains_key(&key)).then(|| stamp(&page).map(|value| (key, value)))
+            (!snapshots.contains_key(&key)).then(|| {
+                stamp(&page).map(|disk_stamp| {
+                    (
+                        key,
+                        ClosedSource {
+                            path: page,
+                            disk_stamp,
+                        },
+                    )
+                })
+            })
         })
         .collect()
 }
 
 fn validate_closed_sources(request: &ExportRequest) -> Result<(), String> {
-    for page in &request.book.pages {
-        let path = page_path(&request.book_path, page);
-        if let Some(expected) = request.closed_sources.get(&path_key(&path))
-            && stamp(&path)? != *expected
-        {
+    // Check the reviewed paths even when a replacement changes their canonical keys.
+    for (key, source) in &request.closed_sources {
+        if path_key(&source.path) != *key || stamp(&source.path)? != source.disk_stamp {
             return Err(format!(
                 "確認後に閉じたページの原稿が変わりました。内容を更新してください: {}",
-                path.display()
+                source.path.display()
             ));
         }
     }
@@ -727,17 +740,24 @@ impl EfudeApp {
             if let Some(current_token) = current_token
                 && let Some(directory) = self.recovery.current_dir().map(Path::to_path_buf)
             {
-                let matches_saved = current_token == receipt.token;
-                if matches_saved {
-                    // Permit a later Undo to create a fresh recovery snapshot of an older state.
+                let saved_token = (current_token != receipt.token).then_some(receipt.token);
+                if self
+                    .io_task_sender
+                    .send(IoTask::ClearRecovery {
+                        directory,
+                        document_id: receipt.document_id,
+                        saved_token,
+                        repaint: egui::Context::default(),
+                    })
+                    .is_ok()
+                    && (saved_token.is_none()
+                        || self.recovery.queued_tokens.get(&receipt.document_id)
+                            == saved_token.as_ref())
+                {
+                    // A later Undo may need to recreate the recovery generation being cleared.
+                    // Keep any unrelated, newer generation cached while its write is in flight.
                     self.recovery.queued_tokens.remove(&receipt.document_id);
                 }
-                let _ = self.io_task_sender.send(IoTask::ClearRecovery {
-                    directory,
-                    document_id: receipt.document_id,
-                    saved_token: (!matches_saved).then_some(receipt.token),
-                    repaint: egui::Context::default(),
-                });
             }
         }
         self.book_ui.job = None;
@@ -1779,6 +1799,67 @@ mod tests {
         assert!(!output.join("001.png").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn review_rejects_closed_page_aliases_before_source_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        efude_io::save(&source.join("001.efude"), &Document::new(8, 8)).unwrap();
+        // Directory aliases keep each leaf a regular file, unlike a file symlink.
+        for alias in ["first", "second"] {
+            std::os::unix::fs::symlink(&source, directory.path().join(alias)).unwrap();
+        }
+        let mut book = Book::new("Aliases", tiny_page_spec());
+        book.pages = ["first/001.efude", "second/001.efude"]
+            .into_iter()
+            .map(|file| BookPage { file: file.into() })
+            .collect();
+        let mut app = EfudeApp::default();
+        app.book_ui.book = Some((directory.path().join("aliases.efudebook"), book));
+        let output = directory.path().join("output");
+        let error = app.prepare_book_export(output.clone()).unwrap_err();
+        assert!(error.contains("同じページファイル"));
+        assert!(app.book_ui.preview.is_none());
+        assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_closed_source_is_rejected_before_saving_any_open_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, book) = small_book(directory.path());
+        let first = page_path(&path, &book.pages[0]);
+        let second = page_path(&path, &book.pages[1]);
+        let original = std::fs::read(&first).unwrap();
+        let replacement = directory.path().join("replacement.efude");
+        let mut replacement_doc = Document::new(8, 8);
+        replacement_doc.layers[0]
+            .pixels
+            .set_pixel(2, 2, [255, 0, 0, 255]);
+        efude_io::save(&replacement, &replacement_doc).unwrap();
+        let mut app = EfudeApp::default();
+        app.install_document(Document::new(8, 8), first.clone());
+        app.add_raster_layer();
+        app.book_ui.book = Some((path, book));
+        let output = directory.path().join("output");
+        app.prepare_book_export(output.clone()).unwrap();
+        let mut request = app.book_ui.preview.take().unwrap().request;
+        request.save_first = true;
+        // Resolving this path now gives a different key than it did at review time.
+        std::fs::remove_file(&second).unwrap();
+        std::os::unix::fs::symlink(replacement, second).unwrap();
+        let (receipts, result) = execute_export(request);
+        assert!(
+            result.is_err(),
+            "a substituted page must require a new review"
+        );
+        assert!(receipts.is_empty());
+        assert_eq!(std::fs::read(first).unwrap(), original);
+        assert!(!output.join("001.png").exists());
+        assert!(!output.join("002.png").exists());
+    }
+
     #[test]
     fn batch_save_clears_saved_recovery_and_keeps_a_later_edit_recoverable() {
         fn drain(app: &mut EfudeApp, ctx: &egui::Context) {
@@ -1838,6 +1919,59 @@ mod tests {
                 edit_after_save
             );
         }
+    }
+
+    #[test]
+    fn delayed_batch_saves_allow_recovery_after_undoing_to_a_cleared_state() {
+        fn drain(app: &mut EfudeApp, ctx: &egui::Context) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.io_task_sender.busy.get() > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1280.0, 820.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.update_ui(ctx),
+                );
+            }
+            assert_eq!(app.io_task_sender.busy.get(), 0);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (path, book) = small_book(directory.path());
+        let mut app = EfudeApp::default();
+        app.install_document(Document::new(8, 8), page_path(&path, &book.pages[0]));
+        app.add_raster_layer();
+        let ctx = egui::Context::default();
+        let id = app.history.document_id();
+        let first_token = app.history.state_token();
+        app.queue_recovery_snapshots(&ctx).unwrap();
+        drain(&mut app, &ctx);
+        let old = app.recovery.snapshot_paths(id, first_token).unwrap().0;
+        assert!(old.exists());
+        app.book_ui.book = Some((path, book));
+        for index in 0..2 {
+            app.prepare_book_export(directory.path().join(format!("output-{index}")))
+                .unwrap();
+            let mut request = app.book_ui.preview.take().unwrap().request;
+            request.save_first = true;
+            let (receipts, result) = execute_export(request);
+            result.as_ref().unwrap();
+            app.add_raster_layer(); // Edit while the batch-save completion is pending.
+            app.book_export_finished(receipts, result);
+            drain(&mut app, &ctx);
+        }
+        assert!(!old.exists());
+        app.history.undo_document(&mut app.doc);
+        app.history.undo_document(&mut app.doc);
+        assert_eq!(app.history.state_token(), first_token);
+        assert!(app.history.is_dirty());
+        assert_eq!(app.queue_recovery_snapshots(&ctx).unwrap(), 1);
+        drain(&mut app, &ctx);
+        assert_eq!(efude_io::load(&old).unwrap().layers.len(), 2);
     }
 
     #[test]

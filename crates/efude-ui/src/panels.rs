@@ -289,6 +289,7 @@ impl EfudeApp {
 
     /// Adds an empty raster layer above the selected one and selects it.
     pub(crate) fn add_raster_layer(&mut self) {
+        self.finish_pending_canvas_gesture();
         let source_id = self
             .doc
             .layers

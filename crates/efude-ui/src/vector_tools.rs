@@ -401,6 +401,7 @@ impl EfudeApp {
 
     /// Adds an empty vector layer above the selected layer.
     pub(crate) fn add_vector_layer(&mut self) {
+        self.finish_pending_canvas_gesture();
         let english = self.language_english;
         let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
         let mut layer = efude_canvas::Layer::new(

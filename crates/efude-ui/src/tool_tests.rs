@@ -2160,6 +2160,39 @@ fn filter_windows_preview_and_apply_on_the_worker() {
 }
 
 #[test]
+fn filtering_soft_selection_preserves_unassociated_color_and_history() {
+    let mut h = Harness::new(2, 1);
+    h.app.doc.layers[0]
+        .pixels
+        .set_pixel(0, 0, [200, 80, 40, 255]);
+    h.app.selection = Selection {
+        active: true,
+        mask: vec![0, 128],
+    };
+    h.app.queue_filter(
+        FilterOperation::Image(efude_canvas::filters::Filter::Mosaic { size: 2 }),
+        &h.ctx.clone(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.app.filter_pending && std::time::Instant::now() < deadline {
+        h.frames(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!h.app.filter_pending);
+    assert_eq!(h.pixel(0, 0), [200, 80, 40, 255]);
+    assert_eq!(
+        h.pixel(1, 0),
+        [200, 80, 40, 64],
+        "feathering must not darken RGB"
+    );
+    h.app.undo();
+    assert_eq!(h.pixel(0, 0), [200, 80, 40, 255]);
+    assert_eq!(h.pixel(1, 0), [0; 4]);
+    h.app.redo();
+    assert_eq!(h.pixel(1, 0), [200, 80, 40, 64]);
+}
+
+#[test]
 fn the_loading_animation_decodes() {
     assert!(crate::filters_ui::loading_animation_frames() > 100);
 }

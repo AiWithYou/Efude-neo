@@ -7,6 +7,105 @@
 use super::*;
 use efude_canvas::filters::{BlurKind, Direction, Filter, GRADE_COUNT, GRADE_NAMES};
 
+#[cfg(test)]
+mod preview_regression_tests {
+    use super::*;
+
+    fn after_pixels(app: &mut EfudeApp, ctx: &egui::Context) -> Vec<Color32> {
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_filter_preview(ctx, FilterKind::Mosaic);
+        });
+        let id = app
+            .filter_dialog
+            .as_ref()
+            .unwrap()
+            .preview
+            .as_ref()
+            .unwrap()
+            .after
+            .id();
+        let image = output
+            .textures_delta
+            .set
+            .iter()
+            .find(|(texture, _)| *texture == id)
+            .expect("changed document needs a new preview");
+        let egui::ImageData::Color(image) = &image.1.image else {
+            panic!("RGBA preview expected")
+        };
+        image.pixels.clone()
+    }
+
+    #[test]
+    fn filter_preview_updates_between_clean_documents_with_matching_layer_ids() {
+        let mut app = EfudeApp::default();
+        let ctx = egui::Context::default();
+        let mut first = Document::new(2, 1);
+        first.layers[0].pixels.fill_shared([220, 30, 20, 255]);
+        app.install_document(first, "first.efude".into());
+        app.filter_dialog = Some(FilterDialog::open(FilterKind::Mosaic));
+        assert_eq!(
+            after_pixels(&mut app, &ctx),
+            vec![Color32::from_rgb(220, 30, 20); 2]
+        );
+        let mut second = Document::new(2, 1);
+        second.layers[0].pixels.fill_shared([20, 30, 220, 255]);
+        app.install_document(second, "second.efude".into());
+        assert_eq!(
+            after_pixels(&mut app, &ctx),
+            vec![Color32::from_rgb(20, 30, 220); 2]
+        );
+        app.switch_tab(0);
+        assert_eq!(
+            after_pixels(&mut app, &ctx),
+            vec![Color32::from_rgb(220, 30, 20); 2]
+        );
+    }
+
+    #[test]
+    fn filter_preview_obeys_soft_selection_just_like_apply() {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(2, 1);
+        app.doc.layers[0].pixels.set_pixel(0, 0, [200, 80, 40, 255]);
+        app.selection = Selection {
+            active: true,
+            mask: vec![0, 128],
+        };
+        app.filter_settings.mosaic = 2;
+        app.filter_dialog = Some(FilterDialog::open(FilterKind::Mosaic));
+        let ctx = egui::Context::default();
+        let token = app.history.state_token();
+        assert_eq!(
+            after_pixels(&mut app, &ctx),
+            vec![
+                Color32::from_rgb(200, 80, 40),
+                Color32::from_rgb(241, 211, 201),
+            ]
+        );
+        assert_eq!(app.history.state_token(), token);
+        assert_eq!(app.doc.layers[0].pixels.pixel(1, 0), [0; 4]);
+        app.change_selection(|selection, _, _| selection.mask = vec![255, 0]);
+        assert_eq!(app.history.state_token(), token);
+        assert_eq!(
+            after_pixels(&mut app, &ctx),
+            vec![Color32::from_rgb(227, 167, 147), Color32::WHITE]
+        );
+        app.undo();
+        assert_eq!(
+            after_pixels(&mut app, &ctx),
+            vec![
+                Color32::from_rgb(200, 80, 40),
+                Color32::from_rgb(241, 211, 201)
+            ]
+        );
+        app.change_selection(|selection, _, _| selection.clear());
+        assert_eq!(
+            after_pixels(&mut app, &ctx),
+            vec![Color32::from_rgb(227, 167, 147); 2]
+        );
+    }
+}
+
 /// Filters that have a window.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FilterKind {
@@ -505,8 +604,25 @@ impl EfudeApp {
         let left = (self.navigator_center.x as i64 - pw / 2).clamp(0, dw - pw);
         let top = (self.navigator_center.y as i64 - ph / 2).clamp(0, dh - ph);
         let layer = &self.doc.layers[self.selected_layer];
+        // Selection-only edits do not change the document's saved-state token.
+        // Only visible output coverage affects this preview; avoid hashing the
+        // full canvas on every frame while a filter window is open.
+        let selection_key = self.selection.active.then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            for y in top..top + ph {
+                let start = (y * dw + left) as usize;
+                let end = (start + pw as usize).min(self.selection.mask.len());
+                self.selection
+                    .mask
+                    .get(start..end)
+                    .unwrap_or(&[])
+                    .hash(&mut hash);
+            }
+            hash.finish()
+        });
         let key = format!(
-            "{operation:?} {left} {top} {} {}",
+            "{operation:?} {left} {top} {} {} {selection_key:?}",
             layer.id,
             self.history.state_token()
         );
@@ -534,7 +650,26 @@ impl EfudeApp {
         let mut part = efude_canvas::Layer::new(0, String::new(), cw, ch);
         part.pixels = efude_canvas::TilePixels::from_dense(cw, ch, &crop);
         run_filter(&mut part, cw, ch, operation, (x0, y0));
-        let filtered = part.pixels.to_dense();
+        let mut filtered = part.pixels.to_dense();
+        if self.selection.active {
+            for y in 0..ch {
+                for x in 0..cw {
+                    let i = ((y * cw + x) * 4) as usize;
+                    let index = ((y0 + i64::from(y)) * dw + x0 + i64::from(x)) as usize;
+                    let coverage =
+                        self.selection.mask.get(index).copied().unwrap_or(0) as f32 / 255.0;
+                    let before = [crop[i], crop[i + 1], crop[i + 2], crop[i + 3]];
+                    let after = [
+                        filtered[i],
+                        filtered[i + 1],
+                        filtered[i + 2],
+                        filtered[i + 3],
+                    ];
+                    filtered[i..i + 4]
+                        .copy_from_slice(&blend_selection_pixel(before, after, coverage));
+                }
+            }
+        }
         let image = |pixels: &[u8]| {
             let mut out = Vec::with_capacity((pw * ph * 4) as usize);
             for y in 0..ph {
