@@ -11,6 +11,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+// Accommodate extended Windows paths, including JSON/UTF-8 expansion,
+// while keeping recovery sidecar reads bounded.
+const MAX_METADATA_BYTES: u64 = 256 * 1024;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SnapshotMeta {
     pub version: u32,
@@ -168,7 +172,9 @@ impl Store {
                         .file_name()
                         .and_then(|name| name.to_str())
                         .is_some_and(|name| name.starts_with("tab_"))
-                    || metadata.metadata().is_ok_and(|data| data.len() > 16 * 1024)
+                    || metadata
+                        .metadata()
+                        .is_ok_and(|data| data.len() > MAX_METADATA_BYTES)
                 {
                     continue;
                 }
@@ -182,7 +188,7 @@ impl Store {
                 let Ok(info) = serde_json::from_slice::<SnapshotMeta>(&bytes) else {
                     continue;
                 };
-                if info.version != 1 || info.title.chars().count() > 240 {
+                if !valid_snapshot_metadata(&metadata, &info) {
                     continue;
                 }
                 self.candidates.push(Candidate {
@@ -319,9 +325,33 @@ pub(crate) fn write_snapshot(
     doc: &Document,
     info: &SnapshotMeta,
 ) -> Result<(), String> {
-    efude_io::save(snapshot, doc).map_err(|error| error.to_string())?;
-    let bytes = serde_json::to_vec(info).map_err(|error| error.to_string())?;
     let parent = metadata.parent().ok_or("invalid recovery metadata path")?;
+    if !valid_snapshot_metadata(metadata, info)
+        || snapshot != metadata.with_extension("efude").as_path()
+        || info.width != doc.width
+        || info.height != doc.height
+    {
+        return Err("invalid recovery snapshot identity".into());
+    }
+    let previous = read_generation_metadata(parent, info.document_id)?
+        .into_iter()
+        .map(|(_, info)| info.saved_at_nanos)
+        .max();
+    let mut stored_info = info.clone();
+    if let Some(previous) = previous {
+        stored_info.saved_at_nanos = stored_info.saved_at_nanos.max(
+            previous
+                .checked_add(1)
+                .ok_or("Recovery generation order overflow")?,
+        );
+    }
+    // `saved_at` remains the real wall-clock time shown by the UI. The
+    // nanosecond field also orders generations, including retries and Undo.
+    let bytes = serde_json::to_vec(&stored_info).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_METADATA_BYTES {
+        return Err("Recovery metadata is too large".into());
+    }
+    efude_io::save(snapshot, doc).map_err(|error| error.to_string())?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
     temp.write_all(&bytes).map_err(|error| error.to_string())?;
     temp.as_file()
@@ -333,25 +363,59 @@ pub(crate) fn write_snapshot(
 }
 
 fn generation_metadata(folder: &Path, document_id: u64) -> Vec<(PathBuf, SnapshotMeta)> {
-    let Ok(items) = fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    items
-        .flatten()
-        .filter_map(|item| {
-            let path = item.path();
-            let name = path.file_name()?.to_str()?;
-            if !name.starts_with(&format!("tab_{document_id}_")) || !name.ends_with(".json") {
-                return None;
-            }
-            if path.metadata().ok()?.len() > 16 * 1024 {
-                return None;
-            }
-            let bytes = fs::read(&path).ok()?;
-            let info = serde_json::from_slice::<SnapshotMeta>(&bytes).ok()?;
-            (info.document_id == document_id).then_some((path, info))
-        })
-        .collect()
+    read_generation_metadata(folder, document_id).unwrap_or_default()
+}
+
+fn valid_snapshot_metadata(metadata: &Path, info: &SnapshotMeta) -> bool {
+    info.version == 1
+        && efude_canvas::valid_document_dimensions(info.width, info.height)
+        && metadata
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name == format!("tab_{}_{}.json", info.document_id, info.state_token)
+            })
+}
+
+fn read_generation_metadata(
+    folder: &Path,
+    document_id: u64,
+) -> Result<Vec<(PathBuf, SnapshotMeta)>, String> {
+    let items = fs::read_dir(folder).map_err(|error| error.to_string())?;
+    let prefix = format!("tab_{document_id}_");
+    let mut generations = Vec::new();
+    for item in items {
+        let item = item.map_err(|error| error.to_string())?;
+        let path = item.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        if !item
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+            || path.metadata().map_err(|error| error.to_string())?.len() > MAX_METADATA_BYTES
+        {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let Ok(info) = serde_json::from_slice::<SnapshotMeta>(&bytes) else {
+            continue;
+        };
+        if info.document_id != document_id || !valid_snapshot_metadata(&path, &info) {
+            continue;
+        }
+        match fs::symlink_metadata(path.with_extension("efude")) {
+            Ok(data) if data.is_file() => generations.push((path, info)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(generations)
 }
 
 fn prune_old_generations(folder: &Path, document_id: u64) {
@@ -520,7 +584,7 @@ impl EfudeApp {
                                             candidate.info.width,
                                             candidate.info.height,
                                             age,
-                                            candidate.info.tab_index + 1
+                                            candidate.info.tab_index as u128 + 1
                                         ));
                                     });
                                 });
@@ -764,6 +828,92 @@ mod tests {
     }
 
     #[test]
+    fn long_valid_document_titles_remain_available_for_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first = Store::new_in(root.path().to_path_buf());
+        let doc = Document::new(8, 8);
+        // A valid file name can exceed 240 characters, and recovered-tab titles
+        // additionally include a suffix. Neither should hide a complete snapshot.
+        let title = format!("{}.efude (recovered)", "a".repeat(245));
+        let original = root.path().join(format!("{}.efude", "a".repeat(245)));
+        let info = make_metadata(1, 2, title.clone(), Some(original), 0, &doc);
+        let (snapshot, metadata) = first.snapshot_paths(1, 2).unwrap();
+        write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        first._lease.take();
+
+        let mut restarted = Store::new_in(root.path().to_path_buf());
+        assert_eq!(restarted.candidates.len(), 1);
+        assert_eq!(restarted.candidates[0].info.title, title);
+        assert!(restarted.candidates[0].selected);
+        restarted.finish_cleanly();
+    }
+
+    #[test]
+    fn recovery_dialog_can_display_the_largest_imported_tab_index() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first = Store::new_in(root.path().to_path_buf());
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels.set_pixel(0, 0, [12, 34, 56, 255]);
+        let info = make_metadata(1, 2, "Recovered".into(), None, usize::MAX, &doc);
+        let (snapshot, metadata) = first.snapshot_paths(1, 2).unwrap();
+        write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        first._lease.take();
+
+        let mut app = EfudeApp::default();
+        app.recovery.finish_cleanly();
+        app.recovery = Store::new_in(root.path().to_path_buf());
+        assert_eq!(app.recovery.candidates.len(), 1);
+        assert_eq!(app.recovery.candidates[0].info.tab_index, usize::MAX);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| app.recovery_dialog(ctx));
+        assert_eq!(
+            efude_io::load(&snapshot).unwrap().layers[0]
+                .pixels
+                .pixel(0, 0),
+            [12, 34, 56, 255]
+        );
+        app.recovery.finish_cleanly();
+    }
+
+    #[test]
+    fn long_original_paths_remain_available_for_recovery_and_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first = Store::new_in(root.path().to_path_buf());
+        let doc = Document::new(8, 8);
+        // Windows extended paths permit up to 32,767 UTF-16 units. Each
+        // component here stays below the usual 255-unit component limit.
+        let mut original = PathBuf::from(r"\\?\C:\");
+        for _ in 0..100 {
+            original.push("a".repeat(180));
+        }
+        original.push("drawing.efude");
+        let info = make_metadata(
+            1,
+            2,
+            "drawing.efude".into(),
+            Some(original.clone()),
+            0,
+            &doc,
+        );
+        let (snapshot, metadata) = first.snapshot_paths(1, 2).unwrap();
+        write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        assert!(fs::metadata(&metadata).unwrap().len() > 16 * 1024);
+        assert_eq!(
+            generation_metadata(first.current_dir().unwrap(), 1).len(),
+            1
+        );
+        first._lease.take();
+
+        let mut restarted = Store::new_in(root.path().to_path_buf());
+        assert_eq!(restarted.candidates.len(), 1);
+        assert_eq!(restarted.candidates[0].info.original_path, Some(original));
+        clear_snapshot_family(snapshot.parent().unwrap(), 1, None);
+        assert!(!snapshot.exists());
+        assert!(!metadata.exists());
+        restarted.finish_cleanly();
+    }
+
+    #[test]
     fn saved_state_clears_only_the_matching_recovery_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::new_in(root.path().to_path_buf());
@@ -827,6 +977,244 @@ mod tests {
             [1, 2, 3, 255]
         );
         assert!(old_meta.exists());
+        store.finish_cleanly();
+    }
+
+    #[test]
+    fn recovery_keeps_latest_saves_after_clock_moves_backwards() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new_in(root.path().to_path_buf());
+        let mut doc = Document::new(8, 8);
+        let future = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+            + std::time::Duration::from_secs(3600))
+        .as_nanos();
+        for (index, token) in [10, 20, 5].into_iter().enumerate() {
+            doc.layers[0]
+                .pixels
+                .set_pixel(0, 0, [index as u8 + 1, 0, 0, 255]);
+            let (snapshot, metadata) = store.snapshot_paths(1, token).unwrap();
+            let mut info = make_metadata(1, token, "A".into(), None, 0, &doc);
+            if index < 2 {
+                info.saved_at_nanos = future + index as u128;
+            } else {
+                info.saved_at = 42;
+            }
+            write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        }
+        let (latest, latest_meta) = store.snapshot_paths(1, 5).unwrap();
+        assert!(latest.exists(), "the newest saved recovery was pruned");
+        assert!(store.snapshot_paths(1, 20).unwrap().0.exists());
+        assert!(!store.snapshot_paths(1, 10).unwrap().0.exists());
+        let info: SnapshotMeta = serde_json::from_slice(&fs::read(&latest_meta).unwrap()).unwrap();
+        assert_eq!(
+            info.saved_at, 42,
+            "the UI must retain the real wall-clock time"
+        );
+        assert!(info.saved_at_nanos > future + 1);
+
+        store.current = None; // Leave the files as an interrupted process would.
+        drop(store);
+        let mut recovered = Store::new_in(root.path().to_path_buf());
+        let selected = recovered
+            .candidates
+            .iter()
+            .find(|candidate| candidate.selected)
+            .unwrap();
+        assert_eq!(selected.snapshot, latest);
+        assert_eq!(
+            efude_io::load(&selected.snapshot).unwrap().layers[0]
+                .pixels
+                .pixel(0, 0),
+            [3, 0, 0, 255]
+        );
+        recovered.finish_cleanly();
+    }
+
+    #[test]
+    fn recovery_retry_updates_same_state_without_changing_display_time() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new_in(root.path().to_path_buf());
+        let mut doc = Document::new(8, 8);
+        let (snapshot, metadata) = store.snapshot_paths(1, 5).unwrap();
+        let mut info = make_metadata(1, 5, "A".into(), None, 0, &doc);
+        info.saved_at_nanos = 100;
+        write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        doc.layers[0].pixels.set_pixel(0, 0, [4, 5, 6, 128]);
+        info.saved_at_nanos = 1;
+        info.saved_at = 42;
+        write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        let stored: SnapshotMeta = serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        assert_eq!(stored.saved_at_nanos, 101);
+        assert_eq!(stored.saved_at, 42);
+        assert_eq!(stored.state_token, 5);
+        assert_eq!(
+            info.saved_at_nanos, 1,
+            "the requested metadata is not mutated"
+        );
+        assert_eq!(
+            efude_io::load(&snapshot).unwrap().layers[0]
+                .pixels
+                .pixel(0, 0),
+            [4, 5, 6, 128]
+        );
+        assert_eq!(
+            generation_metadata(store.current_dir().unwrap(), 1).len(),
+            1
+        );
+        store.finish_cleanly();
+    }
+
+    #[test]
+    fn recovery_order_overflow_preserves_existing_generations_and_original() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new_in(root.path().to_path_buf());
+        let mut doc = Document::new(8, 8);
+        let original = root.path().join("original.efude");
+        efude_io::save(&original, &doc).unwrap();
+        let mut preserved = vec![(original.clone(), fs::read(&original).unwrap())];
+        for (token, stamp) in [(10, u128::MAX - 1), (20, u128::MAX)] {
+            let (snapshot, metadata) = store.snapshot_paths(1, token).unwrap();
+            let mut info = make_metadata(1, token, "A".into(), Some(original.clone()), 0, &doc);
+            info.saved_at_nanos = stamp;
+            write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+            preserved.push((snapshot.clone(), fs::read(&snapshot).unwrap()));
+            preserved.push((metadata.clone(), fs::read(&metadata).unwrap()));
+        }
+        doc.layers[0].pixels.set_pixel(0, 0, [4, 5, 6, 255]);
+        // Check both a new generation and a retry of the existing maximum.
+        for token in [5, 20] {
+            let (snapshot, metadata) = store.snapshot_paths(1, token).unwrap();
+            let mut info = make_metadata(1, token, "A".into(), Some(original.clone()), 0, &doc);
+            info.saved_at_nanos = 1;
+            assert_eq!(
+                write_snapshot(&snapshot, &metadata, &doc, &info).unwrap_err(),
+                "Recovery generation order overflow"
+            );
+            for (path, bytes) in &preserved {
+                assert_eq!(
+                    &fs::read(path).unwrap(),
+                    bytes,
+                    "changed {}",
+                    path.display()
+                );
+            }
+        }
+        let (new_snapshot, new_metadata) = store.snapshot_paths(1, 5).unwrap();
+        assert!(!new_snapshot.exists());
+        assert!(!new_metadata.exists());
+        assert_eq!(
+            generation_metadata(store.current_dir().unwrap(), 1).len(),
+            2
+        );
+        store.finish_cleanly();
+    }
+
+    #[test]
+    fn recovery_order_ignores_foreign_invalid_and_incomplete_sidecars() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new_in(root.path().to_path_buf());
+        let doc = Document::new(8, 8);
+        let folder = store.current_dir().unwrap();
+        let mut untouched = Vec::new();
+        for token in 100..=106 {
+            let mut info = make_metadata(1, token, "A".into(), None, 0, &doc);
+            info.saved_at_nanos = u128::MAX;
+            let filename = if token == 104 {
+                "tab_10_104".to_string()
+            } else {
+                format!("tab_1_{token}")
+            };
+            match token {
+                100 => info.version = 2,
+                101 => info.document_id = 2,
+                102 => info.state_token = 999,
+                103 => info.width = 0,
+                104 => info.document_id = 10,
+                _ => {}
+            }
+            let metadata = folder.join(format!("{filename}.json"));
+            let bytes = if token == 105 {
+                b"{broken".to_vec()
+            } else {
+                serde_json::to_vec(&info).unwrap()
+            };
+            fs::write(&metadata, &bytes).unwrap();
+            untouched.push((metadata, bytes));
+            if token != 106 {
+                let snapshot = folder.join(format!("{filename}.efude"));
+                efude_io::save(&snapshot, &doc).unwrap();
+                untouched.push((snapshot.clone(), fs::read(&snapshot).unwrap()));
+            }
+        }
+        let (snapshot, metadata) = store.snapshot_paths(1, 5).unwrap();
+        let mut info = make_metadata(1, 5, "A".into(), None, 0, &doc);
+        info.saved_at_nanos = 10;
+        write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        let stored: SnapshotMeta = serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        assert_eq!(stored.saved_at_nanos, 10);
+        assert_eq!(generation_metadata(folder, 1).len(), 1);
+        for (path, bytes) in untouched {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "changed {}",
+                path.display()
+            );
+        }
+        store.finish_cleanly();
+    }
+
+    #[test]
+    fn recovery_rejects_mismatched_writer_identity_before_changing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new_in(root.path().to_path_buf());
+        let doc = Document::new(8, 8);
+        let (snapshot, metadata) = store.snapshot_paths(1, 5).unwrap();
+        let info = make_metadata(1, 5, "A".into(), None, 0, &doc);
+        write_snapshot(&snapshot, &metadata, &doc, &info).unwrap();
+        let snapshot_bytes = fs::read(&snapshot).unwrap();
+        let metadata_bytes = fs::read(&metadata).unwrap();
+        for field in 0..4 {
+            let mut invalid = info.clone();
+            match field {
+                0 => invalid.version = 2,
+                1 => invalid.document_id = 2,
+                2 => invalid.state_token = 6,
+                _ => invalid.width = 7,
+            }
+            assert!(write_snapshot(&snapshot, &metadata, &doc, &invalid).is_err());
+            assert_eq!(fs::read(&snapshot).unwrap(), snapshot_bytes);
+            assert_eq!(fs::read(&metadata).unwrap(), metadata_bytes);
+        }
+        let (other_snapshot, _) = store.snapshot_paths(2, 5).unwrap();
+        assert!(write_snapshot(&other_snapshot, &metadata, &doc, &info).is_err());
+        assert!(!other_snapshot.exists());
+        store.finish_cleanly();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn recovery_order_read_failure_keeps_previous_files_and_allows_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new_in(root.path().to_path_buf());
+        let doc = Document::new(8, 8);
+        let (old, old_metadata) = store.snapshot_paths(1, 5).unwrap();
+        let info = make_metadata(1, 5, "A".into(), None, 0, &doc);
+        write_snapshot(&old, &old_metadata, &doc, &info).unwrap();
+        let old_bytes = fs::read(&old).unwrap();
+        let metadata_bytes = fs::read(&old_metadata).unwrap();
+        let lock = exclusive_open(&old_metadata).unwrap();
+        let (new, new_metadata) = store.snapshot_paths(1, 6).unwrap();
+        let info = make_metadata(1, 6, "A".into(), None, 0, &doc);
+        assert!(write_snapshot(&new, &new_metadata, &doc, &info).is_err());
+        assert!(!new.exists());
+        assert!(!new_metadata.exists());
+        assert_eq!(fs::read(&old).unwrap(), old_bytes);
+        drop(lock);
+        assert_eq!(fs::read(&old_metadata).unwrap(), metadata_bytes);
+        write_snapshot(&new, &new_metadata, &doc, &info).unwrap();
+        assert!(new.exists());
+        assert!(old.exists());
         store.finish_cleanly();
     }
 

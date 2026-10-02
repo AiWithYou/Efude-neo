@@ -60,7 +60,7 @@ struct ExportPreview {
     collisions: usize,
 }
 
-fn path_key(path: &Path) -> String {
+pub(crate) fn path_key(path: &Path) -> String {
     let path = path
         .canonicalize()
         .or_else(|_| std::path::absolute(path))
@@ -172,6 +172,8 @@ fn render_page(
         .and_then(|text| serde_json::from_str::<comic::ComicDoc>(text).ok())
         .map(|comic| comic.page)
         .unwrap_or_else(|| book.page_spec(index));
+    spec.validate()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     // A stored page may have moved to the other side since it was created.
     spec.right_page = book.is_right_page(index);
     let geometry = spec.geometry();
@@ -321,12 +323,32 @@ fn validate_closed_sources(request: &ExportRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_snapshot_source(snapshot: &PageSnapshot) -> Result<(), String> {
+    if stamp(&snapshot.path)? != snapshot.disk_stamp {
+        return Err(format!(
+            "確認後に原稿ファイルが変わりました。保存を止めました: {}",
+            snapshot.path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Roll back all published files on a publish error, retaining backups if recovery fails.
 fn publish_pngs(
     stage: tempfile::TempDir,
     folder: &Path,
     names: &[String],
     expected: &[Option<(u64, std::time::SystemTime)>],
+) -> Result<(), String> {
+    publish_pngs_with_checkpoint(stage, folder, names, expected, |_| {})
+}
+
+fn publish_pngs_with_checkpoint(
+    stage: tempfile::TempDir,
+    folder: &Path,
+    names: &[String],
+    expected: &[Option<(u64, std::time::SystemTime)>],
+    mut before_backup: impl FnMut(&Path),
 ) -> Result<(), String> {
     if expected.len() != names.len() {
         return Err("書き出し先の確認件数が一致しません".into());
@@ -345,10 +367,19 @@ fn publish_pngs(
                 ));
             }
             if expected[index].is_some() {
+                before_backup(&destination);
                 let backup = backup_folder.join(name);
                 std::fs::rename(&destination, &backup)
                     .map_err(|e| format!("{}: {e}", destination.display()))?;
+                let moved_stamp = stamp(&backup);
+                // Every check failure must restore or retain the file just moved.
                 backups.push((destination.clone(), backup));
+                if moved_stamp? != expected[index] {
+                    return Err(format!(
+                        "確認後に出力先が変わりました: {}",
+                        destination.display()
+                    ));
+                }
             }
             let source_path = stage.path().join(name);
             let published_stamp = stamp(&source_path)?;
@@ -415,6 +446,13 @@ fn rollback_pngs(
 pub(crate) fn execute_export(
     request: ExportRequest,
 ) -> (Vec<SaveReceipt>, Result<PathBuf, String>) {
+    execute_export_with_checkpoint(request, |_| {})
+}
+
+fn execute_export_with_checkpoint(
+    request: ExportRequest,
+    mut after_save: impl FnMut(&Path),
+) -> (Vec<SaveReceipt>, Result<PathBuf, String>) {
     let mut receipts = Vec::new();
     if request.expected.iter().any(Option::is_some) && !request.overwrite {
         return (
@@ -427,18 +465,8 @@ pub(crate) fn execute_export(
             return (receipts, Err(error));
         }
         for snapshot in request.snapshots.values().filter(|s| s.dirty) {
-            match stamp(&snapshot.path) {
-                Ok(current) if current == snapshot.disk_stamp => {}
-                Ok(_) => {
-                    return (
-                        receipts,
-                        Err(format!(
-                            "確認後に原稿ファイルが変わりました。保存を止めました: {}",
-                            snapshot.path.display()
-                        )),
-                    );
-                }
-                Err(error) => return (receipts, Err(error)),
+            if let Err(error) = validate_snapshot_source(snapshot) {
+                return (receipts, Err(error));
             }
         }
         // Runs on the normal I/O queue; a normal save cannot race this sequence.
@@ -447,6 +475,10 @@ pub(crate) fn execute_export(
             if let Some(snapshot) = request.snapshots.get(&path_key(&path))
                 && snapshot.dirty
             {
+                // Other processes can change a later page while earlier pages save.
+                if let Err(error) = validate_snapshot_source(snapshot) {
+                    return (receipts, Err(error));
+                }
                 if let Err(error) = efude_io::save(&snapshot.path, &snapshot.document) {
                     return (
                         receipts,
@@ -461,6 +493,7 @@ pub(crate) fn execute_export(
                     document_id: snapshot.document_id,
                     token: snapshot.token,
                 });
+                after_save(&snapshot.path);
             }
         }
     }
@@ -1394,6 +1427,107 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn print_export_clips_page_numbers_outside_integer_coordinates() {
+        assert_export_clips_extreme_nombre(false);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn print_export_clips_document_metadata_page_numbers_outside_integer_coordinates() {
+        assert_export_clips_extreme_nombre(true);
+    }
+
+    #[cfg(windows)]
+    fn assert_export_clips_extreme_nombre(in_metadata: bool) {
+        let fonts = text::system_fonts();
+        let info = fonts
+            .iter()
+            .find(|info| info.name.contains("Arial"))
+            .or(fonts.first())
+            .expect("Windows system font");
+        let font = (Arc::new(std::fs::read(&info.path).unwrap()), info.index);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.efudebook");
+        let mut book = Book::new("Test", tiny_page_spec());
+        book.pages.push(BookPage {
+            file: "001.efude".into(),
+        });
+        let mut extreme = tiny_page_spec();
+        extreme.inner_margins_mm[3] = 1e20;
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels.set_pixel(0, 0, [12, 34, 56, 255]);
+        if in_metadata {
+            doc.metadata.insert(
+                "comic".into(),
+                serde_json::to_string(&comic::ComicDoc {
+                    page: extreme,
+                    layout: efude_comic::PanelLayout::for_dpi(25.4),
+                })
+                .unwrap(),
+            );
+        } else {
+            book.page = extreme;
+        }
+        std::fs::write(&path, book.to_json()).unwrap();
+        let book = Book::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        efude_io::save(&page_path(&path, &book.pages[0]), &doc).unwrap();
+        let image = render_page(
+            &book,
+            &path,
+            0,
+            &ExportOptions::default(),
+            Some(&font),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(image.rgba, efude_canvas::composite(&doc));
+    }
+
+    #[test]
+    fn print_export_rejects_invalid_page_geometry_stored_in_document_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let book_path = directory.path().join("test.efudebook");
+        let mut book = Book::new("Test", tiny_page_spec());
+        book.nombre.enabled = false;
+        book.pages.push(BookPage {
+            file: "001.efude".into(),
+        });
+        let mut invalid = tiny_page_spec();
+        invalid.dpi = 1e20;
+        invalid.trim_mm = [2.032e-18; 2];
+        assert_eq!(
+            (
+                invalid.geometry().canvas_width,
+                invalid.geometry().canvas_height
+            ),
+            (8, 8)
+        );
+        let mut doc = Document::new(8, 8);
+        doc.metadata.insert(
+            "comic".into(),
+            serde_json::to_string(&comic::ComicDoc {
+                page: invalid,
+                layout: efude_comic::PanelLayout::for_dpi(300.0),
+            })
+            .unwrap(),
+        );
+        efude_io::save(&page_path(&book_path, &book.pages[0]), &doc).unwrap();
+        let result = render_page(
+            &book,
+            &book_path,
+            0,
+            &ExportOptions {
+                area: ExportArea::WithMarks,
+                ..ExportOptions::default()
+            },
+            None,
+            &Default::default(),
+        );
+        assert!(result.is_err(), "invalid metadata was rendered");
+    }
+
+    #[test]
     fn creating_a_book_rejects_existing_manifest_or_page_without_changing_them() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = EfudeApp::default();
@@ -1689,6 +1823,98 @@ mod tests {
             })
             .unwrap();
         assert!(!parked.history.is_dirty());
+    }
+
+    #[test]
+    fn a_source_changed_between_batch_saves_keeps_the_other_writers_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, book) = small_book(directory.path());
+        let first_path = page_path(&path, &book.pages[0]);
+        let second_path = page_path(&path, &book.pages[1]);
+        let mut app = EfudeApp::default();
+        app.install_document(Document::new(8, 8), first_path.clone());
+        app.add_raster_layer();
+        app.install_document(Document::new(8, 8), second_path.clone());
+        app.add_raster_layer();
+        app.book_ui.book = Some((path, book));
+        let folder = directory.path().join("output");
+        std::fs::create_dir(&folder).unwrap();
+        app.prepare_book_export(folder.clone()).unwrap();
+        let mut request = app.book_ui.preview.take().unwrap().request;
+        request.save_first = true;
+        app.validate_book_save_sources(&request).unwrap();
+        let reviewed_stamp = stamp(&second_path).unwrap();
+        let mut other_document = Document::new(8, 8);
+        other_document.layers[0].name = "Saved by another writer".repeat(8);
+        other_document.layers[0]
+            .pixels
+            .set_pixel(3, 3, [0, 255, 0, 255]);
+        let mut other_bytes = None;
+        let (receipts, result) = execute_export_with_checkpoint(request, |saved_path| {
+            if path_key(saved_path) == path_key(&first_path) {
+                // A second process saves while the batch has finished only page one.
+                efude_io::save(&second_path, &other_document).unwrap();
+                assert_ne!(stamp(&second_path).unwrap(), reviewed_stamp);
+                other_bytes = Some(std::fs::read(&second_path).unwrap());
+            }
+        });
+        assert!(
+            std::fs::read(&second_path).unwrap() == other_bytes.unwrap(),
+            "the batch overwrote the other writer's document"
+        );
+        assert!(result.is_err());
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(path_key(&receipts[0].path), path_key(&first_path));
+        assert_eq!(efude_io::load(&first_path).unwrap().layers.len(), 2);
+        assert_eq!(efude_io::load(&second_path).unwrap().layers.len(), 1);
+        assert!(!folder.join("001.png").exists());
+        assert!(!folder.join("002.png").exists());
+        app.book_export_finished(receipts, result);
+        assert!(app.history.is_dirty());
+        let first_tab = app
+            .tabs
+            .slots
+            .iter()
+            .filter_map(|slot| slot.parked.as_ref())
+            .find(|tab| {
+                tab.doc_path
+                    .as_ref()
+                    .is_some_and(|path| path_key(path) == path_key(&first_path))
+            })
+            .unwrap();
+        assert!(!first_tab.history.is_dirty());
+    }
+
+    #[test]
+    fn an_output_changed_before_backup_is_restored_and_aborts_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path();
+        let names = vec!["001.png".into(), "002.png".into()];
+        for name in &names {
+            std::fs::write(folder.join(name), b"original").unwrap();
+        }
+        let expected = names
+            .iter()
+            .map(|name| stamp(&folder.join(name)).unwrap())
+            .collect::<Vec<_>>();
+        let stage = tempfile::tempdir_in(folder).unwrap();
+        for name in &names {
+            std::fs::write(stage.path().join(name), b"our new output").unwrap();
+        }
+        let other_bytes = b"a replacement saved by another writer after our stamp check";
+        let result = publish_pngs_with_checkpoint(stage, folder, &names, &expected, |path| {
+            if path.file_name().unwrap() == "002.png" {
+                std::fs::write(path, other_bytes).unwrap();
+                assert_ne!(stamp(path).unwrap(), expected[1]);
+            }
+        });
+        assert!(
+            std::fs::read(folder.join("002.png")).unwrap() == other_bytes,
+            "publication discarded the other writer's replacement"
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(folder.join("001.png")).unwrap(), b"original");
+        assert!(result.unwrap_err().contains("元に戻しました"));
     }
 
     #[test]

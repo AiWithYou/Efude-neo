@@ -75,7 +75,11 @@ impl Book {
     }
 
     pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(text)
+        let book: Self = serde_json::from_str(text)?;
+        book.page
+            .validate()
+            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+        Ok(book)
     }
 
     pub fn to_json(&self) -> String {
@@ -128,8 +132,10 @@ impl Book {
 
     /// The page number printed on page `index`, if any.
     pub fn nombre_of(&self, index: usize) -> Option<u32> {
-        (self.nombre.enabled && !(self.nombre.skip_first && index == 0))
-            .then(|| self.nombre.start + index as u32)
+        if !self.nombre.enabled || (self.nombre.skip_first && index == 0) {
+            return None;
+        }
+        self.nombre.start.checked_add(u32::try_from(index).ok()?)
     }
 
     /// File name for page `number` (1-based) of a new book.
@@ -175,6 +181,9 @@ impl Image {
 
     /// Copies `other` with its top-left at (`x`, `y`).
     pub fn paste(&mut self, other: &Image, x: u32, y: u32) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
         for row in 0..other.height.min(self.height.saturating_sub(y)) {
             let len = (other.width.min(self.width.saturating_sub(x)) * 4) as usize;
             let src = other.at(0, row);
@@ -191,20 +200,26 @@ impl Image {
                 if value == 0 {
                     continue;
                 }
-                let (px, py) = (
-                    coverage.x0 as i64 + x as i64 + offset.0,
-                    coverage.y0 as i64 + y as i64 + offset.1,
-                );
+                let (Some(px), Some(py)) = (
+                    (i64::from(coverage.x0) + i64::from(x)).checked_add(offset.0),
+                    (i64::from(coverage.y0) + i64::from(y)).checked_add(offset.1),
+                ) else {
+                    continue;
+                };
                 if px < 0 || py < 0 || px >= self.width as i64 || py >= self.height as i64 {
                     continue;
                 }
                 let i = self.at(px as u32, py as u32);
                 let a = value as f32 / 255.0;
+                let destination_alpha = self.rgba[i + 3] as f32 / 255.0;
+                let output_alpha = a + destination_alpha * (1.0 - a);
                 for (c, &channel) in color.iter().enumerate() {
-                    self.rgba[i + c] =
-                        (channel as f32 * a + self.rgba[i + c] as f32 * (1.0 - a)).round() as u8;
+                    self.rgba[i + c] = ((channel as f32 * a
+                        + self.rgba[i + c] as f32 * destination_alpha * (1.0 - a))
+                        / output_alpha)
+                        .round() as u8;
                 }
-                self.rgba[i + 3] = self.rgba[i + 3].max(value);
+                self.rgba[i + 3] = (output_alpha * 255.0).round() as u8;
             }
         }
     }
@@ -364,13 +379,18 @@ pub fn nombre_origin(
 /// Two pages side by side (either may be missing: blank paper).
 pub fn spread(left: Option<&Image>, right: Option<&Image>) -> Option<Image> {
     let sample = left.or(right)?;
-    let (w, h) = (sample.width, sample.height);
-    let mut out = Image::new(w * 2, h, [255, 255, 255, 255]);
+    let left_width = left.unwrap_or(sample).width;
+    let right_width = right.unwrap_or(sample).width;
+    let height = left
+        .unwrap_or(sample)
+        .height
+        .max(right.unwrap_or(sample).height);
+    let mut out = Image::new(left_width + right_width, height, [255, 255, 255, 255]);
     if let Some(left) = left {
         out.paste(left, 0, 0);
     }
     if let Some(right) = right {
-        out.paste(right, w, 0);
+        out.paste(right, left_width, 0);
     }
     Some(out)
 }
@@ -424,6 +444,36 @@ mod tests {
     }
 
     #[test]
+    fn page_numbers_outside_u32_are_omitted_instead_of_wrapping_or_panicking() {
+        let mut b = book(2, Binding::Right);
+        b.nombre.start = u32::MAX;
+        assert_eq!(b.nombre_of(0), Some(u32::MAX));
+        assert_eq!(b.nombre_of(1), None);
+        b.nombre.start = 0;
+        if usize::BITS > u32::BITS {
+            assert_eq!(b.nombre_of(usize::MAX), None);
+        }
+    }
+
+    #[test]
+    fn loading_a_book_rejects_invalid_page_geometry_without_restricting_valid_dpi() {
+        let mut b = book(1, Binding::Right);
+        for dpi in [0.0, -100.0, 10_001.0, 1e20] {
+            b.page.dpi = dpi;
+            assert!(Book::from_json(&b.to_json()).is_err(), "accepted dpi {dpi}");
+        }
+        for dpi in [25.4, 72.0, 1200.0, 10_000.0] {
+            b.page.dpi = dpi;
+            assert!(Book::from_json(&b.to_json()).is_ok(), "rejected dpi {dpi}");
+        }
+        b.page.trim_mm[0] = 0.0;
+        assert!(Book::from_json(&b.to_json()).is_err());
+        b.page.trim_mm[0] = 100.0;
+        b.page.bleed_mm = -1.0;
+        assert!(Book::from_json(&b.to_json()).is_err());
+    }
+
+    #[test]
     fn export_areas_crop_and_mark() {
         let b = book(1, Binding::Right);
         let g = b.page.geometry();
@@ -452,6 +502,70 @@ mod tests {
         image.rgba[0..4].copy_from_slice(&[30, 30, 30, 255]);
         convert_color(&mut image, ExportColor::Monochrome, 128);
         assert_eq!(&image.rgba[..], &[0, 0, 0, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn page_number_coverage_composites_straight_alpha() {
+        let coverage = Coverage {
+            x0: 0,
+            y0: 0,
+            width: 1,
+            height: 1,
+            data: vec![128],
+        };
+        let mut image = Image::new(1, 1, [255, 0, 0, 128]);
+        image.draw(&coverage, (0, 0), [0, 0, 0]);
+        assert_eq!(image.rgba, vec![85, 0, 0, 192]);
+
+        // Hidden RGB on transparent paper must not tint antialiased text.
+        let mut image = Image::new(1, 1, [255, 0, 0, 0]);
+        image.draw(&coverage, (0, 0), [0, 0, 0]);
+        assert_eq!(image.rgba, vec![0, 0, 0, 128]);
+    }
+
+    #[test]
+    fn page_number_coverage_clips_extreme_offsets() {
+        let mut coverage = Coverage {
+            x0: 0,
+            y0: 0,
+            width: 2,
+            height: 2,
+            data: vec![255; 4],
+        };
+        for offset in [(i64::MAX, 0), (0, i64::MAX), (i64::MIN, 0), (0, i64::MIN)] {
+            let mut image = Image::new(2, 2, [255; 4]);
+            let before = image.clone();
+            image.draw(&coverage, offset, [0; 3]);
+            assert_eq!(image, before);
+        }
+        // A large coverage origin can still translate onto the canvas.
+        coverage.x0 = u32::MAX;
+        coverage.y0 = u32::MAX;
+        let mut image = Image::new(2, 2, [255; 4]);
+        image.draw(
+            &coverage,
+            (-i64::from(u32::MAX), -i64::from(u32::MAX)),
+            [0; 3],
+        );
+        assert_eq!(image.rgba, [0, 0, 0, 255].repeat(4));
+    }
+
+    #[test]
+    fn paste_outside_the_page_leaves_it_unchanged() {
+        let mut image = Image::new(2, 2, [255; 4]);
+        let before = image.clone();
+        image.paste(&Image::new(1, 1, [0, 0, 0, 255]), 10, 0);
+        assert_eq!(image, before);
+    }
+
+    #[test]
+    fn differently_sized_spread_pages_keep_all_pixels() {
+        let left = Image::new(2, 2, [255, 0, 0, 255]);
+        let right = Image::new(3, 3, [0, 0, 255, 255]);
+        let image = spread(Some(&left), Some(&right)).unwrap();
+        assert_eq!((image.width, image.height), (5, 3));
+        assert_eq!(&image.rgba[image.at(4, 2)..][..4], &[0, 0, 255, 255]);
+        assert_eq!(&image.rgba[image.at(0, 2)..][..4], &[255; 4]);
     }
 
     #[test]

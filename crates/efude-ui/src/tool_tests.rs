@@ -6,6 +6,397 @@
 use super::*;
 use efude_canvas::ToneSettings;
 
+#[derive(Default)]
+struct SettingsStorage(std::collections::HashMap<String, String>);
+
+impl eframe::Storage for SettingsStorage {
+    fn get_string(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+
+    fn set_string(&mut self, key: &str, value: String) {
+        self.0.insert(key.into(), value);
+    }
+
+    fn flush(&mut self) {}
+}
+
+fn restore_settings(storage: &SettingsStorage) -> EfudeApp {
+    let mut cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+    cc.storage = Some(storage);
+    EfudeApp::from_creation_context(&cc)
+}
+
+#[test]
+fn settings_restore_the_full_supported_canvas_zoom_range() {
+    let mut app = EfudeApp::default();
+    let mut storage = SettingsStorage::default();
+    for zoom in [0.01, 0.05, 0.1, 1.0, 4.0, 8.0, 64.0] {
+        app.zoom = zoom;
+        eframe::App::save(&mut app, &mut storage);
+        let restored = restore_settings(&storage);
+        assert_eq!(restored.zoom, zoom, "saved canvas zoom {zoom}");
+    }
+}
+
+#[test]
+fn imported_image_thumbnail_ignores_rgb_of_transparent_pixels() {
+    let file = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+    let source = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 0]).unwrap();
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    let (width, height, pixels) = decode_limited_image(file.path(), 1, 1).unwrap();
+    assert_eq!((width, height), (1, 1));
+    assert_eq!(
+        pixels,
+        [255, 0, 0, 128],
+        "transparent blue must not tint visible red"
+    );
+    let (_, _, original) = decode_limited_image(file.path(), 2, 1).unwrap();
+    assert_eq!(
+        original,
+        source.into_raw(),
+        "unscaled import keeps its pixels"
+    );
+    // Exercise the actual reference/guide import limits with a small, thin PNG.
+    for limit in [2048, 4096] {
+        let source = image::RgbaImage::from_fn(limit * 2, 1, |x, _| {
+            if x.is_multiple_of(2) {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 0])
+            }
+        });
+        source
+            .save_with_format(file.path(), image::ImageFormat::Png)
+            .unwrap();
+        let (width, height, pixels) = decode_limited_image(file.path(), limit, limit).unwrap();
+        assert_eq!((width, height), (limit, 1));
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|pixel| pixel == [255, 0, 0, 128])
+        );
+    }
+}
+
+#[test]
+fn imported_image_thumbnail_weights_partial_and_low_alpha() {
+    let file = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+    for (pixels, expected) in [
+        (vec![255, 0, 0, 128, 0, 0, 255, 64], [170, 0, 85, 96]),
+        (vec![7, 39, 200, 1, 255, 0, 0, 0], [7, 39, 200, 1]),
+        (vec![5, 7, 11, 0, 20, 30, 40, 0], [0, 0, 0, 0]),
+    ] {
+        image::RgbaImage::from_raw(2, 1, pixels)
+            .unwrap()
+            .save_with_format(file.path(), image::ImageFormat::Png)
+            .unwrap();
+        let (width, height, pixels) = decode_limited_image(file.path(), 1, 1).unwrap();
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(pixels, expected);
+    }
+}
+
+#[test]
+fn imported_image_thumbnail_keeps_native_16bit_alpha_precision() {
+    let file = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+    let source = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(
+        2,
+        1,
+        vec![65535, 0, 0, 32768, 0, 0, 65535, 32895],
+    )
+    .unwrap();
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    assert_eq!(
+        decode_limited_image(file.path(), 1, 1).unwrap().2,
+        [127, 0, 128, 128]
+    );
+    assert_eq!(
+        decode_limited_image(file.path(), 2, 1).unwrap().2,
+        image::DynamicImage::ImageRgba16(source)
+            .to_rgba8()
+            .into_raw()
+    );
+    let source = image::ImageBuffer::<image::LumaA<u16>, Vec<u16>>::from_raw(
+        2,
+        1,
+        vec![65535, 32768, 0, 32895],
+    )
+    .unwrap();
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    assert_eq!(
+        decode_limited_image(file.path(), 1, 1).unwrap().2,
+        [127, 127, 127, 128]
+    );
+    let source =
+        image::ImageBuffer::<image::LumaA<u8>, Vec<u8>>::from_raw(2, 1, vec![255, 128, 0, 64])
+            .unwrap();
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    assert_eq!(
+        decode_limited_image(file.path(), 1, 1).unwrap().2,
+        [170, 170, 170, 96]
+    );
+    let source = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(
+        2,
+        1,
+        vec![127, 257, 65535, 65535, 384, 512, 32700, 65535],
+    )
+    .unwrap();
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    let expected = image::DynamicImage::ImageRgba16(source)
+        .thumbnail(1, 1)
+        .to_rgba8();
+    assert_eq!(
+        decode_limited_image(file.path(), 1, 1).unwrap().2,
+        expected.into_raw()
+    );
+}
+
+#[test]
+fn imported_image_thumbnail_keeps_opaque_sampling_and_dimensions() {
+    let file = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+    let source = image::RgbaImage::from_fn(7, 3, |x, y| {
+        image::Rgba([
+            (x * 37 + y * 61) as u8,
+            (x * 73 + y * 19) as u8,
+            (x * 11 + y * 29) as u8,
+            255,
+        ])
+    });
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    for (max_width, max_height) in [(4, 4), (2, 1), (1, 5)] {
+        let expected = image::DynamicImage::ImageRgba8(source.clone())
+            .thumbnail(max_width, max_height)
+            .to_rgba8();
+        let (width, height, pixels) =
+            decode_limited_image(file.path(), max_width, max_height).unwrap();
+        assert_eq!((width, height), expected.dimensions());
+        assert_eq!(pixels, expected.into_raw());
+    }
+    let source = image::RgbaImage::from_fn(7, 3, |_, _| image::Rgba([23, 99, 177, 128]));
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    for (max_width, max_height) in [(4, 4), (2, 1), (1, 5)] {
+        let expected = image::DynamicImage::ImageRgba8(source.clone())
+            .thumbnail(max_width, max_height)
+            .to_rgba8();
+        let (width, height, pixels) =
+            decode_limited_image(file.path(), max_width, max_height).unwrap();
+        assert_eq!((width, height), expected.dimensions());
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|pixel| pixel == [23, 99, 177, 128])
+        );
+    }
+}
+
+#[test]
+fn imported_image_thumbnail_matches_integer_thumbnail_sampling() {
+    for (width, height) in [(7, 3), (3, 7), (9, 2), (2, 9), (1, 7), (7, 1), (7, 7)] {
+        let rgba8 =
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(width, height, |x, y| {
+                image::Rgba([
+                    (x * 37 + y * 61) as u8,
+                    (x * 73 + y * 19) as u8,
+                    (x * 11 + y * 29) as u8,
+                    (x * 51 + y * 83) as u8,
+                ])
+            }));
+        let rgba16 =
+            image::DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(width, height, |x, y| {
+                image::Rgba([
+                    (x * 9137 + y * 3979) as u16,
+                    (x * 2113 + y * 7379) as u16,
+                    (x * 10001 + y * 2709) as u16,
+                    (x * 17201 + y * 9913) as u16,
+                ])
+            }));
+        let gray8 =
+            image::DynamicImage::ImageLumaA8(image::ImageBuffer::from_fn(width, height, |x, y| {
+                image::LumaA([(x * 73 + y * 19) as u8, (x * 51 + y * 83) as u8])
+            }));
+        let gray16 = image::DynamicImage::ImageLumaA16(image::ImageBuffer::from_fn(
+            width,
+            height,
+            |x, y| image::LumaA([(x * 9137 + y * 3979) as u16, (x * 17201 + y * 9913) as u16]),
+        ));
+        for source in [rgba8, rgba16, gray8, gray16] {
+            for (max_width, max_height) in [(4, 4), (2, 1), (1, 2)] {
+                let actual = thumbnail_imported_image(&source, max_width, max_height);
+                let reference = image::imageops::thumbnail(
+                    &PremultipliedImport(&source),
+                    actual.width(),
+                    actual.height(),
+                );
+                let expected: Vec<u8> = reference
+                    .pixels()
+                    .flat_map(|pixel| {
+                        let alpha = (pixel[3] as f64 * 255.0 / (65535.0 * 65535.0)).round() as u8;
+                        if alpha == 0 {
+                            [0, 0, 0, 0]
+                        } else {
+                            [
+                                (pixel[0] as f64 * 255.0 / pixel[3] as f64).round() as u8,
+                                (pixel[1] as f64 * 255.0 / pixel[3] as f64).round() as u8,
+                                (pixel[2] as f64 * 255.0 / pixel[3] as f64).round() as u8,
+                                alpha,
+                            ]
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    actual.into_raw(),
+                    expected,
+                    "integer sample mismatch: {width}x{height} into {max_width}x{max_height}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_image_thumbnail_avoids_opaque_16bit_accumulator_overflow() {
+    let file = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+    let source = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_pixel(
+        257,
+        256,
+        image::Rgba([u16::MAX; 4]),
+    );
+    source
+        .save_with_format(file.path(), image::ImageFormat::Png)
+        .unwrap();
+    let (width, height, pixels) = decode_limited_image(file.path(), 1, 1).unwrap();
+    assert_eq!((width, height), (1, 1));
+    assert_eq!(pixels, [255; 4]);
+    let sources = [
+        image::DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(257, 256, |x, y| {
+            image::Rgba([
+                (x * 127 + y * 271) as u16,
+                (x * 37 + y * 193) as u16,
+                (x * 313 + y * 101) as u16,
+                u16::MAX,
+            ])
+        })),
+        image::DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(257, 256, |x, y| {
+            image::Rgb([
+                (x * 127 + y * 271) as u16,
+                (x * 37 + y * 193) as u16,
+                (x * 313 + y * 101) as u16,
+            ])
+        })),
+        image::DynamicImage::ImageLumaA16(image::ImageBuffer::from_fn(257, 256, |x, y| {
+            image::LumaA([(x * 127 + y * 271) as u16, u16::MAX])
+        })),
+        image::DynamicImage::ImageLuma16(image::ImageBuffer::from_fn(257, 256, |x, y| {
+            image::Luma([(x * 127 + y * 271) as u16])
+        })),
+    ];
+    for source in sources {
+        let native = source.to_rgba16();
+        let samples = u64::from(source.width()) * u64::from(source.height());
+        let mut sum = [0u64; 4];
+        for pixel in native.pixels() {
+            for channel in 0..4 {
+                sum[channel] += u64::from(pixel[channel]);
+            }
+        }
+        let expected = sum.map(|value| (((value + samples / 2) / samples + 128) / 257) as u8);
+        source
+            .save_with_format(file.path(), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(decode_limited_image(file.path(), 1, 1).unwrap().2, expected);
+    }
+}
+
+#[test]
+fn imported_image_thumbnail_accumulator_bounds_include_rounding() {
+    assert!(!thumbnail_block_overflows(65_536, 65_535));
+    assert!(thumbnail_block_overflows(65_537, 65_535));
+    assert!(!thumbnail_block_overflows(16_810_048, 255));
+    assert!(thumbnail_block_overflows(16_810_049, 255));
+    assert!(thumbnail_block_overflows(100_000_000, 255));
+    let source = image::DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+        256,
+        256,
+        image::Rgba([u16::MAX; 4]),
+    ));
+    assert!(!thumbnail_accumulator_overflows(&source, 1, 1));
+    let source = image::DynamicImage::ImageRgb16(image::ImageBuffer::from_pixel(
+        257,
+        256,
+        image::Rgb([u16::MAX; 3]),
+    ));
+    assert!(thumbnail_accumulator_overflows(&source, 1, 1));
+    assert!(!thumbnail_accumulator_overflows(&source, 2, 1));
+    let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        257,
+        256,
+        image::Rgba([u8::MAX; 4]),
+    ));
+    assert!(!thumbnail_accumulator_overflows(&source, 1, 1));
+    let ratio = 17.0 / 3.0;
+    assert_eq!(
+        (0..3)
+            .map(|i| thumbnail_axis_range(i, 17, ratio))
+            .collect::<Vec<_>>(),
+        [(0, 6), (6, 12), (12, 17)]
+    );
+}
+
+#[test]
+fn nonfinite_saved_settings_leave_the_canvas_and_tools_usable() {
+    let mut app = EfudeApp::default();
+    let mut storage = SettingsStorage::default();
+    eframe::App::save(&mut app, &mut storage);
+    let mut settings: PersistedSettings = eframe::get_value(&storage, "settings").unwrap();
+    settings.zoom = f32::NAN;
+    settings.view_rotation = f32::NAN;
+    settings.size = f32::NAN;
+    settings.intermediate_mix = f32::NAN;
+    settings.tools_panel_width = f32::NAN;
+    settings.layers_panel_width = f32::NAN;
+    settings.symmetry_center = [f32::NAN, f32::INFINITY];
+    settings.pressure_curve_points = [f32::NAN, 0.2, 0.8, f32::NEG_INFINITY];
+    settings.tone_curve = [0.0, f32::NAN, 0.5, f32::INFINITY, 1.0];
+    eframe::set_value(&mut storage, "settings", &settings);
+    let restored = restore_settings(&storage);
+    assert!(
+        restored.zoom.is_finite(),
+        "saved NaN makes the canvas invisible"
+    );
+    assert!(restored.view_rotation.is_finite());
+    assert!(restored.size.is_finite());
+    assert!(restored.intermediate_mix.is_finite());
+    assert!(restored.tools_panel_width.is_finite());
+    assert!(restored.layers_panel_width.is_finite());
+    assert!(restored.symmetry_center.is_finite());
+    assert!(restored.pressure_curve_points.iter().all(|v| v.is_finite()));
+    assert!(restored.tone_curve.iter().all(|v| v.is_finite()));
+    assert_eq!(restored.pressure_curve_points[1..3], [0.2, 0.8]);
+    let mut h = Harness::new(1200, 900);
+    h.app = restored;
+    h.frames(3);
+    h.click(v(600.0, 450.0));
+    assert!(h.pixel(600, 450)[3] > 0, "the restored pen must paint");
+    h.app.undo();
+    h.frames(1);
+    assert_eq!(h.pixel(600, 450)[3], 0);
+}
+
 const SCREEN: Vec2 = Vec2::new(1280.0, 820.0);
 
 pub(super) struct Harness {
@@ -190,6 +581,75 @@ fn v(x: f32, y: f32) -> Vec2 {
 }
 
 #[test]
+fn imported_large_finite_brush_can_draw_an_undoable_vector_dab() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(16, 16);
+    app.add_vector_layer();
+    app.history = Default::default();
+    let mut brush = efude_brush::defaults().remove(0);
+    brush.size = 3.0e38;
+    let imported = efude_brush::set_from_bytes(&efude_brush::set_bytes(&[brush]).unwrap()).unwrap();
+    // Applying a set while the brush pane is hidden does not pass through
+    // the size slider before the next canvas input.
+    app.replace_brushes(imported);
+    assert_eq!(app.size, 3.0e38);
+    app.history.begin();
+    app.vector_dabs(&[InkPoint::new(8.0, 8.0, 1.0, 0)]);
+    app.finish_vector_stroke();
+    app.history.commit();
+    let layer = app.selected_layer;
+    let pixels = app.doc.layers[layer].pixels.to_dense();
+    assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] > 0));
+    assert_eq!(app.doc.layers[layer].vector.as_ref().unwrap().len(), 1);
+    app.undo();
+    assert!(app.doc.layers[layer].vector.as_ref().unwrap().is_empty());
+    assert!(!app.doc.layers[layer].pixels.has_allocated_tiles());
+    app.redo();
+    assert_eq!(app.doc.layers[layer].pixels.to_dense(), pixels);
+    assert_eq!(app.doc.layers[layer].vector.as_ref().unwrap().len(), 1);
+}
+
+#[test]
+fn imported_large_brush_with_tilt_dynamics_keeps_vector_documents_loadable() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(16, 16);
+    app.add_vector_layer();
+    app.history = Default::default();
+    let mut brush = efude_brush::defaults().remove(0);
+    brush.size = 3.0e38;
+    brush.tilt_size = 1.0;
+    let imported = efude_brush::set_from_bytes(&efude_brush::set_bytes(&[brush]).unwrap()).unwrap();
+    app.replace_brushes(imported);
+    let mut point = InkPoint::new(8.0, 8.0, 1.0, 0);
+    point.tilt = glam::Vec2::new(1.0, 0.0);
+    app.history.begin();
+    app.vector_dabs(&[point]);
+    app.finish_vector_stroke();
+    app.history.commit();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tilted.efude");
+    efude_io::save(&path, &app.doc).expect("the drawn document must save");
+    let restored = efude_io::load(&path).expect("a successfully saved document must reopen");
+    let layer = app.selected_layer;
+    assert_eq!(restored.layers[layer].vector, app.doc.layers[layer].vector);
+    assert_eq!(
+        restored.layers[layer].pixels.to_dense(),
+        app.doc.layers[layer].pixels.to_dense()
+    );
+    assert!(
+        restored.layers[layer]
+            .pixels
+            .to_dense()
+            .chunks_exact(4)
+            .all(|p| p[3] > 0)
+    );
+    app.undo();
+    assert!(app.doc.layers[layer].vector.as_ref().unwrap().is_empty());
+    app.redo();
+    assert_eq!(app.doc.layers[layer].vector, restored.layers[layer].vector);
+}
+
+#[test]
 fn tracing_guide_is_displayed_under_paint_without_entering_artwork() {
     let mut app = EfudeApp::default();
     app.doc = Document::new(4, 4);
@@ -210,6 +670,191 @@ fn tracing_guide_is_displayed_under_paint_without_entering_artwork() {
     assert_eq!(
         &efude_canvas::composite_display(&app.doc, 0)[0..4],
         &[255, 128, 255, 255]
+    );
+}
+
+#[test]
+fn gpu_display_does_not_use_the_tracing_guide_as_a_clipping_base() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(4, 1);
+    app.doc.guide =
+        efude_canvas::GuideImage::fit_to_canvas(4, 1, [255, 0, 255, 255].repeat(4), &app.doc);
+    for (x, alpha) in [0, 128, 255, 128].into_iter().enumerate() {
+        app.doc.layers[0]
+            .pixels
+            .set_pixel(x as u32, 0, [0, 0, 0, alpha]);
+    }
+    let mut clipped = efude_canvas::Layer::new(2, "clipped", 4, 1);
+    clipped.clipping = true;
+    clipped.pixels.fill_shared([255, 0, 0, 255]);
+    app.doc.layers.push(clipped);
+    assert_four_pixel_gpu_display_matches_cpu(&app);
+}
+
+#[test]
+fn gpu_dodge_and_burn_keep_black_and_white_backdrops() {
+    for (blend, source, destination) in [
+        (BlendMode::ColorDodge, [255, 255, 255, 255], [0, 0, 0, 255]),
+        (BlendMode::ColorBurn, [0, 0, 0, 255], [255, 255, 255, 255]),
+    ] {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(4, 1);
+        app.doc.layers[0].pixels.fill_shared(destination);
+        let mut layer = efude_canvas::Layer::new(2, "blend", 4, 1);
+        layer.blend = blend;
+        layer.pixels.fill_shared(source);
+        app.doc.layers.push(layer);
+        for linear in [false, true] {
+            app.doc.layers[1].linear_blend = linear;
+            assert_four_pixel_gpu_display_matches_cpu(&app);
+        }
+    }
+}
+
+#[test]
+fn gpu_blend_modes_match_cpu_with_translucent_pixels() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(4, 1);
+    for (x, pixel) in [
+        [0, 230, 200, 64],
+        [255, 16, 90, 128],
+        [60, 120, 230, 255],
+        [100, 80, 50, 0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        app.doc.layers[0].pixels.set_pixel(x as u32, 0, pixel);
+    }
+    app.doc.layers[0].opacity = 0.7;
+    let mut top = efude_canvas::Layer::new(2, "blend", 4, 1);
+    top.opacity = 0.63;
+    for (x, pixel) in [
+        [255, 0, 140, 32],
+        [0, 255, 190, 128],
+        [200, 40, 0, 230],
+        [30, 70, 210, 0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        top.pixels.set_pixel(x as u32, 0, pixel);
+    }
+    app.doc.layers.push(top);
+    for blend in [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::ColorDodge,
+        BlendMode::ColorBurn,
+        BlendMode::HardLight,
+        BlendMode::SoftLight,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Add,
+        BlendMode::Subtract,
+    ] {
+        app.doc.layers[1].blend = blend;
+        for linear in [false, true] {
+            app.doc.layers[1].linear_blend = linear;
+            eprintln!("blend={blend:?}, linear={linear}");
+            assert_four_pixel_gpu_display_matches_cpu(&app);
+        }
+    }
+}
+
+fn assert_four_pixel_gpu_display_matches_cpu(app: &EfudeApp) {
+    let (_, _, layers) = app.prepare_gpu_composite_tile(0, 0).unwrap();
+    let expected = efude_canvas::composite_display(&app.doc, 0);
+    let instance = wgpu::Instance::default();
+    let Some(adapter) =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+    else {
+        eprintln!("no GPU adapter; skipping display comparison");
+        return;
+    };
+    eprintln!("GPU display comparison: {}", adapter.get_info().name);
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            ..Default::default()
+        },
+        None,
+    ))
+    .unwrap();
+    let pipeline = efude_gpu::GpuDabPipeline::new(&device, &queue).unwrap();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 4,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    pipeline
+        .composite_tile_into(
+            &layers,
+            4,
+            1,
+            &texture.create_view(&Default::default()),
+            [0, 0],
+            0,
+        )
+        .unwrap();
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 256,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width: 4,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap()
+        });
+    device.poll(wgpu::Maintain::Wait);
+    receiver.recv().unwrap().unwrap();
+    let actual = buffer.slice(..).get_mapped_range();
+    assert!(
+        actual[..16]
+            .iter()
+            .zip(&expected)
+            .all(|(a, b)| a.abs_diff(*b) <= 1),
+        "GPU={:?}, CPU={expected:?}",
+        &actual[..16]
     );
 }
 
@@ -2480,4 +3125,529 @@ fn control_points_of_vector_lines_can_be_dragged() {
             .is_empty()
     );
     assert_eq!(h.pixel(200, 150)[3], 0);
+}
+
+fn check_low_zoom_wheel_keeps_a_held_pointer_stationary(initial_zoom: f32) {
+    let mut h = Harness::new(400, 300);
+    h.app.zoom = initial_zoom;
+    h.app.brushes[h.app.selected_brush].settle = false;
+    h.frames(3);
+    let target = v(100.0, 80.0);
+    let pointer = h.screen(target);
+    h.move_to(pointer);
+    h.button(true, egui::PointerButton::Primary);
+    let first = h.app.active.last().expect("stroke started").position;
+    let first = v(first.x, first.y);
+    let samples = h.app.active.len();
+    let mut worst_drift = 0.0_f32;
+    let mut worst_point = first;
+    for frame in 0..26 {
+        let events = if frame < 6 {
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, 60.0),
+                modifiers: egui::Modifiers::NONE,
+            }]
+        } else {
+            Vec::new()
+        };
+        h.frame_with(events);
+        let (rect, scale) = h.app.canvas_screen.unwrap();
+        let point = h.app.document_position_unsnapped(pointer, rect, scale);
+        let drift = (point - first).length();
+        if drift > worst_drift {
+            worst_drift = drift;
+            worst_point = point;
+        }
+    }
+    assert!(
+        worst_drift < 0.1,
+        "zoom {initial_zoom}: stationary pointer moved from {first:?} to {worst_point:?} ({worst_drift} document pixels), stroke samples {samples} -> {}",
+        h.app.active.len()
+    );
+    assert_eq!(h.app.active.len(), samples, "wheel injected stroke samples");
+    h.button(false, egui::PointerButton::Primary);
+    h.frames(2);
+    let painted = h.app.doc.layers[0].pixels.to_dense();
+    let mut control = Harness::new(400, 300);
+    control.app.zoom = initial_zoom;
+    control.app.brushes[control.app.selected_brush].settle = false;
+    control.frames(3);
+    control.click(target);
+    assert!(
+        painted == control.app.doc.layers[0].pixels.to_dense(),
+        "stationary wheel stroke must paint the same dab as a click"
+    );
+    h.app.undo();
+    assert!(
+        h.app.doc.layers[0]
+            .pixels
+            .to_dense()
+            .chunks_exact(4)
+            .all(|p| p[3] == 0),
+        "the wheel stroke must remain a single Undo step"
+    );
+    h.app.redo();
+    assert!(painted == h.app.doc.layers[0].pixels.to_dense());
+}
+
+#[test]
+fn wheel_at_one_percent_keeps_a_held_pointer_stationary() {
+    check_low_zoom_wheel_keeps_a_held_pointer_stationary(0.01);
+}
+
+#[test]
+fn wheel_at_five_percent_keeps_a_held_pointer_stationary() {
+    check_low_zoom_wheel_keeps_a_held_pointer_stationary(0.05);
+}
+
+#[test]
+fn wheel_at_ten_percent_keeps_a_held_pointer_stationary() {
+    check_low_zoom_wheel_keeps_a_held_pointer_stationary(0.1);
+}
+
+#[test]
+fn a_held_stroke_can_continue_after_low_zoom_wheel() {
+    let mut h = Harness::new(400, 300);
+    h.app.zoom = 0.05;
+    h.app.brushes[h.app.selected_brush].settle = false;
+    h.frames(3);
+    let start = v(100.0, 80.0);
+    h.move_to(h.screen(start));
+    h.button(true, egui::PointerButton::Primary);
+    for _ in 0..6 {
+        h.frame_with(vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, 60.0),
+            modifiers: egui::Modifiers::NONE,
+        }]);
+    }
+    h.frames(20);
+    assert_eq!(h.app.active.len(), 1);
+    let end = v(140.0, 100.0);
+    h.move_to(h.screen(end));
+    let last = h.app.active.last().expect("stroke continues").position;
+    assert!((v(last.x, last.y) - end).length() < 0.1);
+    assert!(
+        h.app.active.len() > 1,
+        "wheel must not finish the held stroke"
+    );
+    h.button(false, egui::PointerButton::Primary);
+    h.frames(2);
+    assert!(
+        h.pixel(120, 90)[3] > 0,
+        "the continued line was not painted"
+    );
+    let painted = h.app.doc.layers[0].pixels.to_dense();
+    h.app.undo();
+    assert!(
+        h.app.doc.layers[0]
+            .pixels
+            .to_dense()
+            .chunks_exact(4)
+            .all(|p| p[3] == 0)
+    );
+    h.app.redo();
+    assert!(painted == h.app.doc.layers[0].pixels.to_dense());
+}
+
+fn masked_move_mask_values(doc: &Document) -> Vec<u8> {
+    let mask = doc.layers[0].mask.as_ref().unwrap();
+    (0..doc.height)
+        .flat_map(|y| (0..doc.width).map(move |x| mask.pixel_or_tile_default(x, y, [255; 4])[0]))
+        .collect()
+}
+
+fn masked_move_roundtrip(doc: &Document) -> Document {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("masked-move.efude");
+    efude_io::save(&path, doc).unwrap();
+    let reopened = efude_io::load(&path).unwrap();
+    assert_eq!(
+        reopened.layers[0].pixels.to_dense(),
+        doc.layers[0].pixels.to_dense()
+    );
+    assert_eq!(
+        masked_move_mask_values(&reopened),
+        masked_move_mask_values(doc)
+    );
+    assert_eq!(
+        efude_canvas::composite_transparent(&reopened),
+        efude_canvas::composite_transparent(doc)
+    );
+    reopened
+}
+
+#[test]
+fn masked_move_api_does_not_reveal_hidden_source() {
+    let mut doc = Document::new(2, 1);
+    doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+    let mut mask = efude_canvas::TilePixels::new(2, 1);
+    mask.ensure_tile_filled(0, 0, [255; 4]);
+    mask.set_pixel(0, 0, [0; 4]);
+    doc.layers[0].mask = Some(mask);
+    doc = masked_move_roundtrip(&doc);
+    let before = efude_canvas::composite_transparent(&doc);
+    assert!(before.chunks_exact(4).all(|pixel| pixel[3] == 0));
+    let mut selection = Selection {
+        mask: vec![128, 0],
+        active: true,
+    };
+    let mut history = History::default();
+    history.begin();
+    history.record_all_layer_tiles(&doc.layers[0], 2, 1);
+    history.record_all_mask_tiles(&doc.layers[0], 2, 1);
+    efude_canvas::translate_selection(&mut doc.layers[0], &mut selection, 2, 1, 1, 0);
+    history.commit();
+    let moved_pixels = doc.layers[0].pixels.to_dense();
+    let moved_mask = masked_move_mask_values(&doc);
+    let after = efude_canvas::composite_transparent(&doc);
+    masked_move_roundtrip(&doc);
+    history.undo(&mut doc.layers[0]);
+    assert_eq!(efude_canvas::composite_transparent(&doc), before);
+    assert_eq!(masked_move_mask_values(&doc), vec![0, 255]);
+    history.redo(&mut doc.layers[0]);
+    assert_eq!(doc.layers[0].pixels.to_dense(), moved_pixels);
+    assert_eq!(masked_move_mask_values(&doc), moved_mask);
+    assert!(
+        after.chunks_exact(4).all(|pixel| pixel[3] == 0),
+        "Move revealed masked pixels"
+    );
+}
+
+#[test]
+fn masked_move_masked_source_keeps_unselected_destination() {
+    let mut doc = Document::new(2, 1);
+    doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+    doc.layers[0].pixels.set_pixel(1, 0, [0, 0, 255, 255]);
+    let mut mask = efude_canvas::TilePixels::new(2, 1);
+    mask.ensure_tile_filled(0, 0, [255; 4]);
+    mask.set_pixel(0, 0, [0; 4]);
+    doc.layers[0].mask = Some(mask);
+    let before = efude_canvas::composite_transparent(&doc);
+    let mut selection = Selection {
+        mask: vec![255, 0],
+        active: true,
+    };
+    efude_canvas::translate_selection(&mut doc.layers[0], &mut selection, 2, 1, 1, 0);
+    let after = efude_canvas::composite_transparent(&doc);
+    assert_eq!(
+        &after[4..8],
+        &before[4..8],
+        "Move hid an unselected destination pixel"
+    );
+}
+
+#[test]
+fn masked_move_white_mask_and_hard_black_selection_controls() {
+    for coverage in [1, 64, 128, 254, 255] {
+        let mut plain = Document::new(2, 1);
+        plain.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 200]);
+        plain.layers[0].pixels.set_pixel(1, 0, [0, 0, 255, 150]);
+        let mut masked = plain.clone();
+        masked.layers[0].mask = Some(efude_canvas::TilePixels::new(2, 1));
+        let mut selection = Selection {
+            mask: vec![coverage, 0],
+            active: true,
+        };
+        let mut plain_selection = Selection {
+            mask: selection.mask.clone(),
+            active: selection.active,
+        };
+        efude_canvas::translate_selection(&mut plain.layers[0], &mut plain_selection, 2, 1, 1, 0);
+        efude_canvas::translate_selection(&mut masked.layers[0], &mut selection, 2, 1, 1, 0);
+        assert_eq!(
+            masked.layers[0].pixels.to_dense(),
+            plain.layers[0].pixels.to_dense()
+        );
+        assert_eq!(
+            efude_canvas::composite_transparent(&masked),
+            efude_canvas::composite_transparent(&plain)
+        );
+        assert!(
+            !masked.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .has_allocated_tiles()
+        );
+        masked_move_roundtrip(&masked);
+    }
+    let mut hidden = Document::new(2, 1);
+    hidden.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+    let mut mask = efude_canvas::TilePixels::new(2, 1);
+    mask.ensure_tile_filled(0, 0, [0; 4]);
+    hidden.layers[0].mask = Some(mask);
+    let mut selection = Selection {
+        mask: vec![255, 0],
+        active: true,
+    };
+    efude_canvas::translate_selection(&mut hidden.layers[0], &mut selection, 2, 1, 1, 0);
+    assert!(
+        efude_canvas::composite_transparent(&hidden)
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 0)
+    );
+    assert_eq!(masked_move_mask_values(&hidden), vec![255, 0]);
+    masked_move_roundtrip(&hidden);
+}
+
+#[test]
+fn masked_move_real_feather_and_move_do_not_reveal_hidden_pixels() {
+    for layer_coverage in [0, 128] {
+        let mut h = Harness::new(16, 16);
+        h.app.language_english = true;
+        h.app.zoom = 8.0;
+        h.app.workspace = egui_dock::DockState::new(vec![layout::Pane::Canvas]);
+        h.app.workspace.main_surface_mut().split_right(
+            egui_dock::NodeIndex::root(),
+            0.6,
+            vec![layout::Pane::Tool],
+        );
+        h.fill_rect(0, 0, 16, 16, [255, 0, 0, 255]);
+        let mut mask = efude_canvas::TilePixels::new(16, 16);
+        mask.ensure_tile_filled(0, 0, [layer_coverage; 4]);
+        h.app.doc.layers[0].mask = Some(mask);
+        h.app.canvas_texture_dirty = true;
+        h.use_tool(Tool::RectangleSelect);
+        h.drag(&[v(4.0, 4.0), v(6.0, 6.0)]);
+        assert_eq!(h.app.selection.mask[4 * 16 + 4], 255);
+        h.app.selection_feather_radius = 1;
+        h.frames(2);
+        h.click_label("Feather Selection");
+        let selected = h.app.selection.mask.clone();
+        let coverage = selected[4 * 16 + 4];
+        assert!(coverage > 0 && coverage < 255);
+        assert!(
+            efude_canvas::composite_transparent(&h.app.doc)
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == layer_coverage)
+        );
+        let before = masked_move_roundtrip(&h.app.doc);
+        let mut expected = before.clone();
+        let mut expected_selection = Selection {
+            mask: h.app.selection.mask.clone(),
+            active: h.app.selection.active,
+        };
+        efude_canvas::translate_selection(
+            &mut expected.layers[0],
+            &mut expected_selection,
+            16,
+            16,
+            4,
+            0,
+        );
+        h.use_tool(Tool::Move);
+        h.drag(&[v(5.0, 5.0), v(9.0, 5.0)]);
+        assert!(h.app.move_origin.is_none());
+        assert!(!h.app.history.is_active());
+        assert_eq!(
+            h.app.doc.layers[0].pixels.to_dense(),
+            expected.layers[0].pixels.to_dense()
+        );
+        assert_eq!(
+            masked_move_mask_values(&h.app.doc),
+            masked_move_mask_values(&expected)
+        );
+        assert_eq!(h.app.selection.mask, expected_selection.mask);
+        let rendered = efude_canvas::composite_transparent(&h.app.doc);
+        let max_alpha = rendered
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .max()
+            .unwrap();
+        let remaining_alpha = ((255 - u16::from(coverage)) * u16::from(layer_coverage) + 127) / 255;
+        assert_eq!(rendered[(4 * 16 + 4) * 4 + 3], remaining_alpha as u8);
+        let moved_alpha = f32::from(coverage) / 255.0 * f32::from(layer_coverage) / 255.0;
+        let base_alpha = f32::from(layer_coverage) / 255.0;
+        let expected_destination_alpha =
+            ((moved_alpha + base_alpha * (1.0 - moved_alpha)) * 255.0).round() as i32;
+        assert!(
+            (i32::from(rendered[(4 * 16 + 8) * 4 + 3]) - expected_destination_alpha).abs() <= 1
+        );
+        let moved = masked_move_roundtrip(&h.app.doc);
+        h.app.undo();
+        assert_eq!(
+            h.app.doc.layers[0].pixels.to_dense(),
+            before.layers[0].pixels.to_dense()
+        );
+        assert_eq!(
+            masked_move_mask_values(&h.app.doc),
+            masked_move_mask_values(&before)
+        );
+        assert_eq!(h.app.selection.mask, selected);
+        assert!(
+            efude_canvas::composite_transparent(&h.app.doc)
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == layer_coverage)
+        );
+        h.app.redo();
+        assert_eq!(
+            h.app.doc.layers[0].pixels.to_dense(),
+            moved.layers[0].pixels.to_dense()
+        );
+        assert_eq!(
+            masked_move_mask_values(&h.app.doc),
+            masked_move_mask_values(&moved)
+        );
+        assert_eq!(h.app.selection.mask, expected_selection.mask);
+        if layer_coverage == 0 {
+            assert_eq!(
+                max_alpha, 0,
+                "UI Move revealed pixels hidden by the layer mask"
+            );
+        }
+    }
+}
+
+#[test]
+fn masked_transform_real_feather_apply_does_not_reveal_hidden_pixels() {
+    let mut h = Harness::new(16, 16);
+    h.app.language_english = true;
+    h.app.zoom = 8.0;
+    h.app.workspace = egui_dock::DockState::new(vec![layout::Pane::Canvas]);
+    h.app.workspace.main_surface_mut().split_right(
+        egui_dock::NodeIndex::root(),
+        0.6,
+        vec![layout::Pane::Tool],
+    );
+    h.fill_rect(0, 0, 16, 16, [255, 0, 0, 255]);
+    let mut mask = efude_canvas::TilePixels::new(16, 16);
+    mask.ensure_tile_filled(0, 0, [0; 4]);
+    h.app.doc.layers[0].mask = Some(mask);
+    h.app.canvas_texture_dirty = true;
+    h.use_tool(Tool::RectangleSelect);
+    h.drag(&[v(4.0, 4.0), v(6.0, 6.0)]);
+    h.app.selection_feather_radius = 1;
+    h.frames(2);
+    h.click_label("Feather Selection");
+    let selected = h.app.selection.mask.clone();
+    assert_eq!(selected[4 * 16 + 4], 204);
+    let before = masked_move_roundtrip(&h.app.doc);
+    assert!(
+        efude_canvas::composite_transparent(&before)
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 0)
+    );
+    let mut expected = before.clone();
+    let mut expected_selection = Selection {
+        mask: selected.clone(),
+        active: true,
+    };
+    let mut expected_history = History::default();
+    expected_history.begin();
+    efude_canvas::transform_selection(
+        &mut expected.layers[0],
+        &mut expected_selection,
+        16,
+        16,
+        3.0,
+        1.0,
+        0.0,
+        &mut expected_history,
+    );
+    expected_history.commit();
+    h.use_tool(Tool::Move);
+    h.app.transform_scale_x = 3.0;
+    h.app.transform_scale_y = 1.0;
+    h.app.transform_angle = 0.0;
+    h.frames(2);
+    if h.label_rect("Apply Transform").is_none() {
+        h.click_label("Transform");
+    }
+    h.click_label("Apply Transform");
+    assert!(!h.app.history.is_active());
+    assert_eq!(
+        h.app.doc.layers[0].pixels.to_dense(),
+        expected.layers[0].pixels.to_dense()
+    );
+    assert_eq!(
+        masked_move_mask_values(&h.app.doc),
+        masked_move_mask_values(&expected)
+    );
+    assert_eq!(h.app.selection.mask, expected_selection.mask);
+    let after = efude_canvas::composite_transparent(&h.app.doc);
+    let max_alpha = after.chunks_exact(4).map(|pixel| pixel[3]).max().unwrap();
+    let transformed = masked_move_roundtrip(&h.app.doc);
+    h.app.undo();
+    assert_eq!(
+        h.app.doc.layers[0].pixels.to_dense(),
+        before.layers[0].pixels.to_dense()
+    );
+    assert_eq!(
+        masked_move_mask_values(&h.app.doc),
+        masked_move_mask_values(&before)
+    );
+    assert_eq!(h.app.selection.mask, selected);
+    assert!(
+        efude_canvas::composite_transparent(&h.app.doc)
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 0)
+    );
+    h.app.redo();
+    assert_eq!(
+        h.app.doc.layers[0].pixels.to_dense(),
+        transformed.layers[0].pixels.to_dense()
+    );
+    assert_eq!(
+        masked_move_mask_values(&h.app.doc),
+        masked_move_mask_values(&transformed)
+    );
+    assert_eq!(h.app.selection.mask, expected_selection.mask);
+    assert_eq!(
+        max_alpha, 0,
+        "Transform revealed pixels hidden by the layer mask"
+    );
+}
+
+#[test]
+fn masked_mesh_apply_preserves_visible_pixels_native_file_and_one_undo() {
+    let mut h = Harness::new(4, 1);
+    h.app.doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+    h.app.doc.layers[0].pixels.set_pixel(1, 0, [0, 0, 255, 255]);
+    let mut mask = efude_canvas::TilePixels::new(4, 1);
+    mask.ensure_tile_filled(0, 0, [255; 4]);
+    mask.set_pixel(0, 0, [0; 4]);
+    h.app.doc.layers[0].mask = Some(mask);
+    h.app.doc = masked_move_roundtrip(&h.app.doc);
+    h.app.selection = Selection {
+        mask: vec![128, 0, 0, 0],
+        active: true,
+    };
+    let before = h.app.doc.clone();
+    let selected = h.app.selection.mask.clone();
+    h.app.mesh_offsets = [[1.0, 0.0]; 16];
+    // This is the command used by the tool panel's Apply Mesh Transform button.
+    h.app.apply_mesh_warp();
+    assert!(!h.app.history.is_active());
+    assert_eq!(h.app.mesh_offsets, [[0.0; 2]; 16]);
+    assert_eq!(h.app.selection.mask, [0, 128, 0, 0]);
+    let warped = masked_move_roundtrip(&h.app.doc);
+    h.app.undo();
+    assert_eq!(
+        h.app.doc.layers[0].pixels.to_dense(),
+        before.layers[0].pixels.to_dense()
+    );
+    assert_eq!(
+        masked_move_mask_values(&h.app.doc),
+        masked_move_mask_values(&before)
+    );
+    assert_eq!(h.app.selection.mask, selected);
+    h.app.redo();
+    assert_eq!(
+        h.app.doc.layers[0].pixels.to_dense(),
+        warped.layers[0].pixels.to_dense()
+    );
+    assert_eq!(
+        masked_move_mask_values(&h.app.doc),
+        masked_move_mask_values(&warped)
+    );
+    assert_eq!(h.app.selection.mask, [0, 128, 0, 0]);
+    let visible = efude_canvas::composite_transparent(&warped);
+    assert_eq!(&visible[0..4], &[0, 0, 0, 0], "hidden source stays hidden");
+    assert_eq!(
+        &visible[4..8],
+        &[0, 0, 255, 255],
+        "hidden red must not hide or tint blue"
+    );
 }

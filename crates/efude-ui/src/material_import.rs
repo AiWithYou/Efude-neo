@@ -251,7 +251,25 @@ impl EfudeApp {
             applied_tool_brushes: [None; 4],
             applied_size: 0.0,
         };
+        // Importing additional presets must retain the brushes still present,
+        // including each tool's choice and the current working size.
+        let remap = |index: usize| {
+            self.brushes.get(index).and_then(|brush| {
+                if plan.brushes.get(index) == Some(brush) {
+                    Some(index)
+                } else {
+                    plan.brushes.iter().position(|candidate| candidate == brush)
+                }
+            })
+        };
+        let selected = remap(self.selected_brush);
+        let tool_brushes = self.tool_brushes.map(|index| index.and_then(remap));
         self.replace_brushes(plan.brushes);
+        if let Some(selected) = selected {
+            self.selected_brush = selected;
+            self.size = undo.size;
+        }
+        self.tool_brushes = tool_brushes;
         undo.applied = self.brushes.clone();
         undo.applied_selected = self.selected_brush;
         undo.applied_tool_brushes = self.tool_brushes;
@@ -486,5 +504,40 @@ mod tests {
         app.undo_brush_import();
         assert_eq!(app.brushes, before);
         assert_eq!(app.size, 123.0);
+    }
+
+    #[test]
+    fn adding_brushes_preserves_the_current_brush_size_and_tool_assignments() {
+        let mut app = EfudeApp::default();
+        let pen = app
+            .brushes
+            .iter()
+            .enumerate()
+            .filter(|(_, brush)| crate::brush_fits_tool(brush.kind, Tool::Brush))
+            .nth(1)
+            .map(|(index, _)| index)
+            .unwrap();
+        app.select_brush_preset(pen);
+        app.size = 123.0;
+        let assignments = app.tool_brushes;
+        let mut added = app.brushes[0].clone();
+        added.name = "Imported".into();
+        added.size += 3.0;
+        let plan = merge(
+            &app.brushes,
+            &[added],
+            &[true],
+            Mode::Append,
+            Collision::Rename,
+        )
+        .unwrap();
+        app.apply_brush_import(plan);
+        assert_eq!(app.selected_brush, pen);
+        assert_eq!(app.size, 123.0);
+        assert_eq!(app.tool_brushes, assignments);
+        app.undo_brush_import();
+        assert_eq!(app.selected_brush, pen);
+        assert_eq!(app.size, 123.0);
+        assert_eq!(app.tool_brushes, assignments);
     }
 }

@@ -95,8 +95,8 @@ impl VectorStroke {
             [
                 r[0].floor() as i32,
                 r[1].floor() as i32,
-                r[2].ceil() as i32 + 1,
-                r[3].ceil() as i32 + 1,
+                (r[2].ceil() as i32).saturating_add(1),
+                (r[3].ceil() as i32).saturating_add(1),
             ]
         })
     }
@@ -201,8 +201,12 @@ pub fn render_region(
                     let r = a.width.max(b.width) * 0.5 + 1.5;
                     let x0 = ((a.x.min(b.x) - r).floor() as i32).max(area[0]);
                     let y0 = ((a.y.min(b.y) - r).floor() as i32).max(area[1]);
-                    let x1 = ((a.x.max(b.x) + r).ceil() as i32 + 1).min(area[2]);
-                    let y1 = ((a.y.max(b.y) + r).ceil() as i32 + 1).min(area[3]);
+                    let x1 = ((a.x.max(b.x) + r).ceil() as i32)
+                        .saturating_add(1)
+                        .min(area[2]);
+                    let y1 = ((a.y.max(b.y) + r).ceil() as i32)
+                        .saturating_add(1)
+                        .min(area[3]);
                     for y in y0..y1 {
                         let row = (y - area[1]) as usize * aw;
                         for x in x0..x1 {
@@ -277,10 +281,10 @@ pub fn erase_circle(
 ) -> Option<PixelRect> {
     let radius = radius.max(0.5);
     let reach = [
-        (center.0 - radius).floor() as i32 - 1,
-        (center.1 - radius).floor() as i32 - 1,
-        (center.0 + radius).ceil() as i32 + 2,
-        (center.1 + radius).ceil() as i32 + 2,
+        ((center.0 - radius).floor() as i32).saturating_sub(1),
+        ((center.1 - radius).floor() as i32).saturating_sub(1),
+        ((center.0 + radius).ceil() as i32).saturating_add(2),
+        ((center.1 + radius).ceil() as i32).saturating_add(2),
     ];
     let mut dirty = None;
     let mut result = Vec::with_capacity(strokes.len());
@@ -320,7 +324,7 @@ pub fn erase_circle(
             continue;
         }
         let pieces = cut_circle(&stroke.points, center, radius);
-        if pieces.len() == 1 && pieces[0].len() == stroke.points.len() {
+        if pieces.len() == 1 && pieces[0] == stroke.points {
             result.push(stroke);
             continue;
         }
@@ -959,6 +963,37 @@ mod tests {
     }
 
     #[test]
+    fn large_finite_vector_geometry_clips_without_integer_overflow() {
+        let mut stroke = VectorStroke {
+            points: vec![VectorPoint {
+                x: f32::MAX / 2.0,
+                y: 10.0,
+                width: 2.0,
+            }],
+            color: [20, 40, 200, 255],
+            hardness: 1.0,
+            anchors: Vec::new(),
+        };
+        assert_eq!(stroke.bounds().unwrap()[2], i32::MAX);
+        let mut layer = Layer::new(1, "large geometry", 16, 16);
+        layer.vector = Some(vec![stroke.clone()]);
+        render_all(&mut layer, 16, 16, None);
+        assert!(!layer.pixels.has_allocated_tiles());
+
+        stroke.points[0].x = 8.0;
+        stroke.points[0].width = f32::MAX / 2.0;
+        layer.vector = Some(vec![stroke]);
+        render_all(&mut layer, 16, 16, None);
+        assert_eq!(layer.pixels.pixel(8, 8)[3], 255);
+
+        let mut lines = vec![line((2.0, 8.0), (14.0, 8.0), 2.0)];
+        for coordinate in [f32::MIN / 2.0, f32::MAX / 2.0] {
+            assert!(erase_circle(&mut lines, (coordinate, coordinate), 5.0, false).is_none());
+        }
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
     fn drawing_a_region_matches_drawing_everything() {
         let strokes = vec![
             line((10.0, 20.0), (280.0, 270.0), 9.0),
@@ -995,6 +1030,46 @@ mod tests {
         render_all(&mut layer, 300, 300, None);
         assert_eq!(layer.pixels.pixel(100, 50)[3], 0);
         assert_eq!(layer.pixels.pixel(200, 50)[3], 255);
+    }
+
+    #[test]
+    fn erasing_a_line_end_updates_points_even_when_their_count_is_unchanged() {
+        let original = VectorStroke {
+            points: vec![
+                VectorPoint {
+                    x: 10.0,
+                    y: 50.0,
+                    width: 2.0,
+                },
+                VectorPoint {
+                    x: 30.0,
+                    y: 50.0,
+                    width: 2.0,
+                },
+            ],
+            color: [20, 40, 200, 255],
+            hardness: 1.0,
+            anchors: Vec::new(),
+        };
+        for center in [(10.0, 50.0), (30.0, 50.0)] {
+            let mut strokes = vec![original.clone()];
+            assert!(erase_circle(&mut strokes, center, 5.0, false).is_some());
+            assert_eq!(strokes.len(), 1);
+            let first = strokes[0].points.first().unwrap().x;
+            let last = strokes[0].points.last().unwrap().x;
+            if center.0 == 10.0 {
+                assert!((first - 15.0).abs() < 0.01);
+                assert!((last - 30.0).abs() < 0.01);
+            } else {
+                assert!((first - 10.0).abs() < 0.01);
+                assert!((last - 25.0).abs() < 0.01);
+            }
+            let layer = vector_layer(strokes);
+            assert_eq!(layer.pixels.pixel(center.0 as u32, 50)[3], 0);
+        }
+        let mut missed = vec![original.clone()];
+        assert!(erase_circle(&mut missed, (20.0, 70.0), 5.0, false).is_none());
+        assert_eq!(missed, [original]);
     }
 
     #[test]

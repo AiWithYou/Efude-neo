@@ -34,6 +34,32 @@ pub struct PageSpec {
 }
 
 impl PageSpec {
+    /// Checks values accepted by page setup and imported documents. The DPI
+    /// ceiling matches the document reader, rather than the narrower UI range.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.dpi.is_finite() || self.dpi <= 0.0 || self.dpi > 10_000.0 {
+            return Err("page DPI must be finite and in (0, 10000]");
+        }
+        if self
+            .trim_mm
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err("page trim dimensions must be finite and positive");
+        }
+        if !self.bleed_mm.is_finite() || self.bleed_mm < 0.0 {
+            return Err("page bleed must be finite and nonnegative");
+        }
+        if self
+            .inner_margins_mm
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err("page margins must be finite and nonnegative");
+        }
+        Ok(())
+    }
+
     /// Built-in presets: (Japanese name, English name, spec).
     pub fn presets() -> Vec<(&'static str, &'static str, PageSpec)> {
         let page = |trim: [f32; 2], bleed: f32, frame: [f32; 2], dpi: f32| {
@@ -86,12 +112,9 @@ impl PageSpec {
         let trim_min = Vec2::splat(bleed);
         let trim_max = trim_min + trim_size;
         let [top, bottom, binding, outer] = self.inner_margins_mm.map(|mm| self.px(mm));
-        // On a right-bound book the binding is on the right of left-hand
-        // pages and on the left of right-hand pages; mirrored for left-bound.
-        let binding_on_left = match self.binding {
-            Binding::Right => self.right_page,
-            Binding::Left => !self.right_page,
-        };
+        // The binding is at the centre of the spread regardless of reading
+        // order: on the left of right-hand pages and vice versa.
+        let binding_on_left = self.right_page;
         let (left, right) = if binding_on_left {
             (binding, outer)
         } else {
@@ -189,14 +212,18 @@ mod tests {
     fn binding_side_moves_the_wider_margin() {
         let mut spec = PageSpec::presets()[1].2.clone();
         spec.inner_margins_mm = [10.0, 10.0, 20.0, 5.0];
-        let left_page = spec.geometry();
-        spec.right_page = true;
-        let right_page = spec.geometry();
         let margin_left = |g: &PageGeometry| g.inner[0].x - g.trim[0].x;
         let margin_right = |g: &PageGeometry| g.trim[1].x - g.inner[1].x;
-        // Right-bound: left-hand page has the binding (wide margin) on the right.
-        assert!(margin_right(&left_page) > margin_left(&left_page));
-        assert!(margin_left(&right_page) > margin_right(&right_page));
+        for binding in [Binding::Right, Binding::Left] {
+            spec.binding = binding;
+            spec.right_page = false;
+            let left_page = spec.geometry();
+            spec.right_page = true;
+            let right_page = spec.geometry();
+            // The binding is at the centre of the spread for either reading order.
+            assert!(margin_right(&left_page) > margin_left(&left_page));
+            assert!(margin_left(&right_page) > margin_right(&right_page));
+        }
     }
 
     #[test]

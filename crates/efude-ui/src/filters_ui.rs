@@ -12,8 +12,12 @@ mod preview_regression_tests {
     use super::*;
 
     fn after_pixels(app: &mut EfudeApp, ctx: &egui::Context) -> Vec<Color32> {
+        after_pixels_for(app, ctx, FilterKind::Mosaic)
+    }
+
+    fn after_pixels_for(app: &mut EfudeApp, ctx: &egui::Context, kind: FilterKind) -> Vec<Color32> {
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_filter_preview(ctx, FilterKind::Mosaic);
+            app.update_filter_preview(ctx, kind);
         });
         let id = app
             .filter_dialog
@@ -34,6 +38,38 @@ mod preview_regression_tests {
             panic!("RGBA preview expected")
         };
         image.pixels.clone()
+    }
+
+    #[test]
+    fn large_gaussian_preview_matches_the_applied_filter() {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(1000, 1);
+        app.doc.layers[0].pixels.fill_shared([0, 0, 0, 255]);
+        for x in 190..211 {
+            app.doc.layers[0].pixels.set_pixel(x, 0, [255; 4]);
+        }
+        app.navigator_center = egui::vec2(500.0, 0.5);
+        app.filter_settings.blur_kind = BlurKind::Gaussian;
+        app.filter_settings.blur_amount = 200.0;
+        app.filter_dialog = Some(FilterDialog::open(FilterKind::Blur));
+        let mut applied = app.doc.layers[0].clone();
+        run_filter(
+            &mut applied,
+            app.doc.width,
+            app.doc.height,
+            app.filter_operation(FilterKind::Blur),
+            (0, 0),
+        );
+        let preview = after_pixels_for(&mut app, &egui::Context::default(), FilterKind::Blur);
+        for (offset, actual) in preview.iter().enumerate() {
+            let expected = applied.pixels.pixel(390 + offset as u32, 0);
+            assert_eq!(
+                *actual,
+                Color32::from_rgba_unmultiplied(expected[0], expected[1], expected[2], expected[3]),
+                "preview differs at document x={}",
+                390 + offset
+            );
+        }
     }
 
     #[test]
@@ -635,7 +671,7 @@ impl EfudeApp {
             return;
         }
         let margin = match operation {
-            FilterOperation::Image(filter) => filter.reach().min(200) as i64,
+            FilterOperation::Image(filter) => i64::from(filter.reach()),
             _ => 0,
         };
         let (x0, y0) = ((left - margin).max(0), (top - margin).max(0));

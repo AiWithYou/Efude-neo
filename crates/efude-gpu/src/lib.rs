@@ -90,10 +90,12 @@ fn blend(mode: u32, s: f32, d: f32) -> f32 {
     if (mode == 4u) { return min(s, d); }
     if (mode == 5u) { return max(s, d); }
     if (mode == 6u) {
+        if (d <= 0.0) { return 0.0; }
         if (s >= 1.0) { return 1.0; }
         return min(1.0, d / (1.0 - s));
     }
     if (mode == 7u) {
+        if (d >= 1.0) { return 1.0; }
         if (s <= 0.0) { return 0.0; }
         return 1.0 - min(1.0, (1.0 - d) / s);
     }
@@ -163,7 +165,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             mix_channel(info.blend_mode, source.y, destination.y, alpha, linear),
             mix_channel(info.blend_mode, source.z, destination.z, alpha, linear)
         );
-        if (!clipping) { base_alpha = alpha + base_alpha * (1.0 - alpha); }
+        if (!clipping && (info.flags & 4u) == 0u) {
+            base_alpha = alpha + base_alpha * (1.0 - alpha);
+        }
     }
     textureStore(output_texture, vec2<i32>(output_coord), vec4<f32>(destination, 1.0));
 }
@@ -180,6 +184,8 @@ pub struct GpuCompositeLayer {
     pub blend_mode: u32,
     pub linear_blend: bool,
     pub clipping: bool,
+    /// A display backdrop, such as a guide, does not supply clipping coverage.
+    pub background: bool,
 }
 
 pub struct GpuCompositeTileInput {
@@ -530,7 +536,9 @@ impl GpuDabPipeline {
                 }
                 metadata.extend_from_slice(&layer.opacity.to_le_bytes());
                 metadata.extend_from_slice(&layer.blend_mode.to_le_bytes());
-                let flags = u32::from(layer.clipping) | (u32::from(layer.linear_blend) << 1);
+                let flags = u32::from(layer.clipping)
+                    | (u32::from(layer.linear_blend) << 1)
+                    | (u32::from(layer.background) << 2);
                 metadata.extend_from_slice(&flags.to_le_bytes());
                 metadata.extend_from_slice(&0u32.to_le_bytes());
             }
@@ -702,6 +710,7 @@ mod mip_tests {
                     blend_mode: layer.blend as u32,
                     linear_blend: false,
                     clipping: false,
+                    background: false,
                 }
             })
             .collect();

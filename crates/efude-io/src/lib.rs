@@ -13,7 +13,25 @@ use std::{
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 pub mod timelapse;
 const MAX_EFUDE_TILE_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_EFUDE_LAYER_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EFUDE_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EFUDE_VECTOR_BYTES: u64 = 256 * 1024 * 1024;
+#[derive(Clone, Copy)]
+struct EfudeLimits {
+    vector_bytes: u64,
+    archive_entries: u64,
+    tile_slots: u64,
+    decoded_tile_memory: u64,
+}
+const EFUDE_LIMITS: EfudeLimits = EfudeLimits {
+    vector_bytes: MAX_EFUDE_VECTOR_BYTES,
+    archive_entries: 500_000,
+    tile_slots: 2_000_000,
+    decoded_tile_memory: MAX_EFUDE_TILE_MEMORY,
+};
 const MAX_INCREMENTAL_ENTRY_COMPARE: usize = 32 * 1024 * 1024;
+// Backing tile buffers of editable PSD layers; not total process memory.
+const MAX_PSD_TILE_MEMORY: u64 = 512 * 1024 * 1024;
 
 fn write_or_reuse_entry<W: Write + Seek>(
     writer: &mut ZipWriter<W>,
@@ -97,18 +115,86 @@ fn optional_entry<'a, R: Read + Seek>(
     }
 }
 
-fn reserve_efude_tile_memory(used: &mut u64) -> Result<(), Box<dyn std::error::Error>> {
+fn reserve_efude_tile_memory(used: &mut u64, limit: u64) -> Result<(), Box<dyn std::error::Error>> {
     let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
     *used = used
         .checked_add(tile_bytes)
         .ok_or(".efude decoded tile memory size overflow")?;
-    if *used > MAX_EFUDE_TILE_MEMORY {
+    if *used > limit {
         return Err(".efude decoded tiles exceed the 2 GiB memory limit".into());
     }
     Ok(())
 }
 
+fn validate_tile_slots(
+    width: u32,
+    height: u32,
+    layer_count: u64,
+    limit: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tile_slots = u64::from(width.div_ceil(TILE_SIZE))
+        .checked_mul(u64::from(height.div_ceil(TILE_SIZE)))
+        .and_then(|slots| slots.checked_mul(layer_count))
+        .ok_or(".efude canvas and layer count overflow")?;
+    if tile_slots > limit {
+        return Err(".efude canvas and layer count exceed loading limits".into());
+    }
+    Ok(())
+}
+
+fn uniform_mask_value(data: &[u8]) -> Option<u8> {
+    let &value = data.first()?;
+    data.iter().all(|&byte| byte == value).then_some(value)
+}
+
+fn validate_vector_strokes(
+    strokes: &[efude_canvas::VectorStroke],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if strokes.iter().any(|stroke| {
+        !stroke.hardness.is_finite()
+            || stroke
+                .points
+                .iter()
+                .any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.width.is_finite())
+            || stroke.anchors.iter().any(|anchor| {
+                [
+                    anchor.x,
+                    anchor.y,
+                    anchor.width,
+                    anchor.in_x,
+                    anchor.in_y,
+                    anchor.out_x,
+                    anchor.out_y,
+                ]
+                .iter()
+                .any(|value| !value.is_finite())
+            })
+    }) {
+        return Err(".efude vector stroke has invalid geometry or hardness".into());
+    }
+    Ok(())
+}
+
+fn validate_entry_size(
+    bytes: u64,
+    limit: u64,
+    error: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if bytes > limit {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error>> {
+    save_with_limits(path, doc, EFUDE_LIMITS)
+}
+
+fn save_with_limits(
+    path: &Path,
+    doc: &Document,
+    limits: EfudeLimits,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !efude_canvas::valid_document_dimensions(doc.width, doc.height) {
         return Err(".efude canvas dimensions exceed safety limits".into());
     }
@@ -118,11 +204,20 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
     if doc.layers.is_empty() || doc.layers.len() > 2000 {
         return Err(".efude layer count is outside the supported range".into());
     }
+    validate_tile_slots(
+        doc.width,
+        doc.height,
+        doc.layers.len() as u64,
+        limits.tile_slots,
+    )?;
     if doc.guide.as_ref().is_some_and(|guide| !guide.is_valid()) {
         return Err(".efude tracing guide is invalid".into());
     }
     let mut ids = std::collections::HashSet::with_capacity(doc.layers.len());
     for layer in &doc.layers {
+        if let Some(strokes) = &layer.vector {
+            validate_vector_strokes(strokes)?;
+        }
         if !ids.insert(layer.id) {
             return Err(".efude contains duplicate layer IDs".into());
         }
@@ -149,12 +244,16 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
                 .and_then(|parent| parent.parent_id);
         }
     }
-    // mimetype, manifest, layers, merged image, thumbnail, optional metadata
+    // mimetype, manifest, layers, merged image, thumbnail, optional metadata,
+    // guide settings/image, and each layer's vector data/paint tiles/mask tiles.
     let mut entry_count =
-        5usize + usize::from(!doc.metadata.is_empty()) + 2 * usize::from(doc.guide.is_some());
+        5u64 + u64::from(!doc.metadata.is_empty()) + 2 * u64::from(doc.guide.is_some());
     for layer in &doc.layers {
         entry_count = entry_count
-            .checked_add(sparse_tile_keys(layer, doc.width, doc.height).len())
+            .checked_add(u64::from(layer.vector.is_some()))
+            .and_then(|count| {
+                count.checked_add(sparse_tile_keys(layer, doc.width, doc.height).len() as u64)
+            })
             .ok_or(".efude archive entry count overflow")?;
         if let Some(mask) = &layer.mask {
             entry_count = entry_count
@@ -162,18 +261,18 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
                     mask.tile_keys()
                         .into_iter()
                         .filter(|&(x, y)| x * TILE_SIZE < doc.width && y * TILE_SIZE < doc.height)
-                        .count(),
+                        .count() as u64,
                 )
                 .ok_or(".efude archive entry count overflow")?;
         }
     }
-    if entry_count > 500_000 {
+    if entry_count > limits.archive_entries {
         return Err(".efude archive would contain too many entries".into());
     }
     let mut previous_archive = File::open(path)
         .ok()
         .and_then(|file| ZipArchive::new(file).ok())
-        .filter(|archive| archive.len() <= 500_000);
+        .filter(|archive| archive.len() as u64 <= limits.archive_entries);
     let parent = path.parent().unwrap_or(Path::new("."));
     let temp = tempfile::NamedTempFile::new_in(parent)?;
     let f = temp.as_file().try_clone()?;
@@ -193,9 +292,19 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
     )?;
     write_or_reuse_entry(&mut z, &mut previous_archive, "manifest.json", o, &manifest)?;
     let layers = serde_json::to_vec_pretty(&doc.layers.iter().map(|l|serde_json::json!({"id":l.id,"name":l.name,"visible":l.visible,"opacity":l.opacity,"locked":l.locked,"clipping":l.clipping,"sketch":l.sketch,"reference":l.reference,"blend":l.blend,"linear_blend":l.linear_blend,"kind":l.kind,"parent_id":l.parent_id,"expanded":l.expanded,"has_mask":l.mask.is_some(),"tone":l.tone})).collect::<Vec<_>>())?;
+    validate_entry_size(
+        layers.len() as u64,
+        MAX_EFUDE_LAYER_METADATA_BYTES,
+        ".efude layer metadata exceeds the size limit",
+    )?;
     write_or_reuse_entry(&mut z, &mut previous_archive, "layers.json", o, &layers)?;
     if !doc.metadata.is_empty() {
         let metadata = serde_json::to_vec_pretty(&doc.metadata)?;
+        validate_entry_size(
+            metadata.len() as u64,
+            MAX_EFUDE_METADATA_BYTES,
+            ".efude metadata exceeds the size limit",
+        )?;
         write_or_reuse_entry(&mut z, &mut previous_archive, "metadata.json", o, &metadata)?;
     }
     if let Some(guide) = &doc.guide {
@@ -221,9 +330,15 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
         }
         write_or_reuse_entry(&mut z, &mut previous_archive, "guide/image.png", o, &bytes)?;
     }
+    let mut allocated_tile_memory = 0u64;
     for l in &doc.layers {
         if let Some(strokes) = &l.vector {
             let bytes = serde_json::to_vec(strokes)?;
+            validate_entry_size(
+                bytes.len() as u64,
+                limits.vector_bytes,
+                ".efude vector strokes exceed the size limit",
+            )?;
             write_or_reuse_entry(
                 &mut z,
                 &mut previous_archive,
@@ -233,6 +348,7 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
             )?;
         }
         for (tx, ty) in sparse_tile_keys(l, doc.width, doc.height) {
+            reserve_efude_tile_memory(&mut allocated_tile_memory, limits.decoded_tile_memory)?;
             let tw = TILE_SIZE.min(doc.width - tx * TILE_SIZE);
             let th = TILE_SIZE.min(doc.height - ty * TILE_SIZE);
             let mut tile = Vec::with_capacity((tw * th * 4) as usize);
@@ -262,6 +378,12 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
                     for x in 0..tw {
                         tile.push(mask.pixel(tx * TILE_SIZE + x, ty * TILE_SIZE + y)[0]);
                     }
+                }
+                if uniform_mask_value(&tile).is_none() {
+                    reserve_efude_tile_memory(
+                        &mut allocated_tile_memory,
+                        limits.decoded_tile_memory,
+                    )?;
                 }
                 write_or_reuse_entry(
                     &mut z,
@@ -313,10 +435,17 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
+    load_with_limits(path, EFUDE_LIMITS)
+}
+
+fn load_with_limits(
+    path: &Path,
+    limits: EfudeLimits,
+) -> Result<Document, Box<dyn std::error::Error>> {
     use std::io::Read;
     let f = File::open(path)?;
     let mut z = zip::ZipArchive::new(f)?;
-    if z.len() > 500_000 {
+    if z.len() as u64 > limits.archive_entries {
         return Err(".efude archive contains too many entries".into());
     }
     {
@@ -377,9 +506,11 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
         return Err(".efude DPI is invalid".into());
     }
     let mut layers_entry = z.by_name("layers.json")?;
-    if layers_entry.size() > 16 * 1024 * 1024 {
-        return Err(".efude layer metadata exceeds the size limit".into());
-    }
+    validate_entry_size(
+        layers_entry.size(),
+        MAX_EFUDE_LAYER_METADATA_BYTES,
+        ".efude layer metadata exceeds the size limit",
+    )?;
     let mut layers_bytes = Vec::with_capacity(layers_entry.size() as usize);
     layers_entry.read_to_end(&mut layers_bytes)?;
     drop(layers_entry);
@@ -387,11 +518,7 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
     if metas.is_empty() || metas.len() > 2000 {
         return Err(".efude layer count is outside the supported range".into());
     }
-    let tile_slots =
-        width.div_ceil(TILE_SIZE) as u64 * height.div_ceil(TILE_SIZE) as u64 * metas.len() as u64;
-    if tile_slots > 2_000_000 {
-        return Err(".efude canvas and layer count exceed loading limits".into());
-    }
+    validate_tile_slots(width, height, metas.len() as u64, limits.tile_slots)?;
     let mut layers = Vec::new();
     let mut ids = std::collections::HashSet::new();
     let mut allocated_tile_memory = 0u64;
@@ -419,20 +546,15 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
             l.mask = Some(efude_canvas::TilePixels::new(width, height));
         }
         if let Some(mut entry) = optional_entry(&mut z, &format!("vectors/{id}.json"))? {
-            if entry.size() > 256 * 1024 * 1024 {
-                return Err(".efude vector strokes exceed the size limit".into());
-            }
+            validate_entry_size(
+                entry.size(),
+                limits.vector_bytes,
+                ".efude vector strokes exceed the size limit",
+            )?;
             let mut bytes = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut bytes)?;
             let strokes: Vec<efude_canvas::VectorStroke> = serde_json::from_slice(&bytes)?;
-            if strokes.iter().any(|stroke| {
-                stroke
-                    .points
-                    .iter()
-                    .any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.width.is_finite())
-            }) {
-                return Err(".efude vector stroke has an invalid point".into());
-            }
+            validate_vector_strokes(&strokes)?;
             l.vector = Some(strokes);
         }
         for ty in 0..height.div_ceil(TILE_SIZE) {
@@ -475,7 +597,10 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
                     None
                 };
                 if let Some(mut tile) = tile {
-                    reserve_efude_tile_memory(&mut allocated_tile_memory)?;
+                    reserve_efude_tile_memory(
+                        &mut allocated_tile_memory,
+                        limits.decoded_tile_memory,
+                    )?;
                     if premultiplied {
                         for pixel in tile.chunks_exact_mut(4) {
                             let alpha = pixel[3] as u16;
@@ -515,9 +640,7 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
                         entry.read_exact(&mut data)?;
                         // Uniform tiles (the inside and outside of a panel
                         // mask) share one allocation.
-                        if let Some(&v) = data.first()
-                            && data.iter().all(|&b| b == v)
-                        {
+                        if let Some(v) = uniform_mask_value(&data) {
                             let tile = uniform_mask_tiles
                                 .entry(v)
                                 .or_insert_with(|| {
@@ -529,7 +652,10 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
                             mask.insert_shared_tile(tx, ty, tile);
                             continue;
                         }
-                        reserve_efude_tile_memory(&mut allocated_tile_memory)?;
+                        reserve_efude_tile_memory(
+                            &mut allocated_tile_memory,
+                            limits.decoded_tile_memory,
+                        )?;
                         mask.ensure_tile_filled(tx * TILE_SIZE, ty * TILE_SIZE, [255; 4]);
                         for y in 0..th {
                             for x in 0..tw {
@@ -571,9 +697,11 @@ pub fn load(path: &Path) -> Result<Document, Box<dyn std::error::Error>> {
     }
     let mut metadata = std::collections::BTreeMap::new();
     if let Some(mut entry) = optional_entry(&mut z, "metadata.json")? {
-        if entry.size() > 16 * 1024 * 1024 {
-            return Err(".efude metadata exceeds the size limit".into());
-        }
+        validate_entry_size(
+            entry.size(),
+            MAX_EFUDE_METADATA_BYTES,
+            ".efude metadata exceeds the size limit",
+        )?;
         let mut bytes = Vec::with_capacity(entry.size() as usize);
         entry.read_to_end(&mut bytes)?;
         metadata = serde_json::from_slice(&bytes)?;
@@ -672,7 +800,13 @@ pub fn load_thumbnail(path: &Path) -> Result<(u32, u32, Vec<u8>), Box<dyn std::e
     }
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
-    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)?.to_rgba8();
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(256);
+    limits.max_image_height = Some(256);
+    reader.limits(limits);
+    let image = reader.decode()?.to_rgba8();
     Ok((image.width(), image.height(), image.into_raw()))
 }
 
@@ -1295,9 +1429,10 @@ pub fn import_psd_report(path: &Path) -> Result<PsdImport, Box<dyn std::error::E
                     planes[2][i] as u32,
                     planes[3][i] as u32,
                 );
-                doc.layers[0].pixels[p] = (((255 - c) * (255 - k) + 127) / 255) as u8;
-                doc.layers[0].pixels[p + 1] = (((255 - m) * (255 - k) + 127) / 255) as u8;
-                doc.layers[0].pixels[p + 2] = (((255 - y) * (255 - k) + 127) / 255) as u8;
+                // PSD stores inverted CMYK planes; alpha is not inverted.
+                doc.layers[0].pixels[p] = ((c * k + 127) / 255) as u8;
+                doc.layers[0].pixels[p + 1] = ((m * k + 127) / 255) as u8;
+                doc.layers[0].pixels[p + 2] = ((y * k + 127) / 255) as u8;
             }
             _ => unreachable!(),
         }
@@ -1417,6 +1552,18 @@ fn be_i32<R: std::io::Read>(r: &mut R) -> Result<i32, Box<dyn std::error::Error>
     r.read_exact(&mut b)?;
     Ok(i32::from_be_bytes(b))
 }
+fn psd_rect_tile_count(bounds: (i32, i32, i32, i32), width: u32, height: u32) -> u64 {
+    let top = i64::from(bounds.0).clamp(0, i64::from(height)) as u32;
+    let left = i64::from(bounds.1).clamp(0, i64::from(width)) as u32;
+    let bottom = i64::from(bounds.2).clamp(0, i64::from(height)) as u32;
+    let right = i64::from(bounds.3).clamp(0, i64::from(width)) as u32;
+    if top >= bottom || left >= right {
+        return 0;
+    }
+    u64::from((right - 1) / TILE_SIZE - left / TILE_SIZE + 1)
+        * u64::from((bottom - 1) / TILE_SIZE - top / TILE_SIZE + 1)
+}
+
 #[allow(clippy::type_complexity)] // Compact private parse result for feature support flags and layers.
 fn parse_psd_layers(
     section: &[u8],
@@ -1424,6 +1571,25 @@ fn parse_psd_layers(
     height: u32,
     color_mode: u16,
     depth: u16,
+) -> Result<(Option<Vec<Layer>>, bool, bool, Vec<&'static str>), Box<dyn std::error::Error>> {
+    parse_psd_layers_with_tile_limit(
+        section,
+        width,
+        height,
+        color_mode,
+        depth,
+        MAX_PSD_TILE_MEMORY,
+    )
+}
+
+#[allow(clippy::type_complexity)] // Same parse result as the production wrapper.
+fn parse_psd_layers_with_tile_limit(
+    section: &[u8],
+    width: u32,
+    height: u32,
+    color_mode: u16,
+    depth: u16,
+    tile_memory_limit: u64,
 ) -> Result<(Option<Vec<Layer>>, bool, bool, Vec<&'static str>), Box<dyn std::error::Error>> {
     use std::io::{Cursor, Read, Seek, SeekFrom};
     if section.len() < 4 {
@@ -1520,36 +1686,66 @@ fn parse_psd_layers(
         let end = start
             .checked_add(extra_len)
             .ok_or("PSD extra data overflow")?;
-        if end > r.get_ref().len() {
+        if extra_len < 12 || end > r.get_ref().len() {
             return Err("invalid PSD layer extra data".into());
         }
         let mask_len = be_u32(&mut r)? as usize;
-        let has_mask = mask_len >= 18;
+        if (r.position() as usize)
+            .checked_add(mask_len)
+            .is_none_or(|mask_end| mask_end > end.saturating_sub(8))
+        {
+            return Err("PSD layer mask data exceeds its extra-data section".into());
+        }
+        let mut has_mask = mask_len >= 18;
         let mut mask_bounds = None;
         let mut mask_default = 255;
         if has_mask {
             let mut mask_header = [0u8; 18];
             r.read_exact(&mut mask_header)?;
-            mask_bounds = Some((
+            let mut bounds = [
                 i32::from_be_bytes(mask_header[0..4].try_into()?),
                 i32::from_be_bytes(mask_header[4..8].try_into()?),
                 i32::from_be_bytes(mask_header[8..12].try_into()?),
                 i32::from_be_bytes(mask_header[12..16].try_into()?),
-            ));
+            ];
+            let flags = mask_header[17];
+            // Disabled masks still have channel data to consume, but do not
+            // affect the imported layer's appearance.
+            has_mask = flags & 2 == 0;
+            if flags & 1 != 0 {
+                for (bound, offset) in bounds.iter_mut().zip([top, left, top, left]) {
+                    *bound = bound
+                        .checked_add(offset)
+                        .ok_or("PSD layer-relative mask coordinate overflow")?;
+                }
+            }
+            mask_bounds = Some((bounds[0], bounds[1], bounds[2], bounds[3]));
             mask_default = mask_header[16];
             r.seek(SeekFrom::Current(mask_len.saturating_sub(18) as i64))?;
         } else {
             r.seek(SeekFrom::Current(mask_len as i64))?;
         }
         let blend_len = be_u32(&mut r)? as usize;
+        if (r.position() as usize)
+            .checked_add(blend_len)
+            .is_none_or(|blend_end| blend_end > end.saturating_sub(4))
+        {
+            return Err("PSD blending ranges exceed their extra-data section".into());
+        }
         r.seek(SeekFrom::Current(blend_len as i64))?;
         let mut name_len = [0u8; 1];
         r.read_exact(&mut name_len)?;
         let name_len = name_len[0] as usize;
+        let pad = (4 - ((name_len + 1) % 4)) % 4;
+        if (r.position() as usize)
+            .checked_add(name_len + pad)
+            .is_none_or(|name_end| name_end > end)
+        {
+            return Err("PSD layer name exceeds its extra-data section".into());
+        }
         let mut name_bytes = vec![0; name_len];
         r.read_exact(&mut name_bytes)?;
         let mut name = String::from_utf8_lossy(&name_bytes).into_owned();
-        let pad = (4 - ((name_len + 1) % 4)) % 4;
         r.seek(SeekFrom::Current(pad as i64))?;
         let mut section = None;
         while (r.position() as usize).saturating_add(12) <= end {
@@ -1560,6 +1756,12 @@ fn parse_psd_layers(
             let len = be_u32(&mut r)? as usize;
             if &sig != b"8BIM" {
                 break;
+            }
+            if (r.position() as usize)
+                .checked_add(len)
+                .is_none_or(|block_end| block_end > end)
+            {
+                return Err("PSD tagged layer data exceeds its extra-data section".into());
             }
             if &key == b"TySh" {
                 has_text_layers = true;
@@ -1609,7 +1811,10 @@ fn parse_psd_layers(
             } else if &key == b"luni" && len >= 4 {
                 // Unicode layer name: u32 length, then UTF-16BE units.
                 let count = be_u32(&mut r)? as usize;
-                let units = count.min((len - 4) / 2);
+                if count > (len - 4) / 2 {
+                    return Err("PSD Unicode layer name exceeds its tagged block".into());
+                }
+                let units = count;
                 let mut utf16 = Vec::with_capacity(units);
                 for _ in 0..units {
                     utf16.push(be_u16(&mut r)?);
@@ -1661,6 +1866,7 @@ fn parse_psd_layers(
     let mut layers: Vec<Layer> = Vec::with_capacity(count);
     let mut group_stack: Vec<u64> = Vec::new();
     let mut decoded_channel_bytes = 0u64;
+    let mut decoded_tile_bytes = 0u64;
     let mut cmyk_scratch_bytes = 0usize;
     for record in records {
         if record.section == Some(3) {
@@ -1678,6 +1884,30 @@ fn parse_psd_layers(
             group_stack.pop();
             continue;
         }
+        let layer_rect = (record.top, record.left, record.bottom, record.right);
+        let mask_rect = record.mask_bounds.unwrap_or(layer_rect);
+        let pixel_tiles = psd_rect_tile_count(layer_rect, width, height);
+        let mask_tiles = if record.has_mask {
+            let changed_tiles = if record.channels.iter().any(|channel| channel.id == -2) {
+                psd_rect_tile_count(mask_rect, width, height)
+            } else {
+                0
+            };
+            // Nonwhite defaults share one buffer. Count possible COW tiles too;
+            // this conservatively keeps the default even if every tile changes.
+            changed_tiles + u64::from(record.mask_default != 255)
+        } else {
+            0
+        };
+        let tile_bytes = (pixel_tiles + mask_tiles)
+            .checked_mul(u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4)
+            .ok_or("PSD decoded tile buffer size overflow")?;
+        decoded_tile_bytes = decoded_tile_bytes
+            .checked_add(tile_bytes)
+            .ok_or("PSD decoded tile buffer size overflow")?;
+        if decoded_tile_bytes > tile_memory_limit {
+            return Err("PSD decoded tile buffer estimate exceeds the memory safety limit".into());
+        }
         let id = layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
         let mut layer = Layer::new(id, record.name, width, height);
         layer.parent_id = group_stack.last().copied();
@@ -1692,15 +1922,11 @@ fn parse_psd_layers(
         if record.has_mask {
             layer.mask = Some(efude_canvas::TilePixels::new(width, height));
             if record.mask_default != 255 {
-                for y in (0..height).step_by(efude_canvas::TILE_SIZE as usize) {
-                    for x in (0..width).step_by(efude_canvas::TILE_SIZE as usize) {
-                        layer.mask.as_mut().unwrap().ensure_tile_filled(
-                            x,
-                            y,
-                            [record.mask_default; 4],
-                        );
-                    }
-                }
+                layer
+                    .mask
+                    .as_mut()
+                    .unwrap()
+                    .fill_shared([record.mask_default; 4]);
             }
         }
         let lw = (record.right as i64 - record.left as i64).max(0) as usize;
@@ -1723,10 +1949,6 @@ fn parse_psd_layers(
         } else {
             None
         };
-        let mask_rect =
-            record
-                .mask_bounds
-                .unwrap_or((record.top, record.left, record.bottom, record.right));
         let mask_width = (mask_rect.3 as i64 - mask_rect.1 as i64).max(0) as usize;
         let mask_height = (mask_rect.2 as i64 - mask_rect.0 as i64).max(0) as usize;
         if mask_width > width as usize * 2
@@ -1784,6 +2006,12 @@ fn parse_psd_layers(
             if channel.len < 2 {
                 return Err("PSD layer channel is missing its compression field".into());
             }
+            if (r.position() as usize)
+                .checked_add(channel.len)
+                .is_none_or(|channel_end| channel_end > r.get_ref().len())
+            {
+                return Err("PSD layer channel exceeds its layer-info section".into());
+            }
             let compression = be_u16(&mut r)?;
             let mut copy_row = |y: usize, row: &[u8]| {
                 let dy = channel_top as i64 + y as i64;
@@ -1820,6 +2048,15 @@ fn parse_psd_layers(
                         -1 => layer.pixels[dst + 3] = value,
                         -2 => {
                             if let Some(mask) = &mut layer.mask {
+                                // Pixels outside the mask rectangle keep its
+                                // default, including the rest of this tile.
+                                if !mask.has_tile(dx as u32, dy as u32) {
+                                    mask.ensure_tile_filled(
+                                        dx as u32,
+                                        dy as u32,
+                                        [record.mask_default; 4],
+                                    );
+                                }
                                 mask.set_pixel(dx as u32, dy as u32, [value; 4]);
                             }
                         }
@@ -1893,9 +2130,9 @@ fn parse_psd_layers(
                         layer.pixels[index + 2] as u32,
                         black[y * lw + x] as u32,
                     );
-                    layer.pixels[index] = (((255 - c) * (255 - k) + 127) / 255) as u8;
-                    layer.pixels[index + 1] = (((255 - m) * (255 - k) + 127) / 255) as u8;
-                    layer.pixels[index + 2] = (((255 - yellow) * (255 - k) + 127) / 255) as u8;
+                    layer.pixels[index] = ((c * k + 127) / 255) as u8;
+                    layer.pixels[index + 1] = ((m * k + 127) / 255) as u8;
+                    layer.pixels[index + 2] = ((yellow * k + 127) / 255) as u8;
                 }
             }
         }
@@ -1966,34 +2203,53 @@ pub fn save_backup(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("document");
+    let prefix = format!("{stem}.");
+    let mut entries = Vec::new();
+    for item in fs::read_dir(&dir)? {
+        let entry = item?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(timestamp) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|name| name.strip_suffix(".efude"))
+        else {
+            continue;
+        };
+        // Only this document's numeric timestamp may follow its exact stem.
+        // For example, "chapter.rough.*.efude" belongs to another document.
+        if timestamp.is_empty() || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(timestamp) = timestamp.parse::<u128>() {
+            entries.push((timestamp, entry));
+        }
+    }
+    let stamp = next_backup_stamp(stamp, entries.iter().map(|(stamp, _)| *stamp).max())?;
     let backup = dir.join(format!("{stem}.{stamp}.efude"));
     save(&backup, doc)?;
-    let prefix = format!("{stem}.");
-    let mut entries = fs::read_dir(&dir)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                return None;
-            }
-            let name = entry.file_name();
-            let timestamp = name
-                .to_str()?
-                .strip_prefix(&prefix)?
-                .strip_suffix(".efude")?;
-            // Only this document's numeric timestamp may follow its exact stem.
-            // For example, "chapter.rough.*.efude" belongs to another document.
-            if timestamp.is_empty() || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
-            Some((timestamp.parse::<u128>().ok()?, entry))
-        })
-        .collect::<Vec<_>>();
     entries.sort_by_key(|(timestamp, _)| *timestamp);
-    let excess = entries.len().saturating_sub(generations.max(1));
+    // The pre-save list contains only previous generations. The newly saved
+    // generation sorts last even after a wall-clock correction.
+    let excess = entries
+        .len()
+        .saturating_add(1)
+        .saturating_sub(generations.max(1));
     for (_, entry) in entries.into_iter().take(excess) {
         let _ = fs::remove_file(entry.path());
     }
     Ok(())
+}
+fn next_backup_stamp(
+    now: u128,
+    previous: Option<u128>,
+) -> Result<u128, Box<dyn std::error::Error>> {
+    match previous {
+        Some(previous) => Ok(now.max(previous.checked_add(1).ok_or("backup timestamp overflow")?)),
+        None => Ok(now),
+    }
 }
 pub fn backup_interval(minutes: u32) -> Duration {
     Duration::from_secs(minutes.clamp(1, 120) as u64 * 60)
@@ -2002,6 +2258,29 @@ pub fn backup_interval(minutes: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn small_vector_document() -> Document {
+        use efude_canvas::{VectorPoint, VectorStroke};
+        let mut document = Document::new(8, 8);
+        document.layers[0].vector = Some(vec![VectorStroke::fitted(
+            vec![
+                VectorPoint {
+                    x: 1.0,
+                    y: 2.0,
+                    width: 2.0,
+                },
+                VectorPoint {
+                    x: 6.0,
+                    y: 4.0,
+                    width: 1.0,
+                },
+            ],
+            [20, 40, 80, 255],
+            0.8,
+        )]);
+        document.layers[0].pixels.set_pixel(1, 2, [20, 40, 80, 255]);
+        document
+    }
 
     fn sample_document() -> Document {
         let mut document = Document::new(4, 3);
@@ -2012,6 +2291,40 @@ mod tests {
             .pixels
             .set_pixel(2, 1, [18, 90, 240, 127]);
         document
+    }
+
+    #[test]
+    fn thumbnail_loading_enforces_preview_dimensions() {
+        let directory = tempfile::tempdir().unwrap();
+        for (width, height) in [(256, 256), (257, 1), (1, 257)] {
+            let path = directory.path().join(format!("{width}-{height}.efude"));
+            let mut png_bytes = Vec::new();
+            let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[20, 40, 80, 255].repeat((width * height) as usize))
+                .unwrap();
+            let mut archive = ZipWriter::new(File::create(&path).unwrap());
+            archive
+                .start_file("thumbnail.png", SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(&png_bytes).unwrap();
+            archive.finish().unwrap();
+            let result = load_thumbnail(&path);
+            if width <= 256 && height <= 256 {
+                let (loaded_width, loaded_height, pixels) = result.unwrap();
+                assert_eq!((loaded_width, loaded_height), (width, height));
+                assert_eq!(pixels.len(), (width * height * 4) as usize);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "oversized thumbnail accepted: {width}x{height}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2055,6 +2368,124 @@ mod tests {
                 current.layers[0].pixels.to_dense()
             );
         }
+    }
+
+    #[test]
+    fn backup_retention_keeps_current_generation_when_clock_moves_backwards() {
+        for generations in [1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let backup_dir = directory.path().join(".efude-backups");
+            fs::create_dir(&backup_dir).unwrap();
+            // These older saves model a wall clock that was one hour ahead.
+            let future_stamp = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+                + Duration::from_secs(3600))
+            .as_nanos();
+            let oldest = backup_dir.join(format!("chapter.{future_stamp}.efude"));
+            let newest = backup_dir.join(format!("chapter.{}.efude", future_stamp + 1));
+            let mut document = sample_document();
+            save(&oldest, &document).unwrap();
+            save(&newest, &document).unwrap();
+
+            // Consecutive saves must both retain their current contents, even
+            // while all previous filenames still sort after the current time.
+            let mut previous_color = None;
+            for color in [[11, 37, 83, 255], [19, 43, 97, 255]] {
+                document.layers[0].pixels.set_pixel(1, 1, color);
+                save_backup(
+                    &directory.path().join("chapter.efude"),
+                    &document,
+                    generations,
+                )
+                .unwrap();
+                let backups = fs::read_dir(&backup_dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                assert_eq!(backups.len(), generations);
+                assert!(
+                    backups
+                        .iter()
+                        .any(|path| load(path).unwrap().layers[0].pixels.pixel(1, 1) == color),
+                    "the current backup was deleted for {generations} retained generations"
+                );
+                if let Some(previous_color) = previous_color {
+                    assert_eq!(
+                        backups.iter().any(|path| {
+                            load(path).unwrap().layers[0].pixels.pixel(1, 1) == previous_color
+                        }),
+                        generations == 2,
+                        "the previous save must be the second newest generation"
+                    );
+                }
+                previous_color = Some(color);
+            }
+            assert!(!oldest.exists());
+            assert!(!newest.exists());
+        }
+    }
+
+    #[test]
+    fn backup_stamp_preserves_order_and_rejects_overflow_without_writes() {
+        assert_eq!(next_backup_stamp(100, None).unwrap(), 100);
+        assert_eq!(next_backup_stamp(100, Some(99)).unwrap(), 100);
+        assert_eq!(next_backup_stamp(100, Some(100)).unwrap(), 101);
+        assert_eq!(next_backup_stamp(100, Some(101)).unwrap(), 102);
+        assert_eq!(next_backup_stamp(u128::MAX, None).unwrap(), u128::MAX);
+        assert_eq!(
+            next_backup_stamp(100, Some(u128::MAX - 1)).unwrap(),
+            u128::MAX
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chapter.efude");
+        let backup_dir = directory.path().join(".efude-backups");
+        fs::create_dir(&backup_dir).unwrap();
+        let document = sample_document();
+        save(&path, &document).unwrap();
+        let old_backup = backup_dir.join("chapter.100.efude");
+        let max_backup = backup_dir.join(format!("chapter.{}.efude", u128::MAX));
+        save(&old_backup, &document).unwrap();
+        save(&max_backup, &document).unwrap();
+        let original = fs::read(&path).unwrap();
+        let old_bytes = fs::read(&old_backup).unwrap();
+        let max_bytes = fs::read(&max_backup).unwrap();
+        let mut changed = document;
+        changed.layers[0].pixels.set_pixel(1, 1, [11, 37, 83, 255]);
+
+        let error = save_backup(&path, &changed, 1).unwrap_err().to_string();
+        assert_eq!(error, "backup timestamp overflow");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&old_backup).unwrap(), old_bytes);
+        assert_eq!(fs::read(&max_backup).unwrap(), max_bytes);
+        assert_eq!(fs::read_dir(&backup_dir).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn backup_stamp_ignores_other_documents_and_non_file_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup_dir = directory.path().join(".efude-backups");
+        fs::create_dir(&backup_dir).unwrap();
+        let ignored_folder = backup_dir.join(format!("chapter.{}.efude", u128::MAX));
+        fs::create_dir(&ignored_folder).unwrap();
+        let document = sample_document();
+        let other_document = backup_dir.join(format!("chapter.rough.{}.efude", u128::MAX));
+        save(&other_document, &document).unwrap();
+        let other_bytes = fs::read(&other_document).unwrap();
+
+        save_backup(&directory.path().join("chapter.efude"), &document, 1).unwrap();
+
+        assert!(ignored_folder.is_dir());
+        assert_eq!(fs::read(&other_document).unwrap(), other_bytes);
+        let backups = fs::read_dir(&backup_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file() && path != &other_document)
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            load(&backups[0]).unwrap().layers[0].pixels.pixel(1, 1),
+            document.layers[0].pixels.pixel(1, 1)
+        );
     }
 
     #[test]
@@ -2151,6 +2582,347 @@ mod tests {
     }
 
     #[test]
+    fn efude_rejects_nonfinite_vector_control_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-vector.efude");
+        for field in [
+            "x", "y", "width", "in_x", "in_y", "out_x", "out_y", "hardness",
+        ] {
+            let mut stroke = serde_json::json!({
+                "points": [{"x": 1.0, "y": 1.0, "width": 2.0}],
+                "color": [20, 40, 80, 255],
+                "hardness": 1.0,
+                "anchors": [{
+                    "x": 1.0, "y": 1.0, "width": 2.0,
+                    "in_x": 0.0, "in_y": 0.0, "out_x": 0.0, "out_y": 0.0
+                }]
+            });
+            // A finite JSON f64 can overflow when decoded into an f32.
+            if field == "hardness" {
+                stroke[field] = serde_json::json!(3.5e38);
+            } else {
+                stroke["anchors"][0][field] = serde_json::json!(3.5e38);
+            }
+            let vectors = serde_json::to_vec(&vec![stroke]).unwrap();
+            let mut archive = ZipWriter::new(File::create(&path).unwrap());
+            for (name, bytes) in [
+                ("mimetype", b"application/x-efude".as_slice()),
+                (
+                    "manifest.json",
+                    br#"{"format_version":"0.1","width":4,"height":3,"color_space":"sRGB","pixel_format":"RGBA8"}"#.as_slice(),
+                ),
+                ("layers.json", br#"[{"id":1}]"#.as_slice()),
+                ("vectors/1.json", vectors.as_slice()),
+            ] {
+                archive
+                    .start_file(
+                        name,
+                        SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Stored),
+                    )
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap();
+            assert!(load(&path).is_err(), "invalid vector {field} accepted");
+        }
+    }
+
+    #[test]
+    fn efude_save_rejects_nonfinite_vectors_without_replacing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keep-valid-vector.efude");
+        let original = small_vector_document();
+        save(&path, &original).unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            load(&path).unwrap().layers[0].vector,
+            original.layers[0].vector
+        );
+        let mut accepted = Vec::new();
+        let mut replaced = 0;
+        let mut unreadable = 0;
+        for field in 0..11 {
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                // Each case attempts to replace the same valid native file.
+                fs::write(&path, &original_bytes).unwrap();
+                let mut invalid = original.clone();
+                let stroke = &mut invalid.layers[0].vector.as_mut().unwrap()[0];
+                let target = match field {
+                    0 => &mut stroke.points[0].x,
+                    1 => &mut stroke.points[0].y,
+                    2 => &mut stroke.points[0].width,
+                    3 => &mut stroke.anchors[0].x,
+                    4 => &mut stroke.anchors[0].y,
+                    5 => &mut stroke.anchors[0].width,
+                    6 => &mut stroke.anchors[0].in_x,
+                    7 => &mut stroke.anchors[0].in_y,
+                    8 => &mut stroke.anchors[0].out_x,
+                    9 => &mut stroke.anchors[0].out_y,
+                    10 => &mut stroke.hardness,
+                    _ => unreachable!(),
+                };
+                *target = value;
+                if save(&path, &invalid).is_ok() {
+                    accepted.push((field, value));
+                }
+                replaced += usize::from(fs::read(&path).unwrap() != original_bytes);
+                unreadable += usize::from(load(&path).is_err());
+            }
+        }
+        assert!(
+            accepted.is_empty() && replaced == 0 && unreadable == 0,
+            "nonfinite vector cases accepted: {accepted:?}; replaced: {replaced}; unreadable: {unreadable}"
+        );
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.layers[0].vector, original.layers[0].vector);
+        assert_eq!(loaded.layers[0].pixels.pixel(1, 2), [20, 40, 80, 255]);
+    }
+
+    #[test]
+    fn efude_save_keeps_existing_file_when_text_exceeds_loading_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keep-readable.efude");
+        let original = Document::new(8, 8);
+        save(&path, &original).unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let mut accepted = Vec::new();
+        let mut replaced = 0;
+        let mut unreadable = 0;
+        for entry in ["layers.json", "metadata.json"] {
+            fs::write(&path, &original_bytes).unwrap();
+            let mut oversized = original.clone();
+            let text = "x".repeat(16 * 1024 * 1024);
+            if entry == "layers.json" {
+                oversized.layers[0].name = text;
+            } else {
+                oversized.metadata.insert("balloons".into(), text);
+            }
+            if save(&path, &oversized).is_ok() {
+                accepted.push(entry);
+            }
+            replaced += usize::from(fs::read(&path).unwrap() != original_bytes);
+            unreadable += usize::from(load(&path).is_err());
+        }
+        assert!(
+            accepted.is_empty() && replaced == 0 && unreadable == 0,
+            "oversized entries accepted: {accepted:?}; replaced: {replaced}; unreadable: {unreadable}"
+        );
+    }
+
+    #[test]
+    fn efude_save_checks_vector_byte_limit_before_replacing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keep-vector-budget.efude");
+        let original = sample_document();
+        save(&path, &original).unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let with_vectors = small_vector_document();
+        let strokes = with_vectors.layers[0].vector.as_ref().unwrap();
+        let vector_bytes = serde_json::to_vec(strokes).unwrap().len() as u64;
+        let result = save_with_limits(
+            &path,
+            &with_vectors,
+            EfudeLimits {
+                vector_bytes: vector_bytes - 1,
+                ..EFUDE_LIMITS
+            },
+        );
+        assert!(
+            result.is_err() && fs::read(&path).unwrap() == original_bytes,
+            "over-budget vector data replaced the existing file"
+        );
+        assert_eq!(
+            load(&path).unwrap().layers[0].pixels.pixel(1, 1),
+            [220, 48, 76, 255]
+        );
+        // The exact boundary must still be writable and readable.
+        let exact_limits = EfudeLimits {
+            vector_bytes,
+            ..EFUDE_LIMITS
+        };
+        save_with_limits(&path, &with_vectors, exact_limits).unwrap();
+        assert_eq!(
+            load_with_limits(&path, exact_limits).unwrap().layers[0].vector,
+            with_vectors.layers[0].vector
+        );
+    }
+
+    fn assert_native_budget_boundary(
+        document: &Document,
+        rejected: EfudeLimits,
+        exact: EfudeLimits,
+        expected_entries: usize,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keep-native-budget.efude");
+        let original = sample_document();
+        save(&path, &original).unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let result = save_with_limits(&path, document, rejected);
+        let replaced = fs::read(&path).unwrap() != original_bytes;
+        let writer_accepted_but_reader_rejected =
+            result.is_ok() && load_with_limits(&path, rejected).is_err();
+        assert!(
+            result.is_err() && !replaced,
+            "writer accepted: {}; replaced: {replaced}; same-cap reader rejected: {writer_accepted_but_reader_rejected}",
+            result.is_ok()
+        );
+        assert_eq!(
+            load(&path).unwrap().layers[0].pixels.pixel(1, 1),
+            [220, 48, 76, 255]
+        );
+        save_with_limits(&path, document, exact).unwrap();
+        assert_eq!(
+            ZipArchive::new(File::open(&path).unwrap()).unwrap().len(),
+            expected_entries
+        );
+        let loaded = load_with_limits(&path, exact).unwrap();
+        assert_eq!(
+            (loaded.width, loaded.height),
+            (document.width, document.height)
+        );
+        assert_eq!(loaded.metadata, document.metadata);
+        assert_eq!(loaded.layers.len(), document.layers.len());
+        for (loaded, original) in loaded.layers.iter().zip(&document.layers) {
+            assert_eq!(loaded.vector, original.vector);
+            assert_eq!(loaded.pixels.to_dense(), original.pixels.to_dense());
+            match (&loaded.mask, &original.mask) {
+                (Some(loaded), Some(original)) => {
+                    assert_eq!(loaded.to_dense(), original.to_dense());
+                }
+                (None, None) => {}
+                _ => panic!("mask lost during budget round trip"),
+            }
+        }
+        match (&loaded.guide, &document.guide) {
+            (Some(loaded), Some(original)) => assert_eq!(loaded.rgba, original.rgba),
+            (None, None) => {}
+            _ => panic!("guide lost during budget round trip"),
+        }
+    }
+
+    #[test]
+    fn efude_save_checks_the_same_tile_slots_as_loading() {
+        let mut document = Document::new(TILE_SIZE + 1, 1);
+        document
+            .layers
+            .push(Layer::new(2, "empty", document.width, 1));
+        assert_native_budget_boundary(
+            &document,
+            EfudeLimits {
+                tile_slots: 3,
+                ..EFUDE_LIMITS
+            },
+            EfudeLimits {
+                tile_slots: 4,
+                ..EFUDE_LIMITS
+            },
+            5,
+        );
+    }
+
+    #[test]
+    fn efude_save_counts_vector_entries_with_all_optional_entries() {
+        let mut document = small_vector_document();
+        let mut mask = efude_canvas::TilePixels::new(8, 8);
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        document.layers[0].mask = Some(mask);
+        document
+            .metadata
+            .insert("fixture".into(), "complete snapshot".into());
+        document.guide = GuideImage::fit_to_canvas(8, 8, [11, 22, 33, 255].repeat(64), &document);
+        assert_native_budget_boundary(
+            &document,
+            EfudeLimits {
+                archive_entries: 10,
+                ..EFUDE_LIMITS
+            },
+            EfudeLimits {
+                archive_entries: 11,
+                ..EFUDE_LIMITS
+            },
+            11,
+        );
+    }
+
+    #[test]
+    fn efude_save_checks_decoded_pixel_tile_memory_before_replacing_file() {
+        let mut document = Document::new(TILE_SIZE + 1, 1);
+        document.layers[0].pixels.set_pixel(0, 0, [1, 2, 3, 255]);
+        document.layers[0]
+            .pixels
+            .set_pixel(TILE_SIZE, 0, [4, 5, 6, 255]);
+        let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
+        assert_native_budget_boundary(
+            &document,
+            EfudeLimits {
+                decoded_tile_memory: tile_bytes,
+                ..EFUDE_LIMITS
+            },
+            EfudeLimits {
+                decoded_tile_memory: 2 * tile_bytes,
+                ..EFUDE_LIMITS
+            },
+            7,
+        );
+    }
+
+    #[test]
+    fn efude_save_checks_nonuniform_mask_tile_memory_before_replacing_file() {
+        let mut document = Document::new(2, 1);
+        let mut mask = efude_canvas::TilePixels::new(2, 1);
+        mask.set_pixel(0, 0, [0, 0, 0, 255]);
+        mask.set_pixel(1, 0, [128, 128, 128, 255]);
+        document.layers[0].mask = Some(mask);
+        let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
+        assert_native_budget_boundary(
+            &document,
+            EfudeLimits {
+                decoded_tile_memory: 0,
+                ..EFUDE_LIMITS
+            },
+            EfudeLimits {
+                decoded_tile_memory: tile_bytes,
+                ..EFUDE_LIMITS
+            },
+            6,
+        );
+    }
+
+    #[test]
+    fn efude_save_matches_uniform_mask_allocation_after_partial_tile_cropping() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("uniform-cropped-mask.efude");
+        let mut document = Document::new(TILE_SIZE + 1, 1);
+        let mut mask = efude_canvas::TilePixels::new(document.width, 1);
+        for (tile_x, outside_byte) in [(0, (TILE_SIZE * 4) as usize), (1, 4)] {
+            let mut tile = [11, 11, 11, 255].repeat((TILE_SIZE * TILE_SIZE) as usize);
+            // Both stored tiles are nonuniform, but the rows/columns written
+            // for this canvas crop are uniform and shared by the reader.
+            tile[outside_byte] = 99;
+            mask.insert_shared_tile(tile_x, 0, std::sync::Arc::new(tile));
+        }
+        document.layers[0].mask = Some(mask);
+        let limits = EfudeLimits {
+            decoded_tile_memory: 0,
+            ..EFUDE_LIMITS
+        };
+        save_with_limits(&path, &document, limits).unwrap();
+        let loaded = load_with_limits(&path, limits).unwrap();
+        let mask = loaded.layers[0].mask.as_ref().unwrap();
+        assert_eq!(mask.pixel(0, 0), [11, 11, 11, 255]);
+        assert_eq!(mask.pixel(TILE_SIZE, 0), [11, 11, 11, 255]);
+        let tiles = mask.tiles().map(|(_, tile)| tile).collect::<Vec<_>>();
+        assert_eq!(tiles.len(), 2);
+        assert!(std::ptr::eq(tiles[0], tiles[1]));
+        assert_eq!(
+            ZipArchive::new(File::open(&path).unwrap()).unwrap().len(),
+            7
+        );
+    }
+
+    #[test]
     fn efude_round_trip_preserves_canvas_and_pixels() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("round-trip.efude");
@@ -2204,6 +2976,351 @@ mod tests {
         export_psd(&path, &document).unwrap();
         let loaded = import_psd(&path).unwrap();
         assert_eq!(loaded.layers[0].name, "線画 レイヤー1");
+    }
+
+    fn cmyk_psd_fixture(compression: u16, depth: u16, include_layers: bool) -> Vec<u8> {
+        // Photoshop stores CMYK channels inverted; alpha remains uninverted.
+        // Four pixels: white, black, red, and red with half opacity.
+        let planes = [
+            [255u8, 255, 255, 255],
+            [255, 255, 0, 0],
+            [255, 255, 0, 0],
+            [255, 0, 255, 255],
+            [255, 255, 255, 128],
+        ];
+        let rows: Vec<Vec<u8>> = planes
+            .iter()
+            .map(|plane| {
+                let raw = if depth == 8 {
+                    plane.to_vec()
+                } else {
+                    plane
+                        .iter()
+                        .flat_map(|value| (u16::from(*value) * 257).to_be_bytes())
+                        .collect()
+                };
+                if compression == 1 {
+                    let mut encoded = vec![(raw.len() - 1) as u8];
+                    encoded.extend_from_slice(&raw);
+                    encoded
+                } else {
+                    raw
+                }
+            })
+            .collect();
+        let mut layer_section = Vec::new();
+        if include_layers {
+            let mut record = Vec::new();
+            for bound in [0i32, 0, 1, 4] {
+                record.extend_from_slice(&bound.to_be_bytes());
+            }
+            record.extend_from_slice(&5u16.to_be_bytes());
+            let mut data = Vec::new();
+            for (channel_id, row) in [0i16, 1, 2, 3, -1].into_iter().zip(&rows) {
+                record.extend_from_slice(&channel_id.to_be_bytes());
+                record.extend_from_slice(
+                    &(2u32 + u32::from(compression == 1) * 2 + row.len() as u32).to_be_bytes(),
+                );
+                data.extend_from_slice(&compression.to_be_bytes());
+                if compression == 1 {
+                    data.extend_from_slice(&(row.len() as u16).to_be_bytes());
+                }
+                data.extend_from_slice(row);
+            }
+            record.extend_from_slice(b"8BIMnorm");
+            record.extend_from_slice(&[255, 0, 0, 0]);
+            let mut extra = vec![0; 8];
+            extra.extend_from_slice(&[3, b'i', b'n', b'k']);
+            record.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+            record.extend_from_slice(&extra);
+            let mut info = 1u16.to_be_bytes().to_vec();
+            info.extend_from_slice(&record);
+            info.extend_from_slice(&data);
+            if !info.len().is_multiple_of(2) {
+                info.push(0);
+            }
+            layer_section.extend_from_slice(&(info.len() as u32).to_be_bytes());
+            layer_section.extend_from_slice(&info);
+            layer_section.extend_from_slice(&0u32.to_be_bytes());
+        }
+        let mut file = b"8BPS".to_vec();
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&[0; 6]);
+        file.extend_from_slice(&5u16.to_be_bytes());
+        file.extend_from_slice(&1u32.to_be_bytes());
+        file.extend_from_slice(&4u32.to_be_bytes());
+        file.extend_from_slice(&depth.to_be_bytes());
+        file.extend_from_slice(&4u16.to_be_bytes());
+        file.extend_from_slice(&[0; 8]); // no color-mode data or image resources
+        file.extend_from_slice(&(layer_section.len() as u32).to_be_bytes());
+        file.extend_from_slice(&layer_section);
+        file.extend_from_slice(&compression.to_be_bytes());
+        if compression == 1 {
+            for row in &rows {
+                file.extend_from_slice(&(row.len() as u16).to_be_bytes());
+            }
+        }
+        for row in rows {
+            file.extend_from_slice(&row);
+        }
+        file
+    }
+
+    #[test]
+    fn psd_cmyk_import_decodes_inverted_color_channels_without_inverting_alpha() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cmyk.psd");
+        for compression in [0, 1] {
+            for depth in [8, 16] {
+                for include_layers in [false, true] {
+                    fs::write(&path, cmyk_psd_fixture(compression, depth, include_layers)).unwrap();
+                    let report = import_psd_report(&path).unwrap();
+                    let pixels = &report.document.layers[0].pixels;
+                    for (x, expected) in [
+                        [255, 255, 255, 255],
+                        [0, 0, 0, 255],
+                        [255, 0, 0, 255],
+                        [255, 0, 0, 128],
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        assert_eq!(
+                            pixels.pixel(x as u32, 0),
+                            expected,
+                            "compression={compression}, depth={depth}, layers={include_layers}"
+                        );
+                    }
+                    if include_layers {
+                        assert_eq!(report.document.layers[0].name, "ink");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn psd_layer_parser_rejects_lengths_outside_their_sections() {
+        let file = cmyk_psd_fixture(0, 8, true);
+        let section_len = u32::from_be_bytes(file[34..38].try_into().unwrap()) as usize;
+        let section = &file[38..38 + section_len];
+        // The final raw channel is six bytes. Advertising two more used to
+        // seek past the layer-info boundary and still return editable layers.
+        let mut bad_channel = section.to_vec();
+        bad_channel[50..54].copy_from_slice(&8u32.to_be_bytes());
+        assert!(parse_psd_layers(&bad_channel, 4, 1, 4, 8).is_err());
+
+        // A Unicode block has only its four-byte character count, but claims
+        // ten bytes. It must be rejected before reserving or reading its units.
+        let mut bad_name = section.to_vec();
+        let mut block = b"8BIMluni".to_vec();
+        block.extend_from_slice(&10u32.to_be_bytes());
+        block.extend_from_slice(&0u32.to_be_bytes());
+        bad_name.splice(82..82, block);
+        let info_len = u32::from_be_bytes(section[..4].try_into().unwrap());
+        bad_name[..4].copy_from_slice(&(info_len + 16).to_be_bytes());
+        bad_name[66..70].copy_from_slice(&28u32.to_be_bytes());
+        assert!(parse_psd_layers(&bad_name, 4, 1, 4, 8).is_err());
+
+        // The block fits, but its declared UTF-16 character is missing.
+        bad_name[90..94].copy_from_slice(&4u32.to_be_bytes());
+        bad_name[94..98].copy_from_slice(&1u32.to_be_bytes());
+        assert!(parse_psd_layers(&bad_name, 4, 1, 4, 8).is_err());
+    }
+
+    fn psd_masked_layer_fixture(mask_flags: u8, mask_default: u8, mask_value: u8) -> Vec<u8> {
+        let mut record = Vec::new();
+        for bound in [1i32, 1, 2, 2] {
+            record.extend_from_slice(&bound.to_be_bytes());
+        }
+        record.extend_from_slice(&5u16.to_be_bytes());
+        let mut data = Vec::new();
+        for (channel_id, value) in [0i16, 1, 2, -1, -2]
+            .into_iter()
+            .zip([200u8, 40, 60, 255, mask_value])
+        {
+            record.extend_from_slice(&channel_id.to_be_bytes());
+            record.extend_from_slice(&3u32.to_be_bytes());
+            data.extend_from_slice(&0u16.to_be_bytes());
+            data.push(value);
+        }
+        record.extend_from_slice(b"8BIMnorm");
+        record.extend_from_slice(&[255, 0, 0, 0]);
+        let mut extra = 20u32.to_be_bytes().to_vec();
+        for bound in if mask_flags & 1 != 0 {
+            [0i32, 0, 1, 1]
+        } else {
+            [1i32, 1, 2, 2]
+        } {
+            extra.extend_from_slice(&bound.to_be_bytes());
+        }
+        extra.extend_from_slice(&[mask_default, mask_flags, 0, 0]);
+        extra.extend_from_slice(&0u32.to_be_bytes());
+        extra.extend_from_slice(&[3, b'i', b'n', b'k']);
+        record.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+        record.extend_from_slice(&extra);
+        let mut info = 1u16.to_be_bytes().to_vec();
+        info.extend_from_slice(&record);
+        info.extend_from_slice(&data);
+        if !info.len().is_multiple_of(2) {
+            info.push(0);
+        }
+        let mut section = (info.len() as u32).to_be_bytes().to_vec();
+        section.extend_from_slice(&info);
+        section.extend_from_slice(&0u32.to_be_bytes());
+        section
+    }
+
+    #[test]
+    fn psd_import_respects_disabled_layer_masks() {
+        for flags in [2, 3] {
+            let (layers, unsupported, _, _) =
+                parse_psd_layers(&psd_masked_layer_fixture(flags, 255, 0), 3, 3, 3, 8).unwrap();
+            assert!(!unsupported);
+            let layers = layers.unwrap();
+            assert!(layers[0].mask.is_none(), "disabled mask applied: {flags}");
+            assert_eq!(layers[0].pixels.pixel(1, 1), [200, 40, 60, 255]);
+        }
+    }
+
+    #[test]
+    fn psd_import_offsets_layer_relative_masks() {
+        for flags in [0, 1] {
+            let (layers, unsupported, _, _) =
+                parse_psd_layers(&psd_masked_layer_fixture(flags, 255, 0), 3, 3, 3, 8).unwrap();
+            assert!(!unsupported);
+            let layers = layers.unwrap();
+            let mask = layers[0].mask.as_ref().unwrap();
+            assert_eq!(mask.pixel(1, 1)[0], 0, "mask coordinate mode: {flags}");
+            assert_eq!(mask.pixel(0, 0)[0], 255, "mask coordinate mode: {flags}");
+        }
+    }
+
+    #[test]
+    fn psd_mask_default_tiles_share_storage_until_written() {
+        let section = psd_masked_layer_fixture(0, 0, 255);
+        let (layers, unsupported, _, _) = parse_psd_layers(&section, 768, 512, 3, 8).unwrap();
+        assert!(!unsupported);
+        let mut layers = layers.unwrap();
+        let mask = layers[0].mask.as_mut().unwrap();
+        assert_eq!(mask.pixel(1, 1), [255; 4]);
+        assert_eq!(mask.pixel(700, 400), [0; 4]);
+        assert_eq!(mask.tile_keys().len(), 6);
+        let unique_buffers = mask
+            .tiles()
+            .map(|(_, data)| data.as_ptr())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            unique_buffers <= 2,
+            "one default buffer plus one edited tile expected; found {unique_buffers}"
+        );
+        let original = mask.clone();
+        mask.set_pixel(300, 300, [128; 4]);
+        assert_eq!(mask.pixel(300, 300), [128; 4]);
+        assert_eq!(original.pixel(300, 300), [0; 4]);
+        assert_eq!(mask.pixel(700, 400), [0; 4]);
+        assert_eq!(mask.pixel(1, 1), [255; 4]);
+    }
+
+    fn psd_rgba_layer_fixture(bounds: [i32; 4]) -> Vec<u8> {
+        let width = (bounds[3] - bounds[1]) as usize;
+        let height = (bounds[2] - bounds[0]) as usize;
+        let samples = width * height;
+        let mut record = Vec::new();
+        for bound in bounds {
+            record.extend_from_slice(&bound.to_be_bytes());
+        }
+        record.extend_from_slice(&4u16.to_be_bytes());
+        let mut data = Vec::new();
+        for (id, value) in [0i16, 1, 2, -1].into_iter().zip([200u8, 40, 60, 255]) {
+            record.extend_from_slice(&id.to_be_bytes());
+            record.extend_from_slice(&(2u32 + samples as u32).to_be_bytes());
+            data.extend_from_slice(&0u16.to_be_bytes());
+            data.extend(std::iter::repeat_n(value, samples));
+        }
+        record.extend_from_slice(b"8BIMnorm");
+        record.extend_from_slice(&[255, 0, 0, 0]);
+        record.extend_from_slice(&12u32.to_be_bytes());
+        record.extend_from_slice(&[0; 12]);
+        let mut info = 1u16.to_be_bytes().to_vec();
+        info.extend_from_slice(&record);
+        info.extend_from_slice(&data);
+        let mut section = (info.len() as u32).to_be_bytes().to_vec();
+        section.extend_from_slice(&info);
+        section.extend_from_slice(&0u32.to_be_bytes());
+        section
+    }
+
+    #[test]
+    fn psd_tile_budget_rejects_padding_and_clips_to_canvas() {
+        let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
+        let section = psd_rgba_layer_fixture([0, 0, 1, 768]);
+        assert!(parse_psd_layers_with_tile_limit(&section, 768, 1, 3, 8, tile_bytes * 2).is_err());
+        let (layers, _, _, _) =
+            parse_psd_layers_with_tile_limit(&section, 768, 1, 3, 8, tile_bytes * 3).unwrap();
+        let layers = layers.unwrap();
+        assert_eq!(layers[0].pixels.tile_keys().len(), 3);
+        assert_eq!(layers[0].pixels.pixel(767, 0), [200, 40, 60, 255]);
+
+        let partial = psd_rgba_layer_fixture([0, -256, 1, 512]);
+        let (layers, _, _, _) =
+            parse_psd_layers_with_tile_limit(&partial, 768, 1, 3, 8, tile_bytes * 2).unwrap();
+        let layers = layers.unwrap();
+        assert_eq!(layers[0].pixels.tile_keys().len(), 2);
+        assert_eq!(layers[0].pixels.pixel(0, 0), [200, 40, 60, 255]);
+        assert_eq!(layers[0].pixels.pixel(700, 0), [0; 4]);
+
+        let outside = psd_rgba_layer_fixture([0, 768, 1, 1536]);
+        let (layers, _, _, _) =
+            parse_psd_layers_with_tile_limit(&outside, 768, 1, 3, 8, 0).unwrap();
+        assert!(!layers.unwrap()[0].pixels.has_allocated_tiles());
+    }
+
+    #[test]
+    fn psd_tile_budget_counts_shared_defaults_and_skips_disabled_masks() {
+        let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
+        let single = psd_masked_layer_fixture(0, 0, 255);
+        let mut info = 2u16.to_be_bytes().to_vec();
+        // Two identical records and then both raw channel payloads.
+        for _ in 0..2 {
+            info.extend_from_slice(&single[6..102]);
+        }
+        for _ in 0..2 {
+            info.extend_from_slice(&single[102..117]);
+        }
+        let mut section = (info.len() as u32).to_be_bytes().to_vec();
+        section.extend_from_slice(&info);
+        section.extend_from_slice(&0u32.to_be_bytes());
+        assert!(
+            parse_psd_layers_with_tile_limit(&section, 768, 512, 3, 8, tile_bytes * 5).is_err()
+        );
+        let (layers, _, _, _) =
+            parse_psd_layers_with_tile_limit(&section, 768, 512, 3, 8, tile_bytes * 6).unwrap();
+        for layer in layers.unwrap() {
+            let mask = layer.mask.unwrap();
+            assert_eq!(mask.pixel(1, 1), [255; 4]);
+            assert_eq!(mask.pixel(700, 400), [0; 4]);
+        }
+
+        let disabled = psd_masked_layer_fixture(2, 0, 255);
+        let (layers, _, _, _) =
+            parse_psd_layers_with_tile_limit(&disabled, 768, 512, 3, 8, tile_bytes).unwrap();
+        assert!(layers.unwrap()[0].mask.is_none());
+        let white = psd_masked_layer_fixture(0, 255, 0);
+        assert!(parse_psd_layers_with_tile_limit(&white, 768, 512, 3, 8, tile_bytes).is_err());
+        assert!(parse_psd_layers_with_tile_limit(&white, 768, 512, 3, 8, tile_bytes * 2).is_ok());
+    }
+
+    #[test]
+    fn psd_tile_budget_keeps_cmyk_scratch_separate() {
+        let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
+        let file = cmyk_psd_fixture(0, 8, true);
+        let len = u32::from_be_bytes(file[34..38].try_into().unwrap()) as usize;
+        let section = &file[38..38 + len];
+        let (layers, _, _, _) =
+            parse_psd_layers_with_tile_limit(section, 4, 1, 4, 8, tile_bytes).unwrap();
+        assert_eq!(layers.unwrap()[0].pixels.pixel(2, 0), [255, 0, 0, 255]);
     }
 
     #[test]

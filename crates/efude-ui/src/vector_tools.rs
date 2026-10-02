@@ -120,7 +120,9 @@ impl EfudeApp {
                 self.view_scale,
             );
             self.raster.last_dab = Some(p);
-            let width = (self.size * dynamics.size).max(0.1);
+            let width = (f64::from(self.size) * f64::from(dynamics.size))
+                .max(0.1)
+                .min(f64::from(f32::MAX)) as f32;
             let mirrored = self.symmetric_points(p);
             let Some(strokes) = self.doc.layers[index].vector.as_mut() else {
                 return;
@@ -402,8 +404,11 @@ impl EfudeApp {
     /// Adds an empty vector layer above the selected layer.
     pub(crate) fn add_vector_layer(&mut self) {
         self.finish_pending_canvas_gesture();
+        if !self.can_add_layers(1) {
+            return;
+        }
         let english = self.language_english;
-        let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+        let id = self.next_layer_id();
         let mut layer = efude_canvas::Layer::new(
             id,
             if english {
@@ -421,6 +426,7 @@ impl EfudeApp {
     /// Turns the selected vector layer into a raster layer (its drawing
     /// stays). Undoable.
     pub(crate) fn rasterize_layer(&mut self, index: usize) {
+        self.finish_pending_canvas_gesture();
         let Some(layer) = self.doc.layers.get_mut(index) else {
             return;
         };
@@ -441,7 +447,7 @@ fn segment_rect(a: &VectorPoint, b: &VectorPoint) -> Option<PixelRect> {
     Some([
         (a.x.min(b.x) - r).floor() as i32,
         (a.y.min(b.y) - r).floor() as i32,
-        (a.x.max(b.x) + r).ceil() as i32 + 1,
-        (a.y.max(b.y) + r).ceil() as i32 + 1,
+        ((a.x.max(b.x) + r).ceil() as i32).saturating_add(1),
+        ((a.y.max(b.y) + r).ceil() as i32).saturating_add(1),
     ])
 }

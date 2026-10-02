@@ -1000,6 +1000,7 @@ impl EfudeApp {
         }
         self.commit_pending_guide_edit();
         let selected_before = self.selected_layer;
+        let editing_mask_before = self.editing_mask;
         self.history.begin();
         self.macro_replaying = true;
         self.selected_layer = self
@@ -1073,6 +1074,7 @@ impl EfudeApp {
         } else {
             self.history.cancel(&mut self.doc);
             self.selected_layer = selected_before;
+            self.editing_mask = editing_mask_before;
         }
         self.canvas_texture_dirty = true;
         self.navigator_texture_dirty = true;
@@ -1085,9 +1087,7 @@ impl EfudeApp {
         }
         match step {
             Step::NewRaster => {
-                if self.doc.layers.len() >= 2000
-                    || self.doc.layers.iter().any(|layer| layer.id == u64::MAX)
-                {
+                if self.doc.layers.len() >= 2000 {
                     return Err("レイヤー数またはIDの上限です".into());
                 }
                 self.add_raster_layer();
@@ -1095,13 +1095,7 @@ impl EfudeApp {
             Step::DuplicateActive => {
                 let id = self.doc.layers[self.selected_layer].id;
                 let copied = efude_canvas::subtree_ids(&self.doc.layers, id).len();
-                if self.doc.layers.len() + copied > 2000
-                    || self
-                        .doc
-                        .layers
-                        .iter()
-                        .any(|layer| layer.id > u64::MAX - copied as u64)
-                {
+                if self.doc.layers.len() + copied > 2000 {
                     return Err("レイヤー数またはIDの上限です".into());
                 }
                 self.duplicate_layer_subtree();
@@ -1159,6 +1153,37 @@ mod tests {
     }
 
     #[test]
+    fn macro_creates_layers_after_loading_the_maximum_id() {
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].id = u64::MAX;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("macro-ids.efude");
+        efude_io::save(&path, &doc).unwrap();
+        let mut app = EfudeApp::default();
+        app.doc = efude_io::load(&path).unwrap();
+        app.selected_layer = 0;
+        let definition = Definition {
+            version: 1,
+            name: "Create layers".into(),
+            steps: vec![legacy(Step::NewRaster), legacy(Step::DuplicateActive)],
+        };
+        app.run_macro(&definition).unwrap();
+        assert_eq!(
+            app.doc
+                .layers
+                .iter()
+                .map(|layer| layer.id)
+                .collect::<Vec<_>>(),
+            vec![u64::MAX, 1, 2]
+        );
+        app.undo();
+        assert_eq!(app.doc.layers.len(), 1);
+        assert_eq!(app.doc.layers[0].id, u64::MAX);
+        app.redo();
+        assert_eq!(app.doc.layers.len(), 3);
+    }
+
+    #[test]
     fn macro_replays_on_another_document_as_one_undo_step() {
         let mut app = EfudeApp::default();
         app.doc = Document::new(32, 32);
@@ -1186,6 +1211,8 @@ mod tests {
         app.doc.layers = (1..=1999)
             .map(|id| efude_canvas::Layer::new(id, "L", 8, 8))
             .collect();
+        app.doc.layers[0].mask = Some(efude_canvas::TilePixels::new(8, 8));
+        app.editing_mask = true;
         let state = app.history.state_token();
         let definition = Definition {
             version: 1,
@@ -1196,6 +1223,7 @@ mod tests {
         assert_eq!(app.doc.layers.len(), 1999);
         assert_eq!(app.history.state_token(), state);
         assert!(!app.history.can_undo());
+        assert!(app.editing_mask, "failed macro changed the painting target");
     }
 
     #[test]

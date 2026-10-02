@@ -90,6 +90,8 @@ pub struct StrokeBuilder {
     next_dab_at: f32,
     /// Emitted dabs with their arc length, not yet committed.
     held: Vec<(f32, InkPoint)>,
+    /// Last emitted dab, including one already released from `held`.
+    last_dab: Option<(f32, InkPoint)>,
     /// Sanitised stroke clock (see `stroke_time`).
     clock: u64,
     last_input_time: Option<u64>,
@@ -101,6 +103,14 @@ struct Walk {
     walked: f32,
     next_dab_at: f32,
     held: Vec<(f32, InkPoint)>,
+    last_dab: Option<(f32, InkPoint)>,
+}
+
+impl Walk {
+    fn push_dab(&mut self, at: f32, dab: InkPoint) {
+        self.held.push((at, dab));
+        self.last_dab = Some((at, dab));
+    }
 }
 
 const SUBDIVISIONS: usize = 16;
@@ -122,6 +132,7 @@ impl StrokeBuilder {
             walked: 0.0,
             next_dab_at: 0.0,
             held: Vec::new(),
+            last_dab: None,
             clock: 0,
             last_input_time: None,
             finished: false,
@@ -183,17 +194,49 @@ impl StrokeBuilder {
             self.emit_segment(self.next_segment, false);
             self.next_segment += 1;
         }
-        if self.held.is_empty() && self.walked == 0.0 {
+        if self.last_dab.is_none() {
             // A tap: one dab at the pen position.
             let mut tap = self.smoothed[0];
             tap.taper *= self.start_taper(0.0);
             return vec![tap];
         }
+        let mut walk = Walk {
+            walked: self.walked,
+            next_dab_at: self.next_dab_at,
+            held: std::mem::take(&mut self.held),
+            last_dab: self.last_dab,
+        };
+        self.finish_contact(endpoint, &mut walk);
+        self.last_dab = walk.last_dab;
         let total = self.walked;
-        let held = std::mem::take(&mut self.held);
-        held.into_iter()
+        walk.held
+            .into_iter()
             .map(|(at, dab)| self.with_length_tapers(at, dab, total))
             .collect()
+    }
+
+    /// Spacing need not land on the final contact. Complete that same input
+    /// path once, without duplicating a tap or changing committed dabs.
+    fn finish_contact(&self, endpoint: InkPoint, walk: &mut Walk) {
+        if let Some((at, previous)) = walk.last_dab {
+            if previous.position == endpoint.position {
+                return;
+            }
+            // A scheduled dab can already reach the endpoint to floating
+            // point precision. Move only that uncommitted dab; stamping an
+            // almost identical second dab would build up wet paint.
+            if at > 0.0 && roundoff_same_position(previous.position, endpoint.position) {
+                if let Some((held_at, held_dab)) = walk.held.last_mut() {
+                    held_dab.position = endpoint.position;
+                    *held_at = walk.walked;
+                    walk.last_dab = Some((*held_at, *held_dab));
+                }
+                return;
+            }
+        }
+        let mut dab = endpoint;
+        dab.taper *= self.start_taper(walk.walked);
+        walk.push_dab(walk.walked, dab);
     }
 
     /// Applies the tapers that depend on the stroke's total length: the
@@ -304,11 +347,13 @@ impl StrokeBuilder {
             walked: self.walked,
             next_dab_at: self.next_dab_at,
             held: std::mem::take(&mut self.held),
+            last_dab: self.last_dab,
         };
         self.walk_segment(i, is_last, &mut walk);
         self.walked = walk.walked;
         self.next_dab_at = walk.next_dab_at;
         self.held = walk.held;
+        self.last_dab = walk.last_dab;
     }
 
     fn walk_segment(&self, i: usize, is_last: bool, walk: &mut Walk) {
@@ -318,7 +363,7 @@ impl StrokeBuilder {
             // First dab sits exactly on the first point.
             let mut first = a;
             first.taper *= self.start_taper(0.0);
-            walk.held.push((0.0, first));
+            walk.push_dab(0.0, first);
             walk.next_dab_at = spacing;
         }
         let mut previous = a.position;
@@ -333,7 +378,7 @@ impl StrokeBuilder {
                 let mut dab = interpolate(a, b, local_t);
                 dab.position = previous + (position - previous) * f;
                 dab.taper *= self.start_taper(walk.next_dab_at);
-                walk.held.push((walk.next_dab_at, dab));
+                walk.push_dab(walk.next_dab_at, dab);
                 walk.next_dab_at += spacing;
             }
             walk.walked += piece;
@@ -350,26 +395,29 @@ impl StrokeBuilder {
     /// Held dabs plus a preview of the segment that is still waiting for its
     /// look-ahead point. Recomputed on every update; never committed as-is.
     fn provisional_tail(&self) -> Vec<InkPoint> {
-        let mut pending = self.held.clone();
-        let mut length = self.walked;
+        let mut walk = Walk {
+            walked: self.walked,
+            next_dab_at: self.next_dab_at,
+            held: self.held.clone(),
+            last_dab: self.last_dab,
+        };
         if self.next_segment + 1 < self.smoothed.len() {
             // Preview the waiting segment without its look-ahead point.
-            let mut walk = Walk {
-                walked: self.walked,
-                next_dab_at: self.next_dab_at,
-                held: Vec::new(),
-            };
             self.walk_segment(self.next_segment, true, &mut walk);
-            length = walk.walked;
-            pending.extend(walk.held);
+        }
+        if walk.last_dab.is_some()
+            && let Some(endpoint) = self.smoothed.last()
+        {
+            self.finish_contact(*endpoint, &mut walk);
         }
         // Show the tail as it would look if the pen lifted now.
-        let mut tail: Vec<InkPoint> = pending
+        let mut tail: Vec<InkPoint> = walk
+            .held
             .into_iter()
-            .map(|(at, dab)| self.with_length_tapers(at, dab, length))
+            .map(|(at, dab)| self.with_length_tapers(at, dab, walk.walked))
             .collect();
         if tail.is_empty()
-            && self.walked == 0.0
+            && walk.last_dab.is_none()
             && let Some(first) = self.smoothed.first()
         {
             let mut first = *first;
@@ -378,6 +426,26 @@ impl StrokeBuilder {
         }
         tail
     }
+}
+
+/// Euclidean distance in units of each coordinate's floating point step.
+/// This scales with coordinate precision rather than a document-pixel
+/// tolerance, so short motion near zero is not mistaken for roundoff.
+fn roundoff_same_position(a: Vec2, b: Vec2) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let ulp = |coordinate: f32| {
+        let magnitude = coordinate.abs();
+        if magnitude == f32::MAX {
+            magnitude - magnitude.next_down()
+        } else {
+            magnitude.next_up() - magnitude
+        }
+    };
+    let magnitude = a.abs().max(b.abs());
+    let steps = (a - b).abs() / Vec2::new(ulp(magnitude.x), ulp(magnitude.y));
+    steps.x.hypot(steps.y) <= 2.0
 }
 
 fn catmull_rom(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
@@ -633,5 +701,185 @@ mod tests {
         assert!(update.committed.is_empty());
         assert_eq!(update.provisional.len(), 1);
         assert_eq!(builder.finish().len(), 1);
+    }
+
+    fn contact_params() -> StrokeParams {
+        StrokeParams {
+            stabilization_ms: 16.0,
+            spacing: 0.25,
+            taper_min: 0.15,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn finish_reaches_the_raw_contact_after_spacing_roundoff() {
+        for points in [
+            [
+                InkPoint::new(50.0, 10.0, 1.0, 65),
+                InkPoint::new(50.0, 70.0, 1.0, 66),
+            ],
+            [
+                InkPoint::new(50.0, 9.999985, 1.0, 65),
+                InkPoint::new(50.00003, 69.99999, 1.0, 66),
+            ],
+            [
+                InkPoint::new(-50.0, -10.0, 1.0, 65),
+                InkPoint::new(-50.0, -70.0, 1.0, 66),
+            ],
+        ] {
+            let dabs = run(&points, contact_params());
+            assert_eq!(dabs.last().unwrap().position, points[1].position);
+            assert_eq!(dabs.len(), 241, "do not stamp a rounded endpoint twice");
+        }
+    }
+
+    #[test]
+    fn final_contact_gets_pixel_and_fraction_end_tapers() {
+        let points = [
+            InkPoint::new(50.0, 10.0, 0.4, 65),
+            InkPoint::new(50.0, 70.0, 0.8, 66),
+        ];
+        for p in [
+            StrokeParams {
+                taper_start_px: 2.0,
+                taper_end_px: 2.0,
+                ..contact_params()
+            },
+            StrokeParams {
+                taper_start_fraction: 0.2,
+                taper_end_fraction: 0.2,
+                ..contact_params()
+            },
+        ] {
+            let dabs = run(&points, p);
+            let end = dabs.last().unwrap();
+            assert_eq!(end.position, points[1].position);
+            assert_eq!(end.pressure, points[1].pressure);
+            assert_eq!(end.taper, p.taper_min);
+            assert_eq!(dabs.first().unwrap().taper, p.taper_min);
+        }
+    }
+
+    #[test]
+    fn stationary_samples_do_not_repeat_a_released_tap() {
+        for n in 1..=5 {
+            let mut points = vec![InkPoint::new(5.0, 5.0, 0.3, 0); n];
+            for point in points.iter_mut().skip(1) {
+                point.pressure = 0.9;
+                point.tilt = Vec2::new(0.2, 0.8);
+                point.rotation = 1.2;
+            }
+            let dabs = run(
+                &points,
+                StrokeParams {
+                    spacing: 0.25,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(dabs.len(), 1, "{n} stationary samples");
+            assert_eq!(dabs[0].pressure, points[0].pressure);
+            assert_eq!(dabs[0].tilt, points[0].tilt);
+            assert_eq!(dabs[0].rotation, points[0].rotation);
+        }
+    }
+
+    #[test]
+    fn short_motion_keeps_the_first_and_last_contact() {
+        for (x, delta) in [(5.0, 0.9), (-5.0, -0.9), (0.0, 1e-7), (-1e-7, 1e-7)] {
+            let points = [
+                InkPoint::new(x, 0.0, 0.5, 0),
+                InkPoint::new(x + delta, 0.0, 0.5, 4),
+            ];
+            let dabs = run(&points, StrokeParams::default());
+            assert_eq!(dabs.len(), 2);
+            assert_eq!(dabs[0].position, points[0].position);
+            assert_eq!(dabs[1].position, points[1].position);
+        }
+    }
+
+    #[test]
+    fn a_committed_endpoint_is_not_stamped_or_promoted_again() {
+        let points = [
+            InkPoint::new(5.0, 5.0, 0.5, 0),
+            InkPoint::new(6.0, 5.0, 0.5, 4),
+            InkPoint::new(6.0, 5.0, 0.9, 8),
+            InkPoint::new(6.0, 5.0, 0.8, 12),
+        ];
+        let mut builder = StrokeBuilder::new(StrokeParams::default());
+        let mut committed = Vec::new();
+        for point in points {
+            committed.extend(builder.push(point).committed);
+        }
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[1].position, points[3].position);
+        assert_eq!(committed[1].pressure, points[1].pressure);
+        assert!(builder.finish().is_empty());
+        assert!(builder.finish().is_empty());
+        assert!(
+            StrokeBuilder::new(StrokeParams::default())
+                .finish()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn preview_and_finish_share_the_short_final_contact() {
+        let mut builder = StrokeBuilder::new(StrokeParams::default());
+        builder.push(InkPoint::new(5.0, 5.0, 0.5, 0));
+        let update = builder.push(InkPoint::new(5.9, 5.0, 0.8, 4));
+        assert!(update.committed.is_empty());
+        assert_eq!(update.provisional.len(), 2);
+        assert_eq!(update.provisional, builder.finish());
+    }
+
+    #[test]
+    fn endpoint_roundoff_uses_both_axes_and_coordinate_precision() {
+        for p in [Vec2::new(50.0, 70.0), Vec2::new(-50.0, -70.0)] {
+            assert!(roundoff_same_position(
+                p,
+                Vec2::new(p.x.next_up(), p.y.next_down())
+            ));
+            assert!(!roundoff_same_position(p, p + Vec2::new(0.001, 0.0)));
+            assert!(!roundoff_same_position(p, p + Vec2::new(0.0, 0.001)));
+            let diagonal = Vec2::new(p.x.next_up().next_up(), p.y.next_up().next_up());
+            assert!(
+                !roundoff_same_position(p, diagonal),
+                "two steps on both axes exceed the distance bound"
+            );
+        }
+        assert!(roundoff_same_position(Vec2::ZERO, Vec2::ZERO));
+        assert!(!roundoff_same_position(Vec2::ZERO, Vec2::new(1e-7, 0.0)));
+        assert!(!roundoff_same_position(Vec2::new(-1e-7, 0.0), Vec2::ZERO));
+    }
+
+    #[test]
+    fn rounded_contact_only_moves_the_uncommitted_position() {
+        let builder = StrokeBuilder::new(StrokeParams::default());
+        let previous = InkPoint::new(50.0, 70.0_f32.next_down(), 0.3, 10);
+        let mut endpoint = InkPoint::new(50.0, 70.0, 0.9, 14);
+        endpoint.tilt = Vec2::new(0.4, 0.8);
+        endpoint.rotation = 1.2;
+        let mut walk = Walk {
+            walked: 60.0,
+            next_dab_at: 60.25,
+            held: vec![(60.0, previous)],
+            last_dab: Some((60.0, previous)),
+        };
+        builder.finish_contact(endpoint, &mut walk);
+        assert_eq!(walk.held.len(), 1);
+        assert_eq!(walk.held[0].1.position, endpoint.position);
+        assert_eq!(walk.held[0].1.pressure, previous.pressure);
+        assert_eq!(walk.held[0].1.tilt, previous.tilt);
+        assert_eq!(walk.held[0].1.rotation, previous.rotation);
+        walk.held.clear();
+        walk.last_dab = Some((60.0, previous));
+        builder.finish_contact(endpoint, &mut walk);
+        assert!(walk.held.is_empty());
+        assert_eq!(
+            walk.last_dab,
+            Some((60.0, previous)),
+            "a committed dab stays unchanged"
+        );
     }
 }

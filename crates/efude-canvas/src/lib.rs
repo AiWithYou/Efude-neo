@@ -368,14 +368,18 @@ fn blend_channel(mode: BlendMode, source: f32, destination: f32) -> f32 {
         BlendMode::Darken => s.min(d),
         BlendMode::Lighten => s.max(d),
         BlendMode::ColorDodge => {
-            if s >= 1. {
+            if d <= 0. {
+                0.
+            } else if s >= 1. {
                 1.
             } else {
                 (d / (1. - s)).min(1.)
             }
         }
         BlendMode::ColorBurn => {
-            if s <= 0. {
+            if d >= 1. {
+                1.
+            } else if s <= 0. {
                 0.
             } else {
                 1. - ((1. - d) / s).min(1.)
@@ -1279,6 +1283,12 @@ impl History {
         if before == after {
             return false;
         }
+        let last = self.pop_undo_entry();
+        if last.is_none() && self.can_undo() {
+            // An unreadable spill must not leave an unrecorded order change:
+            // the preceding Insert/Delete still relies on its original indices.
+            return false;
+        }
         reorder_by_ids(layers, &after);
         let entry = HistoryEntry::Order { before, after };
         Self::collect_history_changes(
@@ -1286,7 +1296,7 @@ impl History {
             &mut self.changed_tiles,
             &mut self.full_redraw_pending,
         );
-        if let Some(last) = self.undo.pop() {
+        if let Some(last) = last {
             let batch = match last {
                 HistoryEntry::Batch(mut entries) => {
                     entries.push(entry);
@@ -1294,8 +1304,7 @@ impl History {
                 }
                 other => HistoryEntry::Batch(vec![other, entry]),
             };
-            self.undo_bytes = self.undo_bytes.saturating_add(64);
-            self.undo.push(batch);
+            self.store_undo_entry(batch);
         }
         true
     }
@@ -3026,7 +3035,11 @@ pub fn translate_selection(
             pixel[..3].fill(0);
         }
         next.set_pixel(x, y, pixel);
-        if let Some(layer_mask) = &mut next_layer_mask {
+        // A feathered selection leaves paint at its source. Keep that paint
+        // under its original mask; clearing the mask would reveal it.
+        if coverage == 255
+            && let Some(layer_mask) = &mut next_layer_mask
+        {
             layer_mask.set_mask_pixel(x, y, [255; 4]);
         }
     }
@@ -3035,7 +3048,8 @@ pub fn translate_selection(
             continue;
         };
         let src_px = original.pixel(src as u32 % width, src as u32 / width);
-        let mut dst_px = next.pixel(dst as u32 % width, dst as u32 / width);
+        let destination_px = next.pixel(dst as u32 % width, dst as u32 / width);
+        let mut dst_px = destination_px;
         let source_alpha = src_px[3] as f32 / 255.0 * coverage as f32 / 255.0;
         let destination_alpha = dst_px[3] as f32 / 255.0;
         let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
@@ -3049,24 +3063,54 @@ pub fn translate_selection(
             }
             dst_px[3] = (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
         }
-        next.set_pixel(dst as u32 % width, dst as u32 / width, dst_px);
         next_mask[dst] = next_mask[dst].max(coverage);
         if let Some(layer_mask) = &mut next_layer_mask {
-            layer_mask.set_mask_pixel(
-                dst as u32 % width,
-                dst as u32 / width,
-                original_layer_mask
-                    .as_ref()
-                    .map(|source| {
-                        source.pixel_or_tile_default(
-                            src as u32 % width,
-                            src as u32 / width,
-                            [255; 4],
-                        )
-                    })
-                    .unwrap_or([255; 4]),
-            );
+            let source_mask = original_layer_mask
+                .as_ref()
+                .map(|source| {
+                    source.pixel_or_tile_default(src as u32 % width, src as u32 / width, [255; 4])
+                })
+                .unwrap_or([255; 4]);
+            let destination_mask =
+                layer_mask.pixel_or_tile_default(dst as u32 % width, dst as u32 / width, [255; 4]);
+            let output_mask = if source_mask[0] == 255 && destination_mask[0] == 255 {
+                // Preserve the existing unmasked paint and sparse-white mask
+                // result exactly.
+                source_mask
+            } else {
+                let visible_source_alpha = source_alpha * source_mask[0] as f32 / 255.0;
+                let visible_destination_alpha =
+                    destination_alpha * destination_mask[0] as f32 / 255.0;
+                let visible_output_alpha =
+                    visible_source_alpha + visible_destination_alpha * (1.0 - visible_source_alpha);
+                if visible_output_alpha > 0.0 {
+                    for channel in 0..3 {
+                        dst_px[channel] = ((src_px[channel] as f32 * visible_source_alpha
+                            + destination_px[channel] as f32
+                                * visible_destination_alpha
+                                * (1.0 - visible_source_alpha))
+                            / visible_output_alpha)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                }
+                // Keep raw alpha's existing encoding and distribute the
+                // visible alpha into its mask. Use the rounded raw alpha as
+                // denominator so small coverages do not become too opaque.
+                // One RGBA+mask cannot also keep a separate hidden color at
+                // a collision; the documented visible source-over wins.
+                let value = if dst_px[3] == 0 {
+                    source_mask[0]
+                } else {
+                    (visible_output_alpha * 255.0 * 255.0 / dst_px[3] as f32)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                [value; 4]
+            };
+            layer_mask.set_mask_pixel(dst as u32 % width, dst as u32 / width, output_mask);
         }
+        next.set_pixel(dst as u32 % width, dst as u32 / width, dst_px);
     }
     layer.pixels = next;
     layer.mask = next_layer_mask;
@@ -3158,6 +3202,9 @@ pub fn transform_selection(
             }
         }
     }
+    // Destinations are independent. Group their contributions while preserving
+    // the original source order, so compositing needs only one final rounding.
+    moves.sort_unstable_by_key(|&(src, dst, _)| (dst, src));
     let mut affected = std::collections::HashSet::new();
     for &(src, _) in &sources {
         affected.insert(src);
@@ -3178,7 +3225,6 @@ pub fn transform_selection(
     let mut next = original.clone();
     let mut next_layer_mask = original_mask.clone();
     let mut next_mask = selection.mask.clone();
-    let mut moved_mask = HashMap::<usize, (f32, f32)>::new();
     for &(src, coverage) in &sources {
         let (x, y) = (src as u32 % width, src as u32 / width);
         let mut pixel = original.pixel(x, y);
@@ -3195,51 +3241,88 @@ pub fn transform_selection(
                 .as_ref()
                 .map(|source| source.pixel_or_tile_default(x, y, [255; 4])[0])
                 .unwrap_or(255) as f32;
-            let cleared = old + (255.0 - old) * (coverage as f32 / 255.0);
+            // A partial cut leaves paint behind, so its existing mask must
+            // still hide that paint. Only a fully emptied source can be white.
+            let cleared = if coverage == 255 { 255.0 } else { old };
             next_layer_mask.set_mask_pixel(x, y, [cleared.round() as u8; 4]);
         }
     }
-    for (src, dst, coverage) in moves {
-        let src_px = original.pixel(src as u32 % width, src as u32 / width);
-        let mut dst_px = next.pixel(dst as u32 % width, dst as u32 / width);
-        let source_alpha = src_px[3] as f32 / 255.0 * coverage;
-        let destination_alpha = dst_px[3] as f32 / 255.0;
-        let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
-        if output_alpha > 0.0 {
-            for channel in 0..3 {
-                dst_px[channel] = ((src_px[channel] as f32 * source_alpha
-                    + dst_px[channel] as f32 * destination_alpha * (1.0 - source_alpha))
-                    / output_alpha)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-            }
-            dst_px[3] = (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        next.set_pixel(dst as u32 % width, dst as u32 / width, dst_px);
-        if selected {
-            next_mask[dst] = (next_mask[dst] as f32 + coverage * 255.0)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-        }
-        if next_layer_mask.is_some() {
-            let value = original_mask
+    let mut cursor = 0;
+    while cursor < moves.len() {
+        let dst = moves[cursor].1;
+        let (x, y) = (dst as u32 % width, dst as u32 / width);
+        let mut dst_px = next.pixel(x, y);
+        let base_alpha = f64::from(dst_px[3]) / 255.0;
+        let mut raw = [
+            f64::from(dst_px[0]) * base_alpha,
+            f64::from(dst_px[1]) * base_alpha,
+            f64::from(dst_px[2]) * base_alpha,
+            base_alpha,
+        ];
+        let base_mask = next_layer_mask
+            .as_ref()
+            .map(|mask| mask.pixel_or_tile_default(x, y, [255; 4])[0])
+            .unwrap_or(255);
+        let mut visible = raw.map(|value| value * (f64::from(base_mask) / 255.0));
+        let mut weighted_mask = 0.0;
+        let mut total_weight = 0.0;
+        while cursor < moves.len() && moves[cursor].1 == dst {
+            let (src, _, coverage) = moves[cursor];
+            let src_px = original.pixel(src as u32 % width, src as u32 / width);
+            let source_mask = original_mask
                 .as_ref()
                 .map(|source| {
                     source.pixel_or_tile_default(src as u32 % width, src as u32 / width, [255; 4])
-                        [0] as f32
+                        [0]
                 })
-                .unwrap_or(255.0);
-            let accumulated = moved_mask.entry(dst).or_default();
-            accumulated.0 += value * coverage;
-            accumulated.1 += coverage;
-        }
-    }
-    if let Some(mask) = &mut next_layer_mask {
-        for (pixel, (weighted_value, total_weight)) in moved_mask {
-            if total_weight > 0.0 {
-                let value = (weighted_value / total_weight).round().clamp(0.0, 255.0) as u8;
-                mask.set_mask_pixel(pixel as u32 % width, pixel as u32 / width, [value; 4]);
+                .unwrap_or(255);
+            let source_alpha = f64::from(src_px[3]) / 255.0 * f64::from(coverage);
+            let effective_alpha = source_alpha * (f64::from(source_mask) / 255.0);
+            for channel in 0..3 {
+                raw[channel] =
+                    f64::from(src_px[channel]) * source_alpha + raw[channel] * (1.0 - source_alpha);
+                visible[channel] = f64::from(src_px[channel]) * effective_alpha
+                    + visible[channel] * (1.0 - effective_alpha);
             }
+            raw[3] = source_alpha + raw[3] * (1.0 - source_alpha);
+            visible[3] = effective_alpha + visible[3] * (1.0 - effective_alpha);
+            if selected {
+                next_mask[dst] = (next_mask[dst] as f32 + coverage * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            weighted_mask += f64::from(source_mask) * f64::from(coverage);
+            total_weight += f64::from(coverage);
+            cursor += 1;
+        }
+
+        // Raw paint and a single mask cannot independently retain hidden RGB
+        // where it overlaps visible paint. Preserve the visible source-over
+        // result; fully hidden contributions can retain their raw color.
+        if raw[3] > 0.0 {
+            let color = if visible[3] > 0.0 { visible } else { raw };
+            for channel in 0..3 {
+                dst_px[channel] = (color[channel] / color[3]).round().clamp(0.0, 255.0) as u8;
+            }
+            dst_px[3] = (raw[3] * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        next.set_pixel(x, y, dst_px);
+        if let Some(mask) = &mut next_layer_mask {
+            // Effective alpha cannot exceed raw alpha. Use the encoded raw
+            // byte as the denominator, and keep white masks identical to an
+            // unmasked transform despite the final alpha rounding.
+            let value = if dst_px[3] > 0 && visible[3] == raw[3] {
+                255
+            } else if dst_px[3] > 0 {
+                (visible[3] * 255.0 * 255.0 / f64::from(dst_px[3]))
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            } else if total_weight > 0.0 {
+                (weighted_mask / total_weight).round().clamp(0.0, 255.0) as u8
+            } else {
+                base_mask
+            };
+            mask.set_mask_pixel(x, y, [value; 4]);
         }
     }
     layer.pixels = next;
@@ -3267,63 +3350,6 @@ pub fn mesh_warp(
     mesh_warp_grid(layer, selection, width, height, 2, 2, &grid, history);
 }
 
-fn bilinear_layer_pixel(pixels: &TilePixels, width: u32, height: u32, x: f32, y: f32) -> [u8; 4] {
-    let x0 = x.floor().clamp(0.0, width.saturating_sub(1) as f32) as u32;
-    let y0 = y.floor().clamp(0.0, height.saturating_sub(1) as f32) as u32;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-    let fx = (x - x.floor()).clamp(0.0, 1.0);
-    let fy = (y - y.floor()).clamp(0.0, 1.0);
-    let samples = [
-        (
-            pixels.pixel_or_tile_default(x0, y0, [0; 4]),
-            (1.0 - fx) * (1.0 - fy),
-        ),
-        (
-            pixels.pixel_or_tile_default(x1, y0, [0; 4]),
-            fx * (1.0 - fy),
-        ),
-        (
-            pixels.pixel_or_tile_default(x0, y1, [0; 4]),
-            (1.0 - fx) * fy,
-        ),
-        (pixels.pixel_or_tile_default(x1, y1, [0; 4]), fx * fy),
-    ];
-    let mut alpha = 0.0;
-    let mut premultiplied = [0.0; 3];
-    for (pixel, weight) in samples {
-        let sample_alpha = pixel[3] as f32 / 255.0;
-        alpha += sample_alpha * weight;
-        for channel in 0..3 {
-            premultiplied[channel] += pixel[channel] as f32 * sample_alpha * weight;
-        }
-    }
-    if alpha <= f32::EPSILON {
-        return [0; 4];
-    }
-    [
-        (premultiplied[0] / alpha).round().clamp(0.0, 255.0) as u8,
-        (premultiplied[1] / alpha).round().clamp(0.0, 255.0) as u8,
-        (premultiplied[2] / alpha).round().clamp(0.0, 255.0) as u8,
-        (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
-    ]
-}
-
-// A layer mask stores coverage in its first channel. Do not premultiply it
-// by its unused alpha channel, and keep absent tiles fully visible.
-fn bilinear_layer_mask_value(mask: &TilePixels, width: u32, height: u32, x: f32, y: f32) -> u8 {
-    let x0 = x.floor().clamp(0.0, width.saturating_sub(1) as f32) as u32;
-    let y0 = y.floor().clamp(0.0, height.saturating_sub(1) as f32) as u32;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-    let fx = (x - x.floor()).clamp(0.0, 1.0);
-    let fy = (y - y.floor()).clamp(0.0, 1.0);
-    let value = |sx, sy| mask.pixel_or_tile_default(sx, sy, [255; 4])[0] as f32;
-    let top = value(x0, y0) * (1.0 - fx) + value(x1, y0) * fx;
-    let bottom = value(x0, y1) * (1.0 - fx) + value(x1, y1) * fx;
-    (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8
-}
-
 fn bilinear_mask_value(mask: &[u8], width: u32, height: u32, x: f32, y: f32) -> u8 {
     let x0 = x.floor().clamp(0.0, width.saturating_sub(1) as f32) as u32;
     let y0 = y.floor().clamp(0.0, height.saturating_sub(1) as f32) as u32;
@@ -3336,6 +3362,106 @@ fn bilinear_mask_value(mask: &[u8], width: u32, height: u32, x: f32, y: f32) -> 
     let top = value(x0, y0) * (1.0 - fx) + value(x1, y0) * fx;
     let bottom = value(x0, y1) * (1.0 - fx) + value(x1, y1) * fx;
     (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8
+}
+
+#[derive(Default)]
+struct WarpSample {
+    raw: [f64; 4],
+    visible: [f64; 4],
+    mask_value: f64,
+}
+
+// Selection and layer-mask coverage belong to each interpolation tap,
+// before its colour is premultiplied and averaged.
+fn bilinear_warp_sample(
+    pixels: &TilePixels,
+    mask: Option<&TilePixels>,
+    selection: Option<&[u8]>,
+    width: u32,
+    height: u32,
+    x: f32,
+    y: f32,
+) -> WarpSample {
+    let x0 = x.floor().clamp(0.0, width.saturating_sub(1) as f32) as u32;
+    let y0 = y.floor().clamp(0.0, height.saturating_sub(1) as f32) as u32;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = f64::from((x - x.floor()).clamp(0.0, 1.0));
+    let fy = f64::from((y - y.floor()).clamp(0.0, 1.0));
+    let mut out = WarpSample::default();
+    let mut total_weight = 0.0;
+    for (sx, sy, weight) in [
+        (x0, y0, (1.0 - fx) * (1.0 - fy)),
+        (x1, y0, fx * (1.0 - fy)),
+        (x0, y1, (1.0 - fx) * fy),
+        (x1, y1, fx * fy),
+    ] {
+        let selected = selection.map_or(1.0, |selection| {
+            f64::from(
+                selection
+                    .get((sy * width + sx) as usize)
+                    .copied()
+                    .unwrap_or(0),
+            ) / 255.0
+        });
+        let weight = weight * selected;
+        let pixel = pixels.pixel_or_tile_default(sx, sy, [0; 4]);
+        let mask_value = mask.map_or(255, |mask| mask.pixel_or_tile_default(sx, sy, [255; 4])[0]);
+        let raw = f64::from(pixel[3]) / 255.0 * weight;
+        let visible = raw * (f64::from(mask_value) / 255.0);
+        out.raw[3] += raw;
+        out.visible[3] += visible;
+        for (channel, &colour) in pixel[..3].iter().enumerate() {
+            out.raw[channel] += f64::from(colour) * raw;
+            out.visible[channel] += f64::from(colour) * visible;
+        }
+        out.mask_value += f64::from(mask_value) * weight;
+        total_weight += weight;
+    }
+    if total_weight > 0.0 {
+        out.mask_value /= total_weight;
+    }
+    out
+}
+
+fn composite_warp_sample(
+    sample: WarpSample,
+    destination: [u8; 4],
+    destination_mask: u8,
+    retained: f64,
+) -> ([u8; 4], u8) {
+    // Compose raw and mask-visible alpha separately; encode their ratio only
+    // after source-over so a hidden source cannot hide a visible destination.
+    let destination_raw = f64::from(destination[3]) / 255.0 * retained;
+    let destination_visible = destination_raw * (f64::from(destination_mask) / 255.0);
+    let raw = sample.raw[3] + destination_raw * (1.0 - sample.raw[3]);
+    let visible = sample.visible[3] + destination_visible * (1.0 - sample.visible[3]);
+    let mut pixel = [0; 4];
+    pixel[3] = (raw * 255.0).round().clamp(0.0, 255.0) as u8;
+    for channel in 0..3 {
+        let colour = if visible > 0.0 {
+            (sample.visible[channel]
+                + f64::from(destination[channel]) * destination_visible * (1.0 - sample.visible[3]))
+                / visible
+        } else if raw > 0.0 {
+            (sample.raw[channel]
+                + f64::from(destination[channel]) * destination_raw * (1.0 - sample.raw[3]))
+                / raw
+        } else {
+            0.0
+        };
+        pixel[channel] = colour.round().clamp(0.0, 255.0) as u8;
+    }
+    let mask = if pixel[3] == 0 {
+        sample.mask_value.round().clamp(0.0, 255.0) as u8
+    } else if visible == raw {
+        255
+    } else {
+        (visible * 255.0 * 255.0 / f64::from(pixel[3]))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (pixel, mask)
 }
 
 /// Warp a regular grid of displacement controls. Offsets are row-major and
@@ -3436,13 +3562,10 @@ pub fn mesh_warp_grid(
                 if selected {
                     next_mask[i] = 0;
                 }
-                if let Some(mask) = &mut next_layer_mask {
-                    let old = original_mask
-                        .as_ref()
-                        .map(|source| source.pixel_or_tile_default(x as u32, y as u32, [255; 4])[0])
-                        .unwrap_or(255) as f32;
-                    let cleared = old + (255.0 - old) * (coverage as f32 / 255.0);
-                    mask.set_mask_pixel(x as u32, y as u32, [cleared.round() as u8; 4]);
+                if let Some(mask) = &mut next_layer_mask
+                    && coverage == 255
+                {
+                    mask.set_mask_pixel(x as u32, y as u32, [255; 4]);
                 }
             }
         }
@@ -3472,32 +3595,34 @@ pub fn mesh_warp_grid(
             }
             let dst = (y as u32 * width + x as u32) as usize;
             affected.insert(dst);
-            let src_px = bilinear_layer_pixel(&original, width, height, sx, sy);
-            let mut dst_px = next.pixel(x as u32, y as u32);
-            let source_alpha = src_px[3] as f32 / 255.0 * coverage as f32 / 255.0;
-            let destination_alpha = dst_px[3] as f32 / 255.0;
-            let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
-            if output_alpha > 0.0 {
-                for channel in 0..3 {
-                    dst_px[channel] = ((src_px[channel] as f32 * source_alpha
-                        + dst_px[channel] as f32 * destination_alpha * (1.0 - source_alpha))
-                        / output_alpha)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                }
-                dst_px[3] = (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-            }
-            next.set_pixel(x as u32, y as u32, dst_px);
+            let sample = bilinear_warp_sample(
+                &original,
+                original_mask.as_ref(),
+                selected.then_some(selection.mask.as_slice()),
+                width,
+                height,
+                sx,
+                sy,
+            );
+            let destination = original.pixel(x as u32, y as u32);
+            let destination_mask = original_mask.as_ref().map_or(255, |mask| {
+                mask.pixel_or_tile_default(x as u32, y as u32, [255; 4])[0]
+            });
+            let retained = if selected {
+                1.0 - f64::from(selection.mask.get(dst).copied().unwrap_or(0)) / 255.0
+            } else {
+                0.0
+            };
+            // Retain the original destination in float rather than composing
+            // against the source cut's already-rounded alpha byte.
+            let (pixel, mask_value) =
+                composite_warp_sample(sample, destination, destination_mask, retained);
+            next.set_pixel(x as u32, y as u32, pixel);
             if selected {
                 next_mask[dst] = next_mask[dst].max(coverage);
             }
             if let Some(mask) = &mut next_layer_mask {
-                let value = original_mask
-                    .as_ref()
-                    .map(|source| bilinear_layer_mask_value(source, width, height, sx, sy))
-                    .unwrap_or(255);
-                let value = [value; 4];
-                mask.set_mask_pixel(x as u32, y as u32, value);
+                mask.set_mask_pixel(x as u32, y as u32, [mask_value; 4]);
             }
         }
     }
@@ -3519,7 +3644,6 @@ pub fn mesh_warp_grid(
         mask.prune_white_tiles();
     }
 }
-
 pub fn gaussian_blur(layer: &mut Layer, width: u32, height: u32, radius: u32) {
     if radius == 0 || width == 0 || height == 0 {
         return;
@@ -3615,7 +3739,10 @@ pub fn auto_levels(layer: &mut Layer) {
         }
         let old = [layer.pixels[i], layer.pixels[i + 1], layer.pixels[i + 2]];
         for c in 0..3 {
-            let range = high[c].saturating_sub(low[c]).max(1);
+            let range = high[c].saturating_sub(low[c]);
+            if range == 0 {
+                continue;
+            }
             layer.pixels[i + c] =
                 ((old[c].saturating_sub(low[c]) as u16 * 255) / range as u16) as u8;
         }
@@ -4300,6 +4427,37 @@ mod accuracy_tests {
     use super::*;
 
     #[test]
+    fn dodge_and_burn_preserve_black_and_white_backdrop_boundaries() {
+        // The singular pairs follow the backdrop-first cases in W3C
+        // Compositing and Blending Level 1, sections 10.1.7 and 10.1.8.
+        // https://www.w3.org/TR/compositing-1/#blendingcolordodge
+        assert_eq!(blend_channel(BlendMode::ColorDodge, 1.0, 0.0), 0.0);
+        assert_eq!(blend_channel(BlendMode::ColorBurn, 0.0, 1.0), 1.0);
+        assert_eq!(blend_channel(BlendMode::ColorDodge, 0.5, 0.25), 0.5);
+        assert_eq!(blend_channel(BlendMode::ColorBurn, 0.5, 0.75), 0.5);
+        for (blend, destination, source) in [
+            (BlendMode::ColorDodge, [0, 0, 0, 255], [255; 4]),
+            (BlendMode::ColorBurn, [255; 4], [0, 0, 0, 255]),
+        ] {
+            for linear in [false, true] {
+                for opacity in [0.5, 1.0] {
+                    let mut doc = Document::new(1, 1);
+                    doc.layers[0].pixels.set_pixel(0, 0, destination);
+                    let mut top = Layer::new(2, "blend", 1, 1);
+                    top.blend = blend;
+                    top.linear_blend = linear;
+                    top.opacity = opacity;
+                    top.pixels.set_pixel(0, 0, source);
+                    doc.layers.push(top);
+                    assert_eq!(composite(&doc), destination);
+                    assert_eq!(composite_transparent(&doc), destination);
+                    assert_eq!(sample_composite_pixel(&doc, 0, 0), destination);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn halving_keeps_flat_colours_and_averages_in_linear_light() {
         // A flat colour stays exactly the same at every level.
         let flat = [123u8, 45, 200, 255].repeat(16);
@@ -4376,6 +4534,23 @@ mod accuracy_tests {
             }
         }
     }
+
+    #[test]
+    fn auto_levels_preserves_constant_channels_and_transparent_pixels() {
+        let mut layer = Layer::new(1, "flat colour", 3, 1);
+        layer.pixels.set_pixel(0, 0, [120, 80, 200, 128]);
+        layer.pixels.set_pixel(1, 0, [180, 80, 200, 255]);
+        layer.pixels.set_pixel(2, 0, [10, 20, 30, 0]);
+        auto_levels(&mut layer);
+        assert_eq!(layer.pixels.pixel(0, 0), [0, 80, 200, 128]);
+        assert_eq!(layer.pixels.pixel(1, 0), [255, 80, 200, 255]);
+        assert_eq!(layer.pixels.pixel(2, 0), [10, 20, 30, 0]);
+
+        let mut flat = Layer::new(2, "single colour", 1, 1);
+        flat.pixels.set_pixel(0, 0, [120, 80, 200, 255]);
+        auto_levels(&mut flat);
+        assert_eq!(flat.pixels.pixel(0, 0), [120, 80, 200, 255]);
+    }
 }
 
 #[cfg(test)]
@@ -4429,6 +4604,52 @@ mod layer_tree_tests {
         history.redo_document(&mut doc);
         assert_eq!(ids(&doc.layers), vec![1, 3, 2]);
         assert!(!history.tidy_layer_tree(&mut doc.layers));
+    }
+
+    #[test]
+    fn tidying_joins_the_last_undo_step_when_it_was_spilled_to_disk() {
+        let mut doc = Document::new(8, 8);
+        doc.layers = vec![layer(1, None, false), layer(2, None, true)];
+        let mut history = History::default();
+        let initial = history.state_token();
+        history.insert_layer(&mut doc.layers, 2, layer(3, Some(2), false));
+        let inserted = history.state_token();
+        let entry = history.undo.pop().unwrap();
+        history
+            .undo_spills
+            .push(History::spill_path(&entry).unwrap());
+        history.undo_bytes = 0;
+        assert!(history.tidy_layer_tree(&mut doc.layers));
+        assert_eq!(ids(&doc.layers), vec![1, 3, 2]);
+        assert_eq!(history.state_token(), inserted);
+        history.undo_document(&mut doc);
+        assert_eq!(ids(&doc.layers), vec![1, 2]);
+        assert_eq!(history.state_token(), initial);
+        history.redo_document(&mut doc);
+        assert_eq!(ids(&doc.layers), vec![1, 3, 2]);
+        assert_eq!(history.state_token(), inserted);
+    }
+
+    #[test]
+    fn tidying_preserves_layers_when_the_last_undo_spill_is_unreadable() {
+        let mut doc = Document::new(8, 8);
+        doc.layers = vec![layer(1, None, false), layer(2, None, true)];
+        let mut history = History::default();
+        history.insert_layer(&mut doc.layers, 2, layer(3, Some(2), false));
+        let entry = history.undo.pop().unwrap();
+        let path = History::spill_path(&entry).unwrap();
+        history.undo_spills.push(path.clone());
+        history.undo_bytes = 0;
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"corrupted history").unwrap();
+        assert!(!history.tidy_layer_tree(&mut doc.layers));
+        assert_eq!(ids(&doc.layers), vec![1, 2, 3]);
+        assert!(history.take_error().is_some());
+        assert!(path.exists());
+        std::fs::write(path, original).unwrap();
+        assert!(history.tidy_layer_tree(&mut doc.layers));
+        history.undo_document(&mut doc);
+        assert_eq!(ids(&doc.layers), vec![1, 2]);
     }
 
     #[test]
@@ -4516,6 +4737,171 @@ mod selection_mask_regression_tests {
         assert!(!layer.mask.as_ref().unwrap().has_allocated_tiles());
         assert!(!history.can_undo());
         assert!(!history.is_dirty());
+    }
+
+    fn assert_masked_move_matches_visible_source_over(
+        colors: &[[u8; 4]],
+        mask_values: &[u8],
+        selected: &[u8],
+        dx: i32,
+    ) {
+        let width = colors.len() as u32;
+        let mut doc = Document::new(width, 1);
+        let mut layer_mask = TilePixels::new(width, 1);
+        layer_mask.ensure_tile_filled(0, 0, [255; 4]);
+        for (x, (&color, &mask)) in colors.iter().zip(mask_values).enumerate() {
+            doc.layers[0].pixels.set_pixel(x as u32, 0, color);
+            layer_mask.set_pixel(x as u32, 0, [mask; 4]);
+        }
+        doc.layers[0].mask = Some(layer_mask);
+        // Compute the visible premultiplied image independently of how Move
+        // encodes its result as raw paint and a separate layer mask.
+        let original = colors
+            .iter()
+            .zip(mask_values)
+            .map(|(color, &mask)| {
+                let alpha = f64::from(color[3]) / 255.0 * f64::from(mask) / 255.0;
+                [
+                    f64::from(color[0]) * alpha,
+                    f64::from(color[1]) * alpha,
+                    f64::from(color[2]) * alpha,
+                    alpha,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut expected = original
+            .iter()
+            .zip(selected)
+            .map(|(color, &coverage)| {
+                color.map(|value| value * (1.0 - f64::from(coverage) / 255.0))
+            })
+            .collect::<Vec<_>>();
+        for (src, (&color, &coverage)) in original.iter().zip(selected).enumerate() {
+            let dst = src as i32 + dx;
+            if !(0..width as i32).contains(&dst) {
+                continue;
+            }
+            let moved = color.map(|value| value * f64::from(coverage) / 255.0);
+            let destination = &mut expected[dst as usize];
+            for channel in 0..4 {
+                destination[channel] = moved[channel] + destination[channel] * (1.0 - moved[3]);
+            }
+        }
+        let mut selection = Selection {
+            mask: selected.to_vec(),
+            active: true,
+        };
+        translate_selection(&mut doc.layers[0], &mut selection, width, 1, dx, 0);
+        let rendered = composite_transparent(&doc);
+        for (x, (pixel, expected)) in rendered.chunks_exact(4).zip(expected).enumerate() {
+            if expected[3] == 0.0 {
+                assert_eq!(pixel, [0; 4], "hidden paint became visible at {x}, dx={dx}");
+            } else {
+                let expected_alpha = (expected[3] * 255.0).round() as i32;
+                assert!(
+                    (i32::from(pixel[3]) - expected_alpha).abs() <= 1,
+                    "alpha at {x}, dx={dx}: {pixel:?}, expected {expected_alpha}"
+                );
+                for channel in 0..3 {
+                    let expected_color = (expected[channel] / expected[3]).round() as i32;
+                    assert!(
+                        (i32::from(pixel[channel]) - expected_color).abs() <= 1,
+                        "color at {x}, dx={dx}: {pixel:?}, expected {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn masked_move_composites_visible_source_and_destination() {
+        for (source_mask, destination_mask, coverage) in [
+            (0, 255, 128),
+            (0, 255, 255),
+            (128, 0, 128),
+            (128, 64, 128),
+            (128, 128, 64),
+            (255, 0, 128),
+            (64, 255, 200),
+            (0, 0, 128),
+        ] {
+            assert_masked_move_matches_visible_source_over(
+                &[[255, 0, 0, 255], [0, 0, 255, 255]],
+                &[source_mask, destination_mask],
+                &[coverage, 0],
+                1,
+            );
+        }
+        assert_masked_move_matches_visible_source_over(
+            &[[255, 0, 0, 64], [0, 0, 255, 180]],
+            &[64, 128],
+            &[200, 0],
+            1,
+        );
+    }
+
+    #[test]
+    fn masked_move_composites_partial_overlap_and_clipped_sources() {
+        for dx in [-1, 1, 3] {
+            assert_masked_move_matches_visible_source_over(
+                &[
+                    [255, 0, 0, 255],
+                    [0, 255, 0, 255],
+                    [0, 0, 255, 255],
+                    [180, 120, 30, 255],
+                    [50, 90, 160, 255],
+                ],
+                &[0, 80, 128, 255, 0],
+                &[0, 128, 200, 64, 0],
+                dx,
+            );
+        }
+    }
+
+    #[test]
+    fn masked_move_repartitions_coverage_after_rounding_raw_alpha() {
+        for (alpha, coverage, mask, expected_raw_alpha, expected_mask) in [
+            (1, 128, 128, 1, 64),
+            (2, 128, 128, 1, 129),
+            (2, 129, 254, 1, 255),
+            (1, 64, 128, 0, 128),
+        ] {
+            let mut layer = Layer::new(1, "quantized mask", 2, 1);
+            layer.pixels.set_pixel(0, 0, [255, 0, 0, alpha]);
+            let mut layer_mask = TilePixels::new(2, 1);
+            layer_mask.ensure_tile_filled(0, 0, [255; 4]);
+            layer_mask.set_pixel(0, 0, [mask; 4]);
+            layer.mask = Some(layer_mask);
+            let mut selection = Selection {
+                mask: vec![coverage, 0],
+                active: true,
+            };
+            translate_selection(&mut layer, &mut selection, 2, 1, 1, 0);
+            assert_eq!(layer.pixels.pixel(1, 0)[3], expected_raw_alpha);
+            assert_eq!(
+                mask_value(&layer, 1),
+                expected_mask,
+                "alpha={alpha}, coverage={coverage}, mask={mask}"
+            );
+        }
+    }
+
+    #[test]
+    fn masked_move_without_selection_translates_paint_and_mask_together() {
+        let mut layer = sparse_mask_layer(3);
+        let layer_mask = layer.mask.as_mut().unwrap();
+        layer_mask.ensure_tile_filled(0, 0, [255; 4]);
+        layer_mask.set_pixel(0, 0, [0; 4]);
+        layer_mask.set_pixel(1, 0, [128; 4]);
+        let original = layer.pixels.clone();
+        translate_selection(&mut layer, &mut Selection::default(), 3, 1, 1, 0);
+        assert_eq!(layer.pixels.pixel(0, 0), [0; 4]);
+        assert_eq!(mask_value(&layer, 0), 255);
+        for x in 1..3 {
+            assert_eq!(layer.pixels.pixel(x, 0), original.pixel(x - 1, 0));
+        }
+        assert_eq!(mask_value(&layer, 1), 0);
+        assert_eq!(mask_value(&layer, 2), 128);
     }
 
     #[test]
@@ -4637,6 +5023,587 @@ mod selection_mask_regression_tests {
                 ),
             }
             assert_eq!(mask_value(&layer, TILE_SIZE), 0, "operation {operation}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod masked_transform_regression_tests {
+    use super::*;
+
+    fn masked_row(colors: &[[u8; 4]], masks: &[u8]) -> Document {
+        let mut doc = Document::new(colors.len() as u32, 1);
+        let mut mask = TilePixels::new(doc.width, 1);
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        for (x, (&color, &coverage)) in colors.iter().zip(masks).enumerate() {
+            doc.layers[0].pixels.set_pixel(x as u32, 0, color);
+            mask.set_pixel(x as u32, 0, [coverage; 4]);
+        }
+        doc.layers[0].mask = Some(mask);
+        doc
+    }
+
+    fn apply(doc: &mut Document, selection: &mut Selection, sx: f32, sy: f32, angle: f32) {
+        let mut history = History::default();
+        history.begin();
+        transform_selection(
+            &mut doc.layers[0],
+            selection,
+            doc.width,
+            doc.height,
+            sx,
+            sy,
+            angle,
+            &mut history,
+        );
+        history.commit();
+    }
+
+    fn assert_visible(doc: &Document, expected: &[[f64; 4]]) {
+        for (index, (pixel, color)) in composite_transparent(doc)
+            .chunks_exact(4)
+            .zip(expected)
+            .enumerate()
+        {
+            let alpha = (color[3] * 255.0).round() as i32;
+            assert!(
+                (i32::from(pixel[3]) - alpha).abs() <= 1,
+                "alpha at {index}: {pixel:?}, expected {alpha}"
+            );
+            if color[3] == 0.0 {
+                assert_eq!(pixel, [0; 4], "hidden paint became visible at {index}");
+            } else if pixel[3] > 0 {
+                for channel in 0..3 {
+                    let value = (color[channel] / color[3]).round() as i32;
+                    assert!(
+                        (i32::from(pixel[channel]) - value).abs() <= 1,
+                        "color at {index}: {pixel:?}, expected {color:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn masked_transform_soft_cut_preserves_hidden_and_gray_source() {
+        for mask in [0, 128] {
+            let mut doc = masked_row(&[[255, 0, 0, 255]; 3], &[mask; 3]);
+            let mut selection = Selection {
+                mask: vec![128, 128, 0],
+                active: true,
+            };
+            apply(&mut doc, &mut selection, 3.0, 1.0, 0.0);
+            let rendered = composite_transparent(&doc);
+            let remaining = (127.0 * f64::from(mask) / 255.0).round() as u8;
+            assert_eq!(
+                rendered[3], remaining,
+                "soft cut revealed the source, mask={mask}"
+            );
+            let source = 128.0 / 255.0 * f64::from(mask) / 255.0;
+            let base = f64::from(mask) / 255.0;
+            let expected = ((source + base * (1.0 - source)) * 255.0).round() as i32;
+            assert!((i32::from(rendered[11]) - expected).abs() <= 1);
+            if mask == 0 {
+                assert!(rendered.chunks_exact(4).all(|pixel| pixel[3] == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn masked_transform_composites_visible_many_to_one_and_partial_overlap() {
+        let colors = [[255, 0, 0, 64], [0, 0, 255, 180], [0, 255, 0, 200]];
+        for masks in [
+            [0, 255, 0],
+            [255, 255, 0],
+            [128, 64, 200],
+            [0, 0, 128],
+            [255, 0, 255],
+        ] {
+            for coverage in [[255, 0, 255], [128, 0, 200]] {
+                let mut doc = masked_row(&colors, &masks);
+                let mut selection = Selection {
+                    mask: coverage.to_vec(),
+                    active: true,
+                };
+                // The endpoints of this 3x1 selection map to x=0.5 and x=1.5.
+                // Each contributes half to its two neighbors, in source order.
+                let mut expected = colors
+                    .iter()
+                    .zip(masks)
+                    .zip(coverage)
+                    .map(|((&pixel, mask), selected)| {
+                        let remaining =
+                            (f64::from(pixel[3]) * (1.0 - f64::from(selected) / 255.0)).round();
+                        let alpha = remaining / 255.0 * f64::from(mask) / 255.0;
+                        [
+                            f64::from(pixel[0]) * alpha,
+                            f64::from(pixel[1]) * alpha,
+                            f64::from(pixel[2]) * alpha,
+                            alpha,
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                for (src, dst) in [(0, 0), (0, 1), (2, 1), (2, 2)] {
+                    let alpha = f64::from(colors[src][3]) / 255.0 * f64::from(masks[src]) / 255.0
+                        * f64::from(coverage[src])
+                        / 255.0
+                        * 0.5;
+                    for channel in 0..3 {
+                        expected[dst][channel] = f64::from(colors[src][channel]) * alpha
+                            + expected[dst][channel] * (1.0 - alpha);
+                    }
+                    expected[dst][3] = alpha + expected[dst][3] * (1.0 - alpha);
+                }
+                apply(&mut doc, &mut selection, 0.5, 1.0, 0.0);
+                assert_visible(&doc, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn masked_transform_many_tiny_contributions_round_once_and_mask_is_continuous() {
+        let mut results = Vec::new();
+        for mask in [254, 255] {
+            let mut doc = Document::new(24, 24);
+            for y in 0..24 {
+                for x in 0..24 {
+                    doc.layers[0].pixels.set_pixel(x, y, [255, 0, 0, 1]);
+                }
+            }
+            let mut layer_mask = TilePixels::new(24, 24);
+            layer_mask.ensure_tile_filled(0, 0, [mask; 4]);
+            doc.layers[0].mask = Some(layer_mask);
+            let mut selection = Selection {
+                mask: vec![255; 24 * 24],
+                active: true,
+            };
+            let mut expected_alpha = 0.0_f64;
+            let mut expected_raw_alpha = 0.0_f64;
+            for y in 0..24 {
+                for x in 0..24 {
+                    // Evaluate one destination's triangular footprint, rather than
+                    // copying the transform's forward four-neighbor traversal.
+                    let tx = 11.5 + (f64::from(x) - 11.5) * f64::from(0.1_f32);
+                    let ty = 11.5 + (f64::from(y) - 11.5) * f64::from(0.1_f32);
+                    let weight =
+                        (1.0 - (11.0 - tx).abs()).max(0.0) * (1.0 - (12.0 - ty).abs()).max(0.0);
+                    let raw = weight / 255.0;
+                    let visible = raw * f64::from(mask) / 255.0;
+                    expected_raw_alpha = raw + expected_raw_alpha * (1.0 - raw);
+                    expected_alpha = visible + expected_alpha * (1.0 - visible);
+                }
+            }
+            apply(&mut doc, &mut selection, 0.1, 0.1, 0.0);
+            assert_eq!(
+                doc.layers[0].pixels.pixel(11, 12)[3],
+                (expected_raw_alpha * 255.0).round() as u8
+            );
+            let rendered = composite_transparent(&doc);
+            let alpha = rendered[(12 * 24 + 11) * 4 + 3];
+            assert!((f64::from(alpha) - (expected_alpha * 255.0).round()).abs() <= 1.0);
+            results.push(alpha);
+        }
+        assert!(
+            results[0].abs_diff(results[1]) <= 1,
+            "one mask level changed alpha by {results:?}"
+        );
+    }
+
+    #[test]
+    fn masked_transform_low_alpha_uses_final_raw_alpha_for_mask_quantization() {
+        for source_alpha in [1, 2] {
+            for mask in [0, 1, 64, 128, 254, 255] {
+                let mut doc = Document::new(2, 2);
+                for y in 0..2 {
+                    for x in 0..2 {
+                        doc.layers[0]
+                            .pixels
+                            .set_pixel(x, y, [255, 0, 0, source_alpha]);
+                    }
+                }
+                let mut layer_mask = TilePixels::new(2, 2);
+                layer_mask.ensure_tile_filled(0, 0, [mask; 4]);
+                doc.layers[0].mask = Some(layer_mask);
+                let mut selection = Selection {
+                    mask: vec![255; 4],
+                    active: true,
+                };
+                let mut visible = 0.0_f64;
+                let mut raw = 0.0_f64;
+                for weight in [0.55 * 0.55, 0.45 * 0.55, 0.55 * 0.45, 0.45 * 0.45] {
+                    let alpha = f64::from(source_alpha) / 255.0 * weight;
+                    raw = alpha + raw * (1.0 - alpha);
+                    let effective = alpha * f64::from(mask) / 255.0;
+                    visible = effective + visible * (1.0 - effective);
+                }
+                apply(&mut doc, &mut selection, 0.1, 0.1, 0.0);
+                assert_eq!(
+                    doc.layers[0].pixels.pixel(0, 0)[3],
+                    (raw * 255.0).round() as u8
+                );
+                let rendered = composite_transparent(&doc);
+                assert!((i32::from(rendered[3]) - (visible * 255.0).round() as i32).abs() <= 1);
+                if mask == 0 {
+                    assert_eq!(&rendered[..4], &[0; 4]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn masked_transform_zero_weight_underflow_keeps_destination_mask() {
+        let mut doc = Document::new(3, 2);
+        doc.layers[0].pixels.set_pixel(2, 0, [255, 0, 0, 255]);
+        let mut mask = TilePixels::new(3, 2);
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        mask.set_pixel(2, 0, [128; 4]);
+        mask.set_pixel(2, 1, [77; 4]);
+        doc.layers[0].mask = Some(mask);
+        let mut selection = Selection {
+            mask: vec![1, 0, 1, 0, 0, 0],
+            active: true,
+        };
+        // This positive bilinear tap is the smallest subnormal. Multiplying
+        // by selection coverage 1/255 underflows its contribution to zero.
+        apply(&mut doc, &mut selection, 1.0, 1.0, f32::from_bits(1));
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap().pixel(2, 1)[0], 77);
+        assert_eq!(doc.layers[0].pixels.pixel(2, 1), [0; 4]);
+    }
+
+    #[test]
+    fn masked_transform_white_mask_and_unmasked_match_for_selection_and_whole_layer() {
+        for active in [false, true] {
+            for (sx, sy, angle) in [
+                (3.0, 1.0, 0.0),
+                (0.1, 0.1, 0.0),
+                (-1.0, 1.0, 0.0),
+                (0.7, 0.9, 0.3),
+            ] {
+                let mut plain = Document::new(4, 3);
+                for y in 0..3 {
+                    for x in 0..4 {
+                        plain.layers[0].pixels.set_pixel(
+                            x,
+                            y,
+                            [
+                                (x * 60) as u8,
+                                (y * 90) as u8,
+                                40,
+                                (50 + x * 20 + y * 30) as u8,
+                            ],
+                        );
+                    }
+                }
+                let mut masked = plain.clone();
+                let mut mask = TilePixels::new(4, 3);
+                mask.ensure_tile_filled(0, 0, [255; 4]);
+                masked.layers[0].mask = Some(mask);
+                let mut selected = Selection {
+                    mask: vec![128; 12],
+                    active,
+                };
+                let mut masked_selected = Selection {
+                    mask: selected.mask.clone(),
+                    active,
+                };
+                apply(&mut plain, &mut selected, sx, sy, angle);
+                apply(&mut masked, &mut masked_selected, sx, sy, angle);
+                assert_eq!(
+                    masked.layers[0].pixels.to_dense(),
+                    plain.layers[0].pixels.to_dense()
+                );
+                assert_eq!(
+                    composite_transparent(&masked),
+                    composite_transparent(&plain)
+                );
+                assert_eq!(masked_selected.mask, selected.mask);
+                assert!(
+                    !masked.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .has_allocated_tiles()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn masked_transform_single_contribution_identity_and_whole_hidden_layer_controls() {
+        let mut doc = masked_row(
+            &[[255, 0, 0, 200], [0, 0, 255, 180], [0, 255, 0, 60]],
+            &[128, 0, 64],
+        );
+        let before = doc.layers[0].pixels.to_dense();
+        let before_mask = doc.layers[0].mask.as_ref().unwrap().to_dense();
+        let mut selection = Selection {
+            mask: vec![255, 0, 0],
+            active: true,
+        };
+        apply(&mut doc, &mut selection, 3.0, 1.0, 0.0);
+        assert_eq!(doc.layers[0].pixels.to_dense(), before);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap().to_dense(), before_mask);
+        let mut history = History::default();
+        history.begin();
+        transform_selection(
+            &mut doc.layers[0],
+            &mut selection,
+            3,
+            1,
+            1.0,
+            1.0,
+            0.0,
+            &mut history,
+        );
+        history.commit();
+        assert!(!history.can_undo());
+        assert_eq!(doc.layers[0].pixels.to_dense(), before);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap().to_dense(), before_mask);
+        let mut hidden = masked_row(&[[255, 0, 0, 255]; 3], &[0; 3]);
+        apply(&mut hidden, &mut Selection::default(), 0.5, 1.0, 0.0);
+        assert!(
+            composite_transparent(&hidden)
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == 0)
+        );
+        assert_eq!(hidden.layers[0].pixels.pixel(0, 0), [255, 0, 0, 128]);
+        assert_eq!(hidden.layers[0].pixels.pixel(1, 0), [255, 0, 0, 255]);
+        assert_eq!(hidden.layers[0].pixels.pixel(2, 0), [255, 0, 0, 128]);
+        for x in 0..3 {
+            assert_eq!(hidden.layers[0].mask.as_ref().unwrap().pixel(x, 0)[0], 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_mask_regression_tests {
+    use super::*;
+
+    fn assert_white_mesh_matches_unmasked(alphas: [u8; 2], selected: [u8; 4], dx: f32) {
+        for explicit_white_tile in [false, true] {
+            let mut plain = Document::new(4, 1);
+            plain.layers[0]
+                .pixels
+                .set_pixel(0, 0, [11, 29, 47, alphas[0]]);
+            plain.layers[0]
+                .pixels
+                .set_pixel(1, 0, [97, 53, 23, alphas[1]]);
+            let mut white = plain.clone();
+            let mut mask = TilePixels::new(4, 1);
+            if explicit_white_tile {
+                mask.ensure_tile_filled(0, 0, [255; 4]);
+            }
+            white.layers[0].mask = Some(mask);
+            let (plain_selection, _) = warp(&mut plain, &selected, dx);
+            let (white_selection, _) = warp(&mut white, &selected, dx);
+            assert_eq!(
+                plain.layers[0].pixels.to_dense(),
+                white.layers[0].pixels.to_dense()
+            );
+            assert_eq!(plain_selection.mask, white_selection.mask);
+            for x in 0..4 {
+                assert_eq!(
+                    sample(&white, x).1,
+                    255,
+                    "white mask changed at {x}: alphas={alphas:?}, selection={selected:?}, dx={dx}"
+                );
+            }
+            assert_eq!(composite_transparent(&plain), composite_transparent(&white));
+        }
+    }
+
+    #[test]
+    fn mesh_white_low_alpha_matches_unmasked() {
+        // These fractional alphas include both half-integer byte rounding and
+        // values whose multiply-by-255/divide-by-255 round trip is not exact.
+        for (alphas, coverage, dx) in [
+            ([73, 0], 128, 0.625),
+            ([107, 0], 255, 0.875),
+            ([1, 2], 255, 0.5),
+            ([1, 2], 128, 0.5),
+            ([2, 3], 255, 0.5),
+        ] {
+            assert_white_mesh_matches_unmasked(alphas, [coverage; 4], dx);
+        }
+    }
+
+    #[test]
+    fn mesh_white_retained_low_alpha_matches_unmasked() {
+        // A transparent source leaves raw destination alpha 4 * 36 / 255,
+        // which rounds to 1; a white mask must still encode full visibility.
+        assert_white_mesh_matches_unmasked([0, 4], [255, 219, 0, 0], 1.0);
+    }
+
+    fn warp(doc: &mut Document, selected: &[u8], dx: f32) -> (Selection, History) {
+        let mut selection = Selection {
+            active: true,
+            mask: selected.to_vec(),
+        };
+        let mut history = History::default();
+        history.begin();
+        mesh_warp_grid(
+            &mut doc.layers[0],
+            &mut selection,
+            doc.width,
+            doc.height,
+            2,
+            2,
+            &[[dx, 0.]; 4],
+            &mut history,
+        );
+        history.record_selection_change(
+            true,
+            selected.to_vec(),
+            selection.active,
+            selection.mask.clone(),
+        );
+        history.commit();
+        (selection, history)
+    }
+    fn sample(doc: &Document, x: u32) -> ([u8; 4], u8, f64) {
+        let layer = &doc.layers[0];
+        let raw = layer.pixels.pixel(x, 0);
+        let mask = layer
+            .mask
+            .as_ref()
+            .map_or(255, |m| m.pixel_or_tile_default(x, 0, [255; 4])[0]);
+        (raw, mask, f64::from(raw[3]) * f64::from(mask) / 255.)
+    }
+    fn masked_doc() -> Document {
+        let mut doc = Document::new(4, 1);
+        let mut mask = TilePixels::new(4, 1);
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        mask.set_pixel(0, 0, [0; 4]);
+        doc.layers[0].mask = Some(mask);
+        doc
+    }
+    #[test]
+    fn half_selected_black_mask_stays_hidden_at_source() {
+        let mut doc = masked_doc();
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        let original = doc.layers[0].pixels.to_dense();
+        let (_, mut history) = warp(&mut doc, &[128, 0, 0, 0], 1.);
+        let after = sample(&doc, 0);
+        println!("case1 source raw/mask/visible={after:?}; independent expected_visible=0");
+        history.undo_document(&mut doc);
+        assert_eq!(doc.layers[0].pixels.to_dense(), original);
+        assert_eq!(sample(&doc, 0).1, 0);
+        history.redo_document(&mut doc);
+        assert_eq!(sample(&doc, 0), after);
+        assert_eq!(after.2, 0.);
+    }
+    #[test]
+    fn hidden_red_does_not_hide_visible_blue_destination() {
+        let mut doc = masked_doc();
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        doc.layers[0].pixels.set_pixel(1, 0, [0, 0, 255, 255]);
+        let _ = warp(&mut doc, &[128, 0, 0, 0], 1.);
+        let actual = sample(&doc, 1);
+        println!(
+            "case2 dest raw/mask/visible={actual:?}; independent expected=[0,0,255] visible_alpha=255"
+        );
+        assert_eq!(actual.2, 255.);
+        assert_eq!(actual.0[..3], [0, 0, 255]);
+    }
+    #[test]
+    fn fractional_selection_filters_out_unselected_green() {
+        let mut doc = Document::new(4, 1);
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        doc.layers[0].pixels.set_pixel(1, 0, [0, 255, 0, 255]);
+        doc.layers[0].pixels.set_pixel(2, 0, [255, 0, 0, 255]);
+        let _ = warp(&mut doc, &[255, 0, 255, 0], 0.5);
+        let actual = sample(&doc, 2);
+        println!(
+            "case3 dest raw/mask/visible={actual:?}; independent selected-premul bilinear expected=[255,0,0,128]"
+        );
+        assert_eq!(actual.0, [255, 0, 0, 128]);
+    }
+    #[test]
+    fn mesh_identity_preserves_pixels_mask_selection_and_history() {
+        let mut doc = masked_doc();
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        let before = doc.layers[0].pixels.to_dense();
+        let (selection, history) = warp(&mut doc, &[128, 0, 0, 0], 0.);
+        assert_eq!(doc.layers[0].pixels.to_dense(), before);
+        assert_eq!(sample(&doc, 0).1, 0);
+        assert_eq!(selection.mask, [128, 0, 0, 0]);
+        assert!(!history.can_undo());
+    }
+    #[test]
+    fn no_mask_integer_mesh_move_keeps_full_selection_and_history() {
+        let mut doc = Document::new(4, 1);
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        let (selection, mut history) = warp(&mut doc, &[255, 0, 0, 0], 1.);
+        assert_eq!(sample(&doc, 1).0, [255, 0, 0, 255]);
+        assert_eq!(sample(&doc, 0).0, [0; 4]);
+        assert_eq!(selection.mask, [0, 255, 0, 0]);
+        assert!(doc.layers[0].mask.is_none());
+        history.undo_document(&mut doc);
+        assert_eq!(sample(&doc, 0).0, [255, 0, 0, 255]);
+        history.redo_document(&mut doc);
+        assert_eq!(sample(&doc, 1).0, [255, 0, 0, 255]);
+    }
+    #[test]
+    fn full_selection_no_mask_keeps_normal_bilinear_colour() {
+        let mut doc = Document::new(4, 1);
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        doc.layers[0].pixels.set_pixel(1, 0, [0, 255, 0, 255]);
+        let _ = warp(&mut doc, &[255; 4], 0.5);
+        assert_eq!(sample(&doc, 1).0, [128, 128, 0, 255]);
+        assert!(doc.layers[0].mask.is_none());
+    }
+    #[test]
+    fn fully_hidden_mesh_keeps_raw_colour_but_remains_hidden() {
+        let mut doc = masked_doc();
+        doc.layers[0].mask.as_mut().unwrap().set_pixel(1, 0, [0; 4]);
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        doc.layers[0].pixels.set_pixel(1, 0, [0, 255, 0, 255]);
+        let _ = warp(&mut doc, &[255; 4], 0.5);
+        let value = sample(&doc, 1);
+        assert_eq!(value.0, [128, 128, 0, 255]);
+        assert_eq!(value.1, 0);
+        assert_eq!(value.2, 0.);
+    }
+    #[test]
+    fn bilinear_mask_sampling_excludes_hidden_colour() {
+        let mut doc = masked_doc();
+        doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+        doc.layers[0].pixels.set_pixel(1, 0, [0, 0, 255, 255]);
+        let _ = warp(&mut doc, &[255; 4], 0.5);
+        let value = sample(&doc, 1);
+        assert_eq!(value.0, [0, 0, 255, 255]);
+        assert_eq!(value.1, 128);
+    }
+    #[test]
+    fn gray_soft_mesh_overlap_matches_visible_source_over() {
+        for destination_selection in [0, 128] {
+            let mut doc = masked_doc();
+            doc.layers[0]
+                .mask
+                .as_mut()
+                .unwrap()
+                .set_pixel(0, 0, [64; 4]);
+            doc.layers[0]
+                .mask
+                .as_mut()
+                .unwrap()
+                .set_pixel(1, 0, [128; 4]);
+            doc.layers[0].pixels.set_pixel(0, 0, [255, 0, 0, 255]);
+            doc.layers[0].pixels.set_pixel(1, 0, [0, 0, 255, 255]);
+            let _ = warp(&mut doc, &[128, destination_selection, 0, 0], 1.);
+            let actual = sample(&doc, 1);
+            let source_visible = 128. / 255. * 64. / 255.;
+            let retained_blue = (1. - f64::from(destination_selection) / 255.) * 128. / 255.;
+            let expected = source_visible + retained_blue * (1. - source_visible);
+            let red = (255. * source_visible / expected).round() as u8;
+            let blue = (255. * retained_blue * (1. - source_visible) / expected).round() as u8;
+            println!(
+                "gray sel={destination_selection} actual={actual:?} oracle_rgb=[{red},0,{blue}] oracle_visible_alpha={}",
+                expected * 255.
+            );
+            assert_eq!(actual.0[..3], [red, 0, blue]);
+            assert!((actual.2 / 255. - expected).abs() <= 0.51 / 255.);
+            assert_eq!(sample(&doc, 0).1, 64);
         }
     }
 }

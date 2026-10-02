@@ -113,17 +113,33 @@ struct Canvas {
     data: Vec<u8>,
 }
 
+// Match the supported document layout: 30,000 px per side and 100 million
+// pixels. The existing two border pixels are allowed outside that layout.
+const MAX_TEXT_LAYOUT_DIMENSION: u32 = 30_000;
+const MAX_TEXT_LAYOUT_PIXELS: u64 = 100_000_000;
+
 impl Canvas {
-    fn new(width: f32, height: f32) -> Self {
-        let (width, height) = (
-            width.ceil().max(1.0) as u32 + 2,
-            height.ceil().max(1.0) as u32 + 2,
-        );
-        Self {
+    fn new(width: f32, height: f32) -> Option<Self> {
+        if !width.is_finite() || !height.is_finite() {
+            return None;
+        }
+        let (width, height) = (width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
+        if width > MAX_TEXT_LAYOUT_DIMENSION
+            || height > MAX_TEXT_LAYOUT_DIMENSION
+            || u64::from(width).checked_mul(u64::from(height))? > MAX_TEXT_LAYOUT_PIXELS
+        {
+            return None;
+        }
+        let (width, height) = (width.checked_add(2)?, height.checked_add(2)?);
+        let pixels = usize::try_from(u64::from(width).checked_mul(u64::from(height))?).ok()?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(pixels).ok()?;
+        data.resize(pixels, 0);
+        Some(Self {
             width,
             height,
-            data: vec![0; (width * height) as usize],
-        }
+            data,
+        })
     }
 
     fn put(&mut self, x: i32, y: i32, value: f32) {
@@ -209,7 +225,7 @@ pub fn render(font: &FontRef, text: &str, style: &TextStyle) -> Option<Coverage>
             .map(|l| column_length(l))
             .fold(0.0f32, f32::max);
         let width = pitch * (lines.len() - 1) as f32 + em;
-        canvas = Canvas::new(width, height);
+        canvas = Canvas::new(width, height)?;
         for (column, line) in lines.iter().enumerate() {
             // Rightmost column first.
             let x = 1.0 + width - em - column as f32 * pitch;
@@ -244,7 +260,7 @@ pub fn render(font: &FontRef, text: &str, style: &TextStyle) -> Option<Coverage>
         };
         let width = lines.iter().map(|l| line_width(l)).fold(0.0f32, f32::max);
         let height = pitch * (lines.len() - 1) as f32 + em;
-        canvas = Canvas::new(width, height);
+        canvas = Canvas::new(width, height)?;
         for (row, line) in lines.iter().enumerate() {
             let mut x = 1.0 + (width - line_width(line)) * 0.5;
             let top = 1.0 + row as f32 * pitch;
@@ -494,6 +510,38 @@ mod tests {
             let data = std::fs::read(&info.path).ok()?;
             has_kana(&data, info.index).then_some((data, info.index))
         })
+    }
+
+    #[test]
+    fn enormous_vertical_text_returns_none_before_allocating() {
+        let Some((data, index)) = test_font() else {
+            eprintln!("no Japanese system font; skipping");
+            return;
+        };
+        assert!(
+            render_with(
+                &data,
+                index,
+                &"W".repeat(1200),
+                &TextStyle {
+                    size: 2000.0,
+                    vertical: true,
+                    ..TextStyle::default()
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn text_canvas_rejects_excessive_area_and_keeps_page_sized_layout() {
+        assert!(Canvas::new(20_000.0, 20_000.0).is_none());
+        assert!(Canvas::new(30_001.0, 1.0).is_none());
+        assert!(Canvas::new(f32::MAX, 1.0).is_none());
+        assert!(Canvas::new(f32::NAN, 1.0).is_none());
+        let page_width = Canvas::new(30_000.0, 1.0).unwrap();
+        assert_eq!((page_width.width, page_width.height), (30_002, 3));
+        assert_eq!(page_width.data.len(), 30_002 * 3);
     }
 
     #[test]

@@ -89,15 +89,10 @@ fn alpha(doc: &Document, selected: &HashSet<u64>, cancel: &AtomicBool) -> Result
         .layers
         .iter()
         .any(|l| l.clipping && selected.contains(&l.id));
-    if count * if has_clipping { 6 } else { 1 } > 512 * 1024 * 1024 {
+    if count * if has_clipping { 5 } else { 1 } > 512 * 1024 * 1024 {
         return Err("チェック用画像が大きすぎます。クリッピング以外のレイヤーに対象を絞るか、小さい複製で確認してください".into());
     }
     let mut out = filled(count, 0u8)?;
-    let mut composed = if has_clipping {
-        filled(count, 0u8)?
-    } else {
-        Vec::new()
-    };
     let mut base = if has_clipping {
         filled(count, 0f32)?
     } else {
@@ -166,12 +161,10 @@ fn alpha(doc: &Document, selected: &HashSet<u64>, cancel: &AtomicBool) -> Result
                         let da = out[p] as f32 / 255.0;
                         out[p] = ((sa + da * (1.0 - sa)) * 255.0).round().clamp(0.0, 255.0) as u8;
                     }
-                    if has_clipping {
-                        let oa = sa + composed[p] as f32 / 255.0 * (1.0 - sa);
-                        composed[p] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
-                        if !layer.clipping {
-                            base[p] = oa;
-                        }
+                    if has_clipping && !layer.clipping {
+                        // Match the renderer: earlier clipped ink must not
+                        // enlarge the coverage supplied to later clipping runs.
+                        base[p] = sa + base[p] * (1.0 - sa);
                     }
                 }
             }
@@ -418,6 +411,36 @@ mod tests {
         assert_eq!(
             alpha(&doc, &HashSet::from([2]), &AtomicBool::new(false)).unwrap()[18],
             0
+        );
+    }
+
+    #[test]
+    fn separate_clipping_runs_do_not_inflate_finishing_check_coverage() {
+        let mut doc = Document::new(1, 1);
+        doc.layers.clear();
+        for (index, (coverage, clipping)) in [(128, false), (255, true), (128, false), (255, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut layer = crate::Layer::new(index as u64 + 1, "layer", 1, 1);
+            layer.clipping = clipping;
+            layer.pixels.set_pixel(0, 0, [0, 0, 0, coverage]);
+            doc.layers.push(layer);
+        }
+        let cancel = AtomicBool::new(false);
+        assert_eq!(alpha(&doc, &HashSet::from([4]), &cancel).unwrap(), [192]);
+        let chosen = HashSet::from([1, 2, 3, 4]);
+        assert_eq!(
+            alpha(&doc, &chosen, &cancel).unwrap(),
+            [crate::composite_transparent(&doc)[3]]
+        );
+        let options = Options {
+            alpha_threshold: 200,
+            ..Options::default()
+        };
+        assert_eq!(
+            inspect(&doc, &[4], &options, &cancel).unwrap().counts,
+            [0; 3]
         );
     }
 

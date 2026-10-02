@@ -218,6 +218,12 @@ impl EfudeApp {
     /// Saves `balloons` and redraws the layers in `layers`, as one undo step.
     fn commit_balloons(&mut self, balloons: Vec<Balloon>, layers: &[u64]) {
         self.history.begin();
+        self.record_balloons(balloons, layers);
+        self.history.commit();
+    }
+
+    /// Updates editable objects and their pixels inside the current action.
+    fn record_balloons(&mut self, balloons: Vec<Balloon>, layers: &[u64]) {
         // Balloons whose layer was deleted go too.
         let balloons: Vec<Balloon> = balloons
             .into_iter()
@@ -230,7 +236,6 @@ impl EfudeApp {
         for layer in layers {
             self.redraw_balloon_layer(&balloons, layer);
         }
-        self.history.commit();
     }
 
     #[cfg(test)]
@@ -251,16 +256,20 @@ impl EfudeApp {
 
     /// A new balloon (or plain text) centred at `center`, on its own layer
     /// at the top of the stack.
+    /// Returns zero when the native document's layer capacity is exhausted.
     pub(crate) fn create_balloon(
         &mut self,
         center: glam::Vec2,
         size: Option<glam::Vec2>,
         shape: BalloonShape,
     ) -> u64 {
+        if !self.can_add_layers(1) {
+            return 0;
+        }
         let font = self.default_font();
         let balloons = self.balloons();
-        let id = balloons.iter().map(|b| b.id).max().unwrap_or(0) + 1;
-        let layer_id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+        let id = allocate_ids(balloons.iter().map(|b| b.id), 1)[0];
+        let layer_id = self.next_layer_id();
         let english = self.language_english;
         let name = match (shape == BalloonShape::None, english) {
             (true, false) => "テキスト",
@@ -282,11 +291,11 @@ impl EfudeApp {
         let layer = efude_canvas::Layer::new(layer_id, name, self.doc.width, self.doc.height);
         let at = self.doc.layers.len();
         self.history.insert_layer(&mut self.doc.layers, at, layer);
-        self.history.commit();
         self.selected_layer = at;
         let mut all = balloons;
         all.push(b);
-        self.commit_balloons(all, &[layer_id]);
+        self.record_balloons(all, &[layer_id]);
+        self.history.commit();
         self.balloon_ui.selected = Some(id);
         id
     }
@@ -370,7 +379,10 @@ impl EfudeApp {
             {
                 return;
             }
-            let layer_id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+            if !self.can_add_layers(1) {
+                return;
+            }
+            let layer_id = self.next_layer_id();
             let name = if self.language_english {
                 "Balloon"
             } else {
@@ -811,6 +823,167 @@ impl EfudeApp {
 mod tests {
     use super::*;
 
+    fn layer_capacity_app(count: usize, shared: bool) -> (EfudeApp, u64) {
+        let mut app = small_app();
+        app.balloon_ui.fonts = Some(Vec::new());
+        add_balloon(&mut app, glam::Vec2::new(54.0, 48.0));
+        let second = add_balloon(&mut app, glam::Vec2::new(74.0, 48.0));
+        if shared {
+            app.join_balloon(second, true);
+        }
+        let next_id = app.next_layer_id();
+        for offset in 0..count - app.doc.layers.len() {
+            app.doc.layers.push(efude_canvas::Layer::new(
+                next_id + offset as u64,
+                "empty",
+                128,
+                96,
+            ));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("balloon-capacity.efude");
+        efude_io::save(&path, &app.doc).unwrap();
+        app.doc = efude_io::load(&path).unwrap();
+        app.history = Default::default();
+        (app, second)
+    }
+
+    fn assert_capacity_document(actual: &Document, expected: &Document) {
+        assert_eq!(actual.metadata, expected.metadata);
+        assert_eq!(actual.layers.len(), expected.layers.len());
+        for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+            assert_eq!(actual.id, expected.id);
+            assert!(actual.property_state() == expected.property_state());
+            assert_eq!(actual.pixels.tile_keys(), expected.pixels.tile_keys());
+            for ((x, y), data) in expected.pixels.tiles() {
+                assert!(
+                    actual.pixels.tile_data(x, y) == Some(data),
+                    "paint changed on layer {}, tile ({x},{y})",
+                    actual.id
+                );
+            }
+        }
+    }
+
+    fn assert_capacity_rejection(app: &mut EfudeApp, operation: impl FnOnce(&mut EfudeApp)) {
+        let clean = app.doc.clone();
+        app.history.begin();
+        app.history
+            .set_metadata(&mut app.doc, "earlier-step", Some("pending".into()));
+        let before = app.doc.clone();
+        let selected = app.selected_layer;
+        let selected_balloon = app.balloon_ui.selected;
+        let state = app.history.state_token();
+        operation(app);
+        let directory = tempfile::tempdir().unwrap();
+        let saved = efude_io::save(&directory.path().join("still-savable.efude"), &app.doc);
+        assert!(
+            saved.is_ok(),
+            "creation made the native document unsavable: {:?}",
+            saved.err()
+        );
+        assert_capacity_document(&app.doc, &before);
+        assert_eq!(app.selected_layer, selected);
+        assert_eq!(app.balloon_ui.selected, selected_balloon);
+        assert_eq!(app.history.state_token(), state);
+        assert!(app.history.is_active());
+        assert!(!app.history.can_undo());
+        app.history.cancel(&mut app.doc);
+        assert_capacity_document(&app.doc, &clean);
+        assert!(!app.history.is_dirty());
+    }
+
+    fn assert_capacity_undo_and_save(app: &mut EfudeApp, before: &Document) {
+        let after = app.doc.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("last-slot.efude");
+        efude_io::save(&path, &app.doc).unwrap();
+        assert_capacity_document(&efude_io::load(&path).unwrap(), &after);
+        app.undo();
+        assert_capacity_document(&app.doc, before);
+        assert!(!app.history.can_undo());
+        app.redo();
+        assert_capacity_document(&app.doc, &after);
+        assert!(!app.history.can_redo());
+    }
+
+    #[test]
+    fn layer_capacity_balloon_creation_is_atomic() {
+        let (mut app, _) = layer_capacity_app(2000, false);
+        let mut created = u64::MAX;
+        assert_capacity_rejection(&mut app, |app| {
+            created = add_balloon(app, glam::Vec2::new(64.0, 48.0));
+        });
+        assert_eq!(created, 0);
+        let (mut app, _) = layer_capacity_app(1999, false);
+        let before = app.doc.clone();
+        assert_ne!(add_balloon(&mut app, glam::Vec2::new(64.0, 48.0)), 0);
+        assert_eq!(app.doc.layers.len(), 2000);
+        assert_capacity_undo_and_save(&mut app, &before);
+    }
+
+    #[test]
+    fn layer_capacity_shared_balloon_separation_is_atomic() {
+        let (mut app, second) = layer_capacity_app(2000, true);
+        assert_capacity_rejection(&mut app, |app| app.join_balloon(second, false));
+    }
+
+    #[test]
+    fn layer_capacity_balloon_join_can_free_a_slot_for_separation() {
+        let (mut app, second) = layer_capacity_app(2000, false);
+        let before = app.doc.clone();
+        app.join_balloon(second, true);
+        assert_eq!(app.doc.layers.len(), 1999);
+        assert_capacity_undo_and_save(&mut app, &before);
+        app.history = Default::default();
+        let before = app.doc.clone();
+        app.join_balloon(second, false);
+        assert_eq!(app.doc.layers.len(), 2000);
+        assert_capacity_undo_and_save(&mut app, &before);
+    }
+
+    #[test]
+    fn layer_capacity_already_separate_balloon_is_still_a_noop() {
+        let (mut app, second) = layer_capacity_app(2000, false);
+        app.status = "unchanged".into();
+        assert_capacity_rejection(&mut app, |app| app.join_balloon(second, false));
+        assert_eq!(app.status, "unchanged");
+    }
+
+    #[test]
+    fn native_max_id_can_create_and_separate_a_balloon() {
+        let mut doc = Document::new(128, 96);
+        doc.layers[0].id = u64::MAX;
+        let original = Balloon::new(u64::MAX, u64::MAX, glam::Vec2::new(64.0, 48.0), 72.0);
+        doc.metadata.insert(
+            METADATA_KEY.into(),
+            serde_json::to_string(&vec![original]).unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("balloon-ids.efude");
+        efude_io::save(&path, &doc).unwrap();
+        let mut app = EfudeApp::default();
+        app.doc = efude_io::load(&path).unwrap();
+        let id = add_balloon(&mut app, glam::Vec2::new(64.0, 48.0));
+        assert_eq!(id, 1);
+        assert_eq!(app.balloons()[0].id, u64::MAX);
+        assert_eq!(app.balloons()[0].layer_id, u64::MAX);
+        assert_eq!(app.balloons()[1].layer_id, 1);
+        app.undo();
+        assert_eq!(app.balloons().len(), 1);
+        assert_eq!(app.doc.layers.len(), 1);
+        app.redo();
+        app.join_balloon(id, true);
+        assert_eq!(app.doc.layers.len(), 1);
+        app.join_balloon(id, false);
+        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(app.balloons()[1].layer_id, 1);
+        efude_io::save(&path, &app.doc).unwrap();
+        let loaded = efude_io::load(&path).unwrap();
+        assert_eq!(loaded.layers[0].id, u64::MAX);
+        assert_eq!(loaded.metadata, app.doc.metadata);
+    }
+
     fn small_app() -> EfudeApp {
         let mut app = EfudeApp::default();
         app.doc = Document::new(128, 96);
@@ -820,6 +993,38 @@ mod tests {
 
     fn add_balloon(app: &mut EfudeApp, center: glam::Vec2) -> u64 {
         app.create_balloon(center, Some(glam::Vec2::splat(40.0)), BalloonShape::Ellipse)
+    }
+
+    #[test]
+    fn creating_a_balloon_undoes_its_layer_pixels_and_metadata_together() {
+        let mut app = small_app();
+        let before = app.doc.clone();
+        let before_token = app.history.state_token();
+        let id = add_balloon(&mut app, glam::Vec2::new(64.0, 48.0));
+        let after = app.doc.clone();
+        let after_token = app.history.state_token();
+        assert_eq!(app.balloons()[0].id, id);
+        assert!(after.layers[1].pixels.has_allocated_tiles());
+        for _ in 0..3 {
+            app.undo();
+            assert_eq!(app.doc.layers.len(), before.layers.len());
+            assert_eq!(app.doc.metadata, before.metadata);
+            assert_eq!(
+                app.doc.layers[0].pixels.to_dense(),
+                before.layers[0].pixels.to_dense()
+            );
+            assert_eq!(app.history.state_token(), before_token);
+            assert!(!app.history.can_undo());
+            app.redo();
+            assert_eq!(app.doc.layers.len(), after.layers.len());
+            assert_eq!(app.doc.metadata, after.metadata);
+            assert_eq!(
+                app.doc.layers[1].pixels.to_dense(),
+                after.layers[1].pixels.to_dense()
+            );
+            assert_eq!(app.history.state_token(), after_token);
+            assert!(!app.history.can_redo());
+        }
     }
 
     #[test]

@@ -398,6 +398,55 @@ impl EfudeApp {
         }
     }
 
+    pub(crate) fn finish_timelapse_on_tab_close(&mut self, document_id: u64) {
+        let Some(state) = self.timelapse_sessions.remove(&document_id) else {
+            return;
+        };
+        if !state.recording {
+            return;
+        }
+        let (mut document, revision) = if self.history.document_id() == document_id {
+            (self.document_snapshot(), self.history.content_revision())
+        } else if let Some(tab) = self
+            .tabs
+            .slots
+            .iter()
+            .filter_map(|slot| slot.parked.as_ref())
+            .find(|tab| tab.history.document_id() == document_id)
+        {
+            (tab.doc.clone(), tab.history.content_revision())
+        } else {
+            return;
+        };
+        if revision == state.last_content_revision {
+            return;
+        }
+        if !state.session.include_guide {
+            document.guide = None;
+        }
+        // Closing is also a recording stop. Preserve its latest committed edit,
+        // including one that has not reached the normal capture interval yet.
+        if self
+            .timelapse_worker
+            .sender
+            .send(Task::Frame {
+                document_id,
+                index: state.next_index,
+                document,
+                session: state.session,
+                repaint: egui::Context::default(),
+            })
+            .is_err()
+        {
+            self.status = self
+                .text(
+                    "タイムラプスの処理が停止しました",
+                    "Timelapse worker stopped",
+                )
+                .into();
+        }
+    }
+
     fn queue_timelapse_export(
         &mut self,
         dialog: &ExportDialog,

@@ -672,6 +672,10 @@ pub fn load_bundle(path: &std::path::Path) -> Result<Brush, Box<dyn std::error::
 
 /// Largest brush set file entry read (texture or metadata).
 const SET_ENTRY_LIMIT: u64 = 32 * 1024 * 1024;
+/// Largest encoded brush set, for both file and byte-slice entry points.
+const SET_FILE_LIMIT: u64 = 256 * 1024 * 1024;
+/// Total retained texture coverage, excluding decoder buffers and other allocations.
+const SET_TEXTURE_LIMIT: u64 = 512 * 1024 * 1024;
 /// Most brushes in one set.
 const SET_BRUSH_LIMIT: usize = 512;
 
@@ -735,7 +739,7 @@ pub fn set_bytes(brushes: &[Brush]) -> Result<Vec<u8>, Box<dyn std::error::Error
 /// Reads a brush set file (see [`save_set`]).
 pub fn load_set(path: &std::path::Path) -> Result<Vec<Brush>, Box<dyn std::error::Error>> {
     let size = std::fs::metadata(path)?.len();
-    if size > 256 * 1024 * 1024 {
+    if size > SET_FILE_LIMIT {
         return Err("brush set exceeds the size limit".into());
     }
     set_from_bytes(&std::fs::read(path)?)
@@ -743,7 +747,18 @@ pub fn load_set(path: &std::path::Path) -> Result<Vec<Brush>, Box<dyn std::error
 
 /// Reads the bytes of a brush set file (see [`save_set`]).
 pub fn set_from_bytes(bytes: &[u8]) -> Result<Vec<Brush>, Box<dyn std::error::Error>> {
+    set_from_bytes_with_limits(bytes, SET_FILE_LIMIT, SET_TEXTURE_LIMIT)
+}
+
+fn set_from_bytes_with_limits(
+    bytes: &[u8],
+    file_limit: u64,
+    texture_limit: u64,
+) -> Result<Vec<Brush>, Box<dyn std::error::Error>> {
     use std::io::Read;
+    if bytes.len() as u64 > file_limit {
+        return Err("brush set exceeds the size limit".into());
+    }
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     if z.len() > 1 + SET_BRUSH_LIMIT * 3 {
         return Err("brush set contains too many entries".into());
@@ -772,20 +787,68 @@ pub fn set_from_bytes(bytes: &[u8]) -> Result<Vec<Brush>, Box<dyn std::error::Er
     if brushes.is_empty() || brushes.len() > SET_BRUSH_LIMIT {
         return Err("a brush set holds 1 to 512 brushes".into());
     }
+    let mut texture_bytes = brushes
+        .iter()
+        .flat_map(|brush| [&brush.tip, &brush.grain_tip, &brush.grain_source])
+        .flatten()
+        .map(|texture| texture.coverage.len() as u64)
+        .sum();
+    check_set_texture_size(texture_bytes, texture_limit)?;
     for (index, brush) in brushes.iter_mut().enumerate() {
         validate_brush(brush)?;
         if let Some(data) = read_entry(&format!("{index}/tip.png"))? {
-            brush.tip = Some(decode_tip(&data)?);
+            replace_set_texture(&mut brush.tip, &data, &mut texture_bytes, texture_limit)?;
         }
         if let Some(data) = read_entry(&format!("{index}/grain.png"))? {
-            brush.grain_tip = Some(decode_tip(&data)?);
+            replace_set_texture(
+                &mut brush.grain_tip,
+                &data,
+                &mut texture_bytes,
+                texture_limit,
+            )?;
         }
         if let Some(data) = read_entry(&format!("{index}/grain_source.png"))? {
-            brush.grain_source = Some(decode_tip(&data)?);
+            replace_set_texture(
+                &mut brush.grain_source,
+                &data,
+                &mut texture_bytes,
+                texture_limit,
+            )?;
+            let refreshed_bytes = texture_bytes
+                - brush
+                    .grain_tip
+                    .as_ref()
+                    .map_or(0, |tip| tip.coverage.len() as u64)
+                + brush
+                    .grain_source
+                    .as_ref()
+                    .map_or(0, |tip| tip.coverage.len() as u64);
+            check_set_texture_size(refreshed_bytes, texture_limit)?;
             brush.refresh_grain();
+            texture_bytes = refreshed_bytes;
         }
     }
     Ok(brushes)
+}
+
+fn check_set_texture_size(bytes: u64, limit: u64) -> Result<(), Box<dyn std::error::Error>> {
+    if bytes > limit {
+        return Err("brush set texture coverage exceeds the size limit".into());
+    }
+    Ok(())
+}
+
+fn replace_set_texture(
+    slot: &mut Option<BrushTip>,
+    data: &[u8],
+    texture_bytes: &mut u64,
+    texture_limit: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let other_bytes = *texture_bytes - slot.as_ref().map_or(0, |tip| tip.coverage.len() as u64);
+    let texture = decode_tip_with_coverage_limit(data, texture_limit - other_bytes)?;
+    *texture_bytes = other_bytes + texture.coverage.len() as u64;
+    *slot = Some(texture);
+    Ok(())
 }
 
 fn encode_tip(tip: &BrushTip) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -813,6 +876,13 @@ fn validate_texture(tip: &BrushTip) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn decode_tip(bytes: &[u8]) -> Result<BrushTip, Box<dyn std::error::Error>> {
+    decode_tip_with_coverage_limit(bytes, u64::MAX)
+}
+
+fn decode_tip_with_coverage_limit(
+    bytes: &[u8],
+    coverage_limit: u64,
+) -> Result<BrushTip, Box<dyn std::error::Error>> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info()?;
     let info = reader.info();
@@ -830,6 +900,7 @@ fn decode_tip(bytes: &[u8]) -> Result<BrushTip, Box<dyn std::error::Error>> {
     let output_size = reader
         .output_buffer_size()
         .ok_or("brush texture output size is invalid")?;
+    check_set_texture_size(output_size as u64, coverage_limit)?;
     let mut frame = vec![0; output_size];
     let info = reader.next_frame(&mut frame)?;
     if info.width == 0
@@ -921,6 +992,103 @@ mod grain_tests {
             );
         }
         assert!(set_from_bytes(b"not a zip").is_err());
+    }
+
+    fn set_fixture(brushes: &[Brush], textures: &[(&str, BrushTip)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut bytes = Vec::new();
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opt = zip::write::SimpleFileOptions::default();
+        z.start_file("set.json", opt).unwrap();
+        z.write_all(
+            &serde_json::to_vec(&serde_json::json!({"version": 1, "brushes": brushes})).unwrap(),
+        )
+        .unwrap();
+        for (name, texture) in textures {
+            z.start_file(*name, opt).unwrap();
+            z.write_all(&encode_tip(texture).unwrap()).unwrap();
+        }
+        z.finish().unwrap();
+        bytes
+    }
+
+    fn small_texture(value: u8) -> BrushTip {
+        BrushTip {
+            width: 4,
+            height: 4,
+            coverage: vec![value; 16],
+        }
+    }
+
+    #[test]
+    fn brush_set_limits_input_and_total_texture_coverage() {
+        let mut brush = defaults().remove(0);
+        brush.tip = Some(small_texture(200));
+        brush.set_grain_source(Some(small_texture(100)));
+        let brushes = vec![brush.clone(), brush];
+        let bytes = set_bytes(&brushes).unwrap();
+        assert!(set_from_bytes_with_limits(&bytes, bytes.len() as u64, 95).is_err());
+        assert!(set_from_bytes_with_limits(&bytes, bytes.len() as u64 - 1, 96).is_err());
+        let loaded = set_from_bytes_with_limits(&bytes, bytes.len() as u64, 96).unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(brushes).unwrap()
+        );
+    }
+
+    #[test]
+    fn brush_set_counts_inline_textures_and_replaces_slots() {
+        let mut brush = defaults().remove(0);
+        brush.tip = Some(small_texture(1));
+        let bytes = set_fixture(&[brush.clone()], &[]);
+        assert!(set_from_bytes_with_limits(&bytes, u64::MAX, 15).is_err());
+        assert!(set_from_bytes_with_limits(&bytes, u64::MAX, 16).is_ok());
+        let mut inline = brush.clone();
+        inline.grain_tip = Some(small_texture(3));
+        inline.grain_source = Some(small_texture(4));
+        let bytes = set_fixture(&[inline], &[]);
+        assert!(set_from_bytes_with_limits(&bytes, u64::MAX, 47).is_err());
+        assert!(set_from_bytes_with_limits(&bytes, u64::MAX, 48).is_ok());
+        let bytes = set_fixture(&[brush], &[("0/tip.png", small_texture(2))]);
+        let loaded = set_from_bytes_with_limits(&bytes, u64::MAX, 16).unwrap();
+        assert_eq!(loaded[0].tip.as_ref().unwrap().coverage, vec![2; 16]);
+    }
+
+    #[test]
+    fn brush_set_counts_derived_grain_and_replaces_it() {
+        let mut brush = defaults().remove(0);
+        brush.grain_invert = true;
+        brush.grain_binary = true;
+        let source = small_texture(100);
+        let bytes = set_fixture(&[brush.clone()], &[("0/grain_source.png", source.clone())]);
+        assert!(set_from_bytes_with_limits(&bytes, u64::MAX, 31).is_err());
+        let loaded = set_from_bytes_with_limits(&bytes, u64::MAX, 32).unwrap();
+        assert_eq!(
+            loaded[0].grain_source.as_ref().unwrap().coverage,
+            vec![100; 16]
+        );
+        assert_eq!(
+            loaded[0].grain_tip.as_ref().unwrap().coverage,
+            vec![255; 16]
+        );
+        brush.grain_tip = Some(small_texture(1));
+        let bytes = set_fixture(&[brush.clone()], &[("0/grain_source.png", source.clone())]);
+        let loaded = set_from_bytes_with_limits(&bytes, u64::MAX, 32).unwrap();
+        assert_eq!(
+            loaded[0].grain_tip.as_ref().unwrap().coverage,
+            vec![255; 16]
+        );
+        brush.grain_source = Some(small_texture(2));
+        let bytes = set_fixture(&[brush], &[("0/grain_source.png", source)]);
+        let loaded = set_from_bytes_with_limits(&bytes, u64::MAX, 32).unwrap();
+        assert_eq!(
+            loaded[0].grain_source.as_ref().unwrap().coverage,
+            vec![100; 16]
+        );
+        assert_eq!(
+            loaded[0].grain_tip.as_ref().unwrap().coverage,
+            vec![255; 16]
+        );
     }
 
     /// Writes `assets/brushes/default.efudebrushes`, the preset set a new

@@ -5,6 +5,29 @@ use efude_brush::{Brush, BrushKind, DynamicSource, ReferenceTarget, SampleRange}
 use efude_canvas::{BlendMode, Document, History, LayerKind, Selection};
 use efude_core::InkPoint;
 use serde::{Deserialize, Serialize};
+
+/// Reserve unique positive IDs, retaining the usual consecutive allocation
+/// while it fits. Existing IDs and the objects referring to them stay intact.
+fn allocate_ids(existing: impl IntoIterator<Item = u64>, count: usize) -> Vec<u64> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let used = existing
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let maximum = used.iter().copied().max().unwrap_or(0);
+    if let Some(last) = u64::try_from(count)
+        .ok()
+        .and_then(|count| maximum.checked_add(count))
+    {
+        return (maximum + 1..=last).collect();
+    }
+    (1..=u64::MAX)
+        .filter(|id| !used.contains(id))
+        .take(count)
+        .collect()
+}
+
 enum IoCompletion {
     BookExportFinished {
         receipts: Vec<book::SaveReceipt>,
@@ -313,12 +336,147 @@ fn decode_limited_image(
     // Only shrink: `thumbnail` would also enlarge small images (a 64 px
     // grain would become a blurred 4096 px one).
     let image = if image.width() > max_width.max(1) || image.height() > max_height.max(1) {
-        image.thumbnail(max_width.max(1), max_height.max(1))
+        thumbnail_imported_image(&image, max_width.max(1), max_height.max(1))
     } else {
-        image
-    }
-    .to_rgba8();
+        image.to_rgba8()
+    };
     Ok((image.width(), image.height(), image.into_raw()))
+}
+
+fn thumbnail_imported_image(
+    image: &image::DynamicImage,
+    max_width: u32,
+    max_height: u32,
+) -> image::RgbaImage {
+    use image::{DynamicImage, GenericImageView};
+    let has_transparency = match image {
+        DynamicImage::ImageRgba8(pixels) => pixels.pixels().any(|pixel| pixel[3] != u8::MAX),
+        DynamicImage::ImageLumaA8(pixels) => pixels.pixels().any(|pixel| pixel[1] != u8::MAX),
+        DynamicImage::ImageRgba16(pixels) => pixels.pixels().any(|pixel| pixel[3] != u16::MAX),
+        DynamicImage::ImageLumaA16(pixels) => pixels.pixels().any(|pixel| pixel[1] != u16::MAX),
+        _ => false,
+    };
+    // Match image 0.25.10's thumbnail dimensions and integer block sampling:
+    // https://docs.rs/image/0.25.10/src/image/imageops/sample.rs.html
+    // Both axes only shrink, so the fractional sample branches are unnecessary.
+    // Evaluate one output pixel at a time without a wide-channel image buffer.
+    let ratio =
+        (max_width as f64 / image.width() as f64).min(max_height as f64 / image.height() as f64);
+    let width = (image.width() as f64 * ratio).round().max(1.0) as u32;
+    let height = (image.height() as f64 * ratio).round().max(1.0) as u32;
+    if !has_transparency && !thumbnail_accumulator_overflows(image, width, height) {
+        return image.thumbnail(max_width, max_height).to_rgba8();
+    }
+    let premultiplied = PremultipliedImport(image);
+    let mut output = image::RgbaImage::new(width, height);
+    let alpha_scale = u64::from(u16::MAX).pow(2);
+    let x_ratio = image.width() as f32 / width as f32;
+    let y_ratio = image.height() as f32 / height as f32;
+    for y in 0..height {
+        let (bottom, top) = thumbnail_axis_range(y, image.height(), y_ratio);
+        for x in 0..width {
+            let (left, right) = thumbnail_axis_range(x, image.width(), x_ratio);
+            let samples = u64::from(right - left) * u64::from(top - bottom);
+            let mut sum = [0u64; 4];
+            for source_y in bottom..top {
+                for source_x in left..right {
+                    let pixel = premultiplied.get_pixel(source_x, source_y);
+                    for channel in 0..4 {
+                        sum[channel] += u64::from(pixel[channel]);
+                    }
+                }
+            }
+            let source = sum.map(|channel| (channel + samples / 2) / samples);
+            let target = output.get_pixel_mut(x, y);
+            let alpha = source[3];
+            target[3] = ((alpha * 255 + alpha_scale / 2) / alpha_scale) as u8;
+            if target[3] != 0 {
+                for channel in 0..3 {
+                    target[channel] = ((source[channel] * 255 + alpha / 2) / alpha).min(255) as u8;
+                }
+            }
+        }
+    }
+    output
+}
+
+fn thumbnail_axis_range(position: u32, length: u32, ratio: f32) -> (u32, u32) {
+    let startf = position as f32 * ratio;
+    let start = (startf.ceil() as u32).min(length - 1);
+    let end = ((startf + ratio).ceil() as u32).clamp(start, length);
+    (start, end)
+}
+
+fn thumbnail_block_overflows(samples: u64, sample_max: u64) -> bool {
+    samples
+        .saturating_mul(sample_max)
+        .saturating_add(samples / 2)
+        > u64::from(u32::MAX)
+}
+
+fn thumbnail_accumulator_overflows(image: &image::DynamicImage, width: u32, height: u32) -> bool {
+    use image::ColorType;
+    let sample_max = match image.color() {
+        ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8 => u64::from(u8::MAX),
+        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 => {
+            u64::from(u16::MAX)
+        }
+        _ => return false,
+    };
+    // Scan just the output axes (at most 30,000 each), using the exact f32
+    // intervals so ceil roundoff cannot underestimate a block's sample count.
+    let max_span = |length: u32, output: u32| {
+        let ratio = length as f32 / output as f32;
+        (0..output)
+            .map(|position| {
+                let (start, end) = thumbnail_axis_range(position, length, ratio);
+                u64::from(end - start)
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    thumbnail_block_overflows(
+        max_span(image.width(), width) * max_span(image.height(), height),
+        sample_max,
+    )
+}
+
+struct PremultipliedImport<'a>(&'a image::DynamicImage);
+
+impl image::GenericImageView for PremultipliedImport<'_> {
+    type Pixel = image::Rgba<u32>;
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.0.width(), self.0.height())
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> Self::Pixel {
+        let pixel = match self.0 {
+            image::DynamicImage::ImageRgba16(pixels) => pixels.get_pixel(x, y).0,
+            image::DynamicImage::ImageRgb16(pixels) => {
+                let pixel = pixels.get_pixel(x, y);
+                [pixel[0], pixel[1], pixel[2], u16::MAX]
+            }
+            image::DynamicImage::ImageLuma16(pixels) => {
+                let value = pixels.get_pixel(x, y)[0];
+                [value, value, value, u16::MAX]
+            }
+            image::DynamicImage::ImageLumaA16(pixels) => {
+                let pixel = pixels.get_pixel(x, y);
+                [pixel[0], pixel[0], pixel[0], pixel[1]]
+            }
+            image => image.get_pixel(x, y).0.map(|value| u16::from(value) * 257),
+        };
+        // Keep native 16-bit products unrounded. The u64 accumulator holds
+        // 100,000,000 * 65535^2 without overflow.
+        let alpha = u32::from(pixel[3]);
+        image::Rgba([
+            u32::from(pixel[0]) * alpha,
+            u32::from(pixel[1]) * alpha,
+            u32::from(pixel[2]) * alpha,
+            u32::from(u16::MAX) * alpha,
+        ])
+    }
 }
 
 fn load_brush_texture(path: &std::path::Path) -> Result<efude_brush::BrushTip, String> {
@@ -658,6 +816,13 @@ fn default_secondary_color() -> [u8; 4] {
 }
 fn default_intermediate_mix() -> f32 {
     0.5
+}
+fn finite_clamp(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
 }
 fn default_backup_interval_minutes() -> u32 {
     5
@@ -1052,6 +1217,11 @@ pub struct EfudeApp {
     tablet_seen: bool,
     stroke_started_at: Option<std::time::Instant>,
     window_samples_started: bool,
+    stroke_window_origin: Option<(Pos2, InkPoint)>,
+    native_contact_active: bool,
+    canvas_input_handled: bool,
+    frame_native_ends: usize,
+    canvas_input_layer: Option<egui::LayerId>,
     gpu_canvas_surface: Option<GpuCanvasSurface>,
     gpu_canvas_disabled: bool,
     navigator_texture_dirty: bool,
@@ -1079,6 +1249,7 @@ pub struct EfudeApp {
     stroke_log: efude_input::StrokeLog,
     pen_queue: efude_input::PenInputQueue,
     frame_pen_packets: Vec<efude_input::PenPacket>,
+    frame_pen_events: Vec<efude_input::PenInputEvent>,
     use_windows_ink: bool,
     use_wintab: bool,
     io_task_sender: IoSender,
@@ -1544,6 +1715,11 @@ impl Default for EfudeApp {
             tablet_seen: false,
             stroke_started_at: None,
             window_samples_started: false,
+            stroke_window_origin: None,
+            native_contact_active: false,
+            canvas_input_handled: false,
+            frame_native_ends: 0,
+            canvas_input_layer: None,
             gpu_canvas_surface: None,
             gpu_canvas_disabled: false,
             navigator_texture_dirty: true,
@@ -1569,6 +1745,7 @@ impl Default for EfudeApp {
             stroke_log: efude_input::StrokeLog::default(),
             pen_queue: efude_input::PenInputQueue::default(),
             frame_pen_packets: Vec::new(),
+            frame_pen_events: Vec::new(),
             use_windows_ink: true,
             use_wintab: false,
             io_task_sender: IoSender {
@@ -1695,6 +1872,7 @@ impl EfudeApp {
         }
     }
     fn select_layer(&mut self, index: usize) {
+        self.finish_pending_canvas_gesture();
         self.selected_layer = index.min(self.doc.layers.len().saturating_sub(1));
         self.editing_mask = false;
     }
@@ -1814,6 +1992,7 @@ impl EfudeApp {
                 blend_mode: 0,
                 linear_blend: false,
                 clipping: false,
+                background: true,
             });
         }
         for layer in self
@@ -1894,6 +2073,7 @@ impl EfudeApp {
                 blend_mode,
                 linear_blend: layer.linear_blend,
                 clipping: layer.clipping,
+                background: false,
             });
         }
         if gpu_layers.len() > 200 {
@@ -2366,6 +2546,31 @@ impl EfudeApp {
         self.canvas_texture_dirty = true;
         self.navigator_texture_dirty = true;
     }
+    fn next_layer_ids(&self, count: usize) -> Vec<u64> {
+        allocate_ids(self.doc.layers.iter().map(|layer| layer.id), count)
+    }
+
+    fn next_layer_id(&self) -> u64 {
+        self.next_layer_ids(1)[0]
+    }
+
+    fn can_add_layers(&mut self, count: usize) -> bool {
+        if self
+            .doc
+            .layers
+            .len()
+            .checked_add(count)
+            .is_some_and(|total| total <= 2000)
+        {
+            true
+        } else {
+            self.status = self
+                .text("レイヤー数の上限です（2000）", "Layer limit reached (2000)")
+                .into();
+            false
+        }
+    }
+
     fn duplicate_layer_subtree(&mut self) {
         self.finish_pending_canvas_gesture();
         let Some(root) = self.doc.layers.get(self.selected_layer) else {
@@ -2396,32 +2601,19 @@ impl EfudeApp {
             .filter_map(|(index, layer)| subtree_ids.contains(&layer.id).then_some(index))
             .collect::<Vec<_>>();
         source_indices.sort_unstable();
+        if !self.can_add_layers(source_indices.len()) {
+            return;
+        }
         let insert_at = source_indices
             .last()
             .copied()
             .unwrap_or(self.selected_layer)
             + 1;
-        let Some(first_id) = self
-            .doc
-            .layers
-            .iter()
-            .map(|layer| layer.id)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-        else {
-            self.status = self
-                .text(
-                    "レイヤーIDを割り当てられません",
-                    "Could not assign a layer ID",
-                )
-                .into();
-            return;
-        };
+        let ids = self.next_layer_ids(source_indices.len());
         let id_map = source_indices
             .iter()
             .enumerate()
-            .map(|(offset, &index)| (self.doc.layers[index].id, first_id + offset as u64))
+            .map(|(offset, &index)| (self.doc.layers[index].id, ids[offset]))
             .collect::<std::collections::HashMap<_, _>>();
         let mut copies = source_indices
             .iter()
@@ -2467,8 +2659,11 @@ impl EfudeApp {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
-    ) -> usize {
-        let id = doc.layers.iter().map(|layer| layer.id).max().unwrap_or(0) + 1;
+    ) -> Result<usize, ()> {
+        if doc.layers.len() >= 2000 {
+            return Err(());
+        }
+        let id = allocate_ids(doc.layers.iter().map(|layer| layer.id), 1)[0];
         let name = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -2500,7 +2695,7 @@ impl EfudeApp {
         layer.pixels.prune_empty_tiles();
         doc.layers[index] = layer;
         history.commit();
-        index
+        Ok(index)
     }
     fn install_system_font(ctx: &egui::Context) {
         let mut candidates = Vec::new();
@@ -2560,9 +2755,10 @@ impl EfudeApp {
                 && let RawWindowHandle::Win32(handle) = handle.as_raw()
             {
                 app.windows_ink_hwnd = handle.hwnd.get();
-                app.windows_ink_hook = efude_input::WindowsInkHook::install(
+                app.windows_ink_hook = efude_input::WindowsInkHook::install_with_events(
                     handle.hwnd.get() as *mut std::ffi::c_void,
                     app.pen_queue.shared(),
+                    app.pen_queue.shared_events(),
                 )
                 .ok();
             }
@@ -2620,7 +2816,8 @@ impl EfudeApp {
                 settings.secondary_color[2],
                 settings.secondary_color[3],
             );
-            app.intermediate_mix = settings.intermediate_mix.clamp(0.0, 1.0);
+            app.intermediate_mix =
+                finite_clamp(settings.intermediate_mix, 0.0, 1.0, app.intermediate_mix);
             if !settings.palette.is_empty() {
                 app.palette = settings.palette.into_iter().take(64).collect();
             }
@@ -2631,11 +2828,22 @@ impl EfudeApp {
             {
                 app.workspace = workspace;
             }
-            app.tools_panel_width = settings.tools_panel_width.clamp(120.0, 480.0);
-            app.layers_panel_width = settings.layers_panel_width.clamp(120.0, 480.0);
-            app.size = settings.size.clamp(1.0, MAX_BRUSH_SIZE);
-            app.zoom = settings.zoom.clamp(0.1, 4.0);
-            app.view_rotation = settings.view_rotation.clamp(-180.0, 180.0);
+            app.tools_panel_width = finite_clamp(
+                settings.tools_panel_width,
+                120.0,
+                480.0,
+                app.tools_panel_width,
+            );
+            app.layers_panel_width = finite_clamp(
+                settings.layers_panel_width,
+                120.0,
+                480.0,
+                app.layers_panel_width,
+            );
+            app.size = finite_clamp(settings.size, 1.0, MAX_BRUSH_SIZE, app.size);
+            app.zoom = finite_clamp(settings.zoom, 0.01, 64.0, app.zoom);
+            app.view_rotation =
+                finite_clamp(settings.view_rotation, -180.0, 180.0, app.view_rotation);
             app.flip_x = settings.flip_x;
             app.flip_y = settings.flip_y;
             app.show_grid = settings.show_grid;
@@ -2646,8 +2854,18 @@ impl EfudeApp {
             app.symmetry_y = settings.symmetry_y;
             app.symmetry_count = settings.symmetry_count.clamp(1, 32);
             app.symmetry_center = Vec2::new(
-                settings.symmetry_center[0].clamp(0.0, app.doc.width.saturating_sub(1) as f32),
-                settings.symmetry_center[1].clamp(0.0, app.doc.height.saturating_sub(1) as f32),
+                finite_clamp(
+                    settings.symmetry_center[0],
+                    0.0,
+                    app.doc.width.saturating_sub(1) as f32,
+                    app.symmetry_center.x,
+                ),
+                finite_clamp(
+                    settings.symmetry_center[1],
+                    0.0,
+                    app.doc.height.saturating_sub(1) as f32,
+                    app.symmetry_center.y,
+                ),
             );
             app.perspective_points = settings
                 .perspective_points
@@ -2664,8 +2882,21 @@ impl EfudeApp {
                 .perspective_selected
                 .min(app.perspective_points.len().saturating_sub(1));
             app.shortcuts = settings.shortcuts;
-            app.tone_curve = settings.tone_curve;
-            app.pressure_curve_points = settings.pressure_curve_points.map(|v| v.clamp(0.0, 1.0));
+            app.tone_curve = std::array::from_fn(|i| {
+                if settings.tone_curve[i].is_finite() {
+                    settings.tone_curve[i]
+                } else {
+                    app.tone_curve[i]
+                }
+            });
+            app.pressure_curve_points = std::array::from_fn(|i| {
+                finite_clamp(
+                    settings.pressure_curve_points[i],
+                    0.0,
+                    1.0,
+                    app.pressure_curve_points[i],
+                )
+            });
             app.use_windows_ink = settings.use_windows_ink;
             app.use_wintab = settings.use_wintab;
             app.eyedropper_radius = settings.eyedropper_radius.min(64);
@@ -2722,9 +2953,10 @@ impl EfudeApp {
         if self.use_wintab {
             self.windows_ink_hook = None;
             if self.wintab_hook.is_none() && self.windows_ink_hwnd != 0 {
-                match efude_input::WintabHook::install(
+                match efude_input::WintabHook::install_with_events(
                     self.windows_ink_hwnd as *mut std::ffi::c_void,
                     self.pen_queue.shared(),
+                    self.pen_queue.shared_events(),
                 ) {
                     Ok(hook) => {
                         self.wintab_hook = Some(hook);
@@ -2743,9 +2975,10 @@ impl EfudeApp {
         }
         if self.use_windows_ink {
             if self.windows_ink_hook.is_none() && self.windows_ink_hwnd != 0 {
-                self.windows_ink_hook = efude_input::WindowsInkHook::install(
+                self.windows_ink_hook = efude_input::WindowsInkHook::install_with_events(
                     self.windows_ink_hwnd as *mut std::ffi::c_void,
                     self.pen_queue.shared(),
+                    self.pen_queue.shared_events(),
                 )
                 .ok();
             }
@@ -2754,6 +2987,8 @@ impl EfudeApp {
         }
         if !self.use_windows_ink && !self.use_wintab {
             self.frame_pen_packets.clear();
+            self.frame_pen_events.clear();
+            self.native_contact_active = false;
         }
     }
     fn pressure_at(ctx: &egui::Context, pos: Pos2) -> f32 {
@@ -2935,6 +3170,7 @@ impl EfudeApp {
     }
     fn reset_stroke_buffers(&mut self) {
         self.raster.reset_buffers();
+        self.stroke_window_origin = None;
     }
     /// Starts the grain of a stroke at `origin`; brushes whose canvas grain
     /// turns with every stroke get a new random angle.
@@ -3487,14 +3723,19 @@ impl EfudeApp {
         enabled: bool,
         tool_keys: &[(egui::Key, Tool, bool)],
     ) {
-        let (pointer_down, pointer_released) =
-            ctx.input(|input| (input.pointer.any_down(), input.pointer.any_released()));
-        let pointer_busy = pointer_down || pointer_released;
+        let (focused, pointer_down, pointer_released) = ctx.input(|input| {
+            (
+                input.focused,
+                input.pointer.any_down(),
+                input.pointer.any_released(),
+            )
+        });
+        let pointer_busy = focused && (pointer_down || pointer_released);
         if let Some(held) = &mut self.held_tool_key {
             if pointer_busy {
                 held.used = true;
             }
-            if !ctx.input(|input| input.key_down(held.key)) {
+            if !focused || !ctx.input(|input| input.key_down(held.key)) {
                 held.released = true;
             }
             // Canvas processing later in this frame must finish with the tool
@@ -3503,16 +3744,11 @@ impl EfudeApp {
                 ctx.request_repaint();
             }
             if held.released && !pointer_busy {
-                let held = self.held_tool_key.take().unwrap();
-                let spring_back =
-                    held.hold_only || held.used || held.pressed_at.elapsed() >= TOOL_KEY_HOLD;
-                if spring_back {
-                    self.switch_tool(held.previous);
-                }
+                self.finish_held_tool_key();
             }
             return;
         }
-        if !enabled || pointer_busy {
+        if !focused || !enabled || pointer_busy {
             return;
         }
         for &(key, tool, hold_only) in tool_keys {
@@ -3528,6 +3764,13 @@ impl EfudeApp {
                 self.switch_tool(tool);
                 break;
             }
+        }
+    }
+    fn finish_held_tool_key(&mut self) {
+        if let Some(held) = self.held_tool_key.take()
+            && (held.hold_only || held.used || held.pressed_at.elapsed() >= TOOL_KEY_HOLD)
+        {
+            self.switch_tool(held.previous);
         }
     }
     fn switch_tool(&mut self, tool: Tool) {
@@ -3834,6 +4077,7 @@ impl EfudeApp {
         );
     }
     fn change_selection(&mut self, change: impl FnOnce(&mut Selection, u32, u32)) {
+        self.finish_pending_canvas_gesture();
         let before_active = self.selection.active;
         let before = self.selection.mask.clone();
         change(&mut self.selection, self.doc.width, self.doc.height);
@@ -3933,6 +4177,7 @@ impl EfudeApp {
             return;
         }
         let mut p = p;
+        let raw_pressure = p.pressure;
         p.pressure =
             self.brushes[self.selected_brush].map_pressure(self.global_pressure_curve(p.pressure));
         let dynamics = efude_brush::engine::dynamics(
@@ -3947,6 +4192,21 @@ impl EfudeApp {
         self.dynamic_mix = dynamics.mix;
         self.dynamic_dilution = dynamics.dilution;
         if matches!(self.tool, Tool::SelectionBrush | Tool::QuickMask) {
+            if !self.size.is_finite()
+                || self.size <= 0.0
+                || !p.position.is_finite()
+                || !raw_pressure.is_finite()
+                || !p.pressure.is_finite()
+                || !p.taper.is_finite()
+                || !p.tilt.is_finite()
+                || !p.rotation.is_finite()
+            {
+                self.raster.last_dab = None;
+                return;
+            }
+            self.selection_dab_segment(p, &dynamics);
+            self.dynamic_size = dynamics.size;
+            self.dynamic_opacity = dynamics.opacity;
             for point in self.symmetric_points(p) {
                 self.selection_dab(point);
             }
@@ -3968,6 +4228,188 @@ impl EfudeApp {
         };
         self.raster.finish_dab(style, p);
     }
+
+    /// Fills missing selection dabs between actual input points. The endpoint
+    /// is still painted by `dab`; selection history/combine is unchanged.
+    fn selection_dab_segment(
+        &mut self,
+        p: InkPoint,
+        dynamics: &efude_brush::engine::Dynamics,
+    ) -> usize {
+        let Some(previous) = self.raster.last_dab else {
+            return 0;
+        };
+        if !previous.position.is_finite()
+            || !previous.pressure.is_finite()
+            || !previous.taper.is_finite()
+            || !previous.tilt.is_finite()
+            || !previous.rotation.is_finite()
+        {
+            return 0;
+        }
+        let brush = &self.brushes[self.selected_brush];
+        let previous_dynamics =
+            efude_brush::engine::dynamics(brush, &previous, None, self.view_scale);
+        let tilt = previous.tilt.length().max(p.tilt.length()).clamp(0.0, 1.0);
+        let aspect = brush.tip_aspect.clamp(0.1, 10.0);
+        let flattened = (brush.tip_aspect * (1.0 - brush.tilt_flattening.clamp(0.0, 0.9) * tilt))
+            .clamp(0.1, 10.0);
+        let extent_factor = f64::from(aspect.max(1.0 / flattened));
+        let source = match brush.size_source {
+            DynamicSource::None => 1.0,
+            DynamicSource::Pressure => previous.pressure.max(p.pressure),
+            DynamicSource::Tilt => tilt,
+            _ => 1.0,
+        };
+        let source = if brush.size_source == DynamicSource::None {
+            1.0
+        } else {
+            let minimum = brush.size_min.clamp(0.0, 1.0);
+            minimum + (1.0 - minimum) * source
+        };
+        let max_size = f64::from(source)
+            * f64::from(1.0 + 0.75 * brush.speed_size.abs().clamp(0.0, 1.0))
+            * f64::from((1.0 + brush.tilt_size.abs().clamp(0.0, 1.0) * tilt).clamp(0.2, 1.8))
+            * f64::from(previous.taper.max(p.taper).clamp(0.01, 1.0));
+        let extent = (f64::from(self.size) * max_size * 0.5).max(0.5) * extent_factor;
+        let minor_radius = f64::from(
+            Self::brush_radius(self.size, previous_dynamics.size)
+                .min(Self::brush_radius(self.size, dynamics.size)),
+        ) / extent_factor;
+        // Preserve deliberately sparse brush settings. A large real radius
+        // also keeps a whole-page dab from being repeated at subpixel spacing.
+        let spacing = f64::from(self.stroke_spacing().min(f32::MAX))
+            .max(minor_radius * 0.5)
+            .max(0.25);
+        let max_steps =
+            (4.0 * (f64::from(self.doc.width) + f64::from(self.doc.height)) + 4.0).max(1.0);
+        let mirrored_previous = self.symmetric_points(previous);
+        let mirrored_next = self.symmetric_points(p);
+        let mut count = 0;
+        for (a, b) in mirrored_previous.into_iter().zip(mirrored_next) {
+            let Some((first, last)) = Self::selection_segment_interval(
+                a.position,
+                b.position,
+                extent,
+                self.doc.width,
+                self.doc.height,
+            ) else {
+                continue;
+            };
+            let length = (f64::from(b.position.x) - f64::from(a.position.x))
+                .hypot(f64::from(b.position.y) - f64::from(a.position.y));
+            let steps = (length * (last - first) / spacing)
+                .ceil()
+                .clamp(1.0, max_steps) as usize;
+            for index in 1..=steps {
+                let t = first + (last - first) * index as f64 / steps as f64;
+                if t <= 0.0 || t >= 1.0 {
+                    continue;
+                }
+                let interpolate = |a: InkPoint, b: InkPoint| {
+                    let lerp =
+                        |a: f32, b: f32| (f64::from(a) * (1.0 - t) + f64::from(b) * t) as f32;
+                    let angle = (f64::from(b.rotation) - f64::from(a.rotation)
+                        + std::f64::consts::PI)
+                        .rem_euclid(std::f64::consts::TAU)
+                        - std::f64::consts::PI;
+                    InkPoint {
+                        position: glam::Vec2::new(
+                            lerp(a.position.x, b.position.x),
+                            lerp(a.position.y, b.position.y),
+                        ),
+                        pressure: lerp(a.pressure, b.pressure),
+                        taper: lerp(a.taper, b.taper),
+                        tilt: glam::Vec2::new(lerp(a.tilt.x, b.tilt.x), lerp(a.tilt.y, b.tilt.y)),
+                        rotation: (f64::from(a.rotation) + angle * t) as f32,
+                        time_ms: a.time_ms.saturating_add(
+                            (b.time_ms.saturating_sub(a.time_ms) as f64 * t) as u64,
+                        ),
+                    }
+                };
+                let input = interpolate(previous, p);
+                let dynamics = efude_brush::engine::dynamics(
+                    &self.brushes[self.selected_brush],
+                    &input,
+                    Some(previous),
+                    self.view_scale,
+                );
+                self.dynamic_size = dynamics.size;
+                self.dynamic_opacity = dynamics.opacity;
+                self.selection_dab(interpolate(a, b));
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn selection_segment_interval(
+        a: glam::Vec2,
+        b: glam::Vec2,
+        extent: f64,
+        width: u32,
+        height: u32,
+    ) -> Option<(f64, f64)> {
+        if width == 0 || height == 0 || !a.is_finite() || !b.is_finite() || !extent.is_finite() {
+            return None;
+        }
+        let (mut first, mut last) = (0.0f64, 1.0f64);
+        for (a, b, edge) in [(a.x, b.x, width - 1), (a.y, b.y, height - 1)] {
+            let a = f64::from(a);
+            let delta = f64::from(b) - a;
+            if delta == 0.0 {
+                if a < -extent || a > f64::from(edge) + extent {
+                    return None;
+                }
+            } else {
+                let t0 = (-extent - a) / delta;
+                let t1 = (f64::from(edge) + extent - a) / delta;
+                first = first.max(t0.min(t1));
+                last = last.min(t0.max(t1));
+            }
+            if first > last {
+                return None;
+            }
+        }
+        Some((first, last))
+    }
+
+    fn brush_radius(size: f32, dynamic_size: f32) -> f32 {
+        let radius = size * dynamic_size * 0.5;
+        if radius.is_infinite() && size.is_finite() && dynamic_size.is_finite() {
+            (f64::from(size) * f64::from(dynamic_size) * 0.5).clamp(0.5, f64::from(f32::MAX)) as f32
+        } else {
+            radius.max(0.5)
+        }
+    }
+
+    fn clipped_brush_bounds(
+        position: glam::Vec2,
+        radius: f32,
+        width: u32,
+        height: u32,
+    ) -> Option<[i32; 4]> {
+        if width == 0 || height == 0 || !position.is_finite() || radius.is_nan() {
+            return None;
+        }
+        // Keep the existing rounded centre and inclusive range, but intersect
+        // it with the document before converting or iterating large extents.
+        let x = f64::from(position.x.round());
+        let y = f64::from(position.y.round());
+        let radius = f64::from(radius).ceil();
+        let right = f64::from(width - 1);
+        let bottom = f64::from(height - 1);
+        if x + radius < 0.0 || y + radius < 0.0 || x - radius > right || y - radius > bottom {
+            return None;
+        }
+        Some([
+            (x - radius).max(0.0) as i32,
+            (y - radius).max(0.0) as i32,
+            (x + radius).min(right) as i32,
+            (y + radius).min(bottom) as i32,
+        ])
+    }
+
     fn selection_dab(&mut self, p: InkPoint) {
         let w = self.doc.width;
         let h = self.doc.height;
@@ -3976,7 +4418,7 @@ impl EfudeApp {
             self.selection.active = true;
         }
         let brush = &self.brushes[self.selected_brush];
-        let r = (self.size * self.dynamic_size * 0.5).max(0.5);
+        let r = Self::brush_radius(self.size, self.dynamic_size);
         let tilt = p.tilt.length().clamp(0.0, 1.0);
         let aspect = (brush.tip_aspect * (1.0 - brush.tilt_flattening.clamp(0.0, 0.9) * tilt))
             .clamp(0.1, 10.0);
@@ -3988,14 +4430,13 @@ impl EfudeApp {
                 0.0
             };
         let (sin, cos) = angle.sin_cos();
-        let cx = p.position.x.round() as i32;
-        let cy = p.position.y.round() as i32;
         let extent = r * aspect.max(1.0 / aspect);
-        for y in cy - extent.ceil() as i32..=cy + extent.ceil() as i32 {
-            for x in cx - extent.ceil() as i32..=cx + extent.ceil() as i32 {
-                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-                    continue;
-                }
+        let Some([left, top, right, bottom]) = Self::clipped_brush_bounds(p.position, extent, w, h)
+        else {
+            return;
+        };
+        for y in top..=bottom {
+            for x in left..=right {
                 let dx = x as f32 - p.position.x;
                 let dy = y as f32 - p.position.y;
                 let local_x = dx * cos + dy * sin;
@@ -4025,11 +4466,9 @@ impl EfudeApp {
                     .clamp(0.0, 1.0);
                 let index = (y as u32 * w + x as u32) as usize;
                 let old = self.selection.mask[index] as f32 / 255.0;
-                let next = if self.selection_erase {
-                    old * (1.0 - strength)
-                } else {
-                    old + (1.0 - old) * strength
-                };
+                // This mask is the stroke's coverage. Subtraction from the
+                // original selection happens in finish_selection_operation.
+                let next = old + (1.0 - old) * strength;
                 self.selection.mask[index] = (next * 255.0).round() as u8;
             }
         }
@@ -4093,7 +4532,7 @@ impl EfudeApp {
             ));
         }
         let brush = &self.brushes[self.selected_brush];
-        let radius = (self.size * self.dynamic_size * 0.5).max(0.5);
+        let radius = Self::brush_radius(self.size, self.dynamic_size);
         let tilt_amount = p.tilt.length().clamp(0.0, 1.0);
         let aspect = (brush.tip_aspect
             * (1.0 - brush.tilt_flattening.clamp(0.0, 0.9) * tilt_amount))
@@ -4101,18 +4540,19 @@ impl EfudeApp {
         let angle = p.rotation + brush.tip_rotation.to_radians();
         let (sin, cos) = angle.sin_cos();
         let max_radius = radius * aspect.max(1.0 / aspect);
-        let (cx, cy) = (p.position.x.round() as i32, p.position.y.round() as i32);
+        let Some([left, top, right, bottom]) =
+            Self::clipped_brush_bounds(p.position, max_radius, self.doc.width, self.doc.height)
+        else {
+            return;
+        };
         let eraser = self.tool == Tool::Eraser || matches!(brush.kind, BrushKind::Eraser);
         let target = if eraser {
             0.0
         } else {
             ((self.color.r() as u16 + self.color.g() as u16 + self.color.b() as u16) / 3) as f32
         };
-        for y in cy - max_radius.ceil() as i32..=cy + max_radius.ceil() as i32 {
-            for x in cx - max_radius.ceil() as i32..=cx + max_radius.ceil() as i32 {
-                if x < 0 || y < 0 || x >= self.doc.width as i32 || y >= self.doc.height as i32 {
-                    continue;
-                }
+        for y in top..=bottom {
+            for x in left..=right {
                 let dx = x as f32 - p.position.x;
                 let dy = y as f32 - p.position.y;
                 let local_x = dx * cos + dy * sin;
@@ -4196,6 +4636,7 @@ impl EfudeApp {
         }
     }
     fn apply_transform(&mut self, sx: f32, sy: f32, angle: f32) {
+        self.finish_pending_canvas_gesture();
         if self.doc.layers[self.selected_layer].locked
             || self.is_reference_layer(self.selected_layer)
             || self.doc.layers[self.selected_layer].kind == LayerKind::Folder
@@ -4228,6 +4669,7 @@ impl EfudeApp {
         self.history.commit();
     }
     fn apply_mesh_warp(&mut self) {
+        self.finish_pending_canvas_gesture();
         if self.refuse_on_vector_layer() {
             return;
         }
@@ -4417,6 +4859,9 @@ impl EfudeApp {
         let Some((w, h, pixels)) = os_image.or_else(|| self.clipboard.clone()) else {
             return;
         };
+        self.start_paste_preview(ctx, w, h, pixels);
+    }
+    fn start_paste_preview(&mut self, ctx: &egui::Context, w: u32, h: u32, pixels: Vec<u8>) {
         if w == 0
             || h == 0
             || (w as u64 * h as u64) > 100_000_000
@@ -4430,6 +4875,7 @@ impl EfudeApp {
                 .into();
             return;
         }
+        self.finish_pending_canvas_gesture();
         let ox = self.doc.width.saturating_sub(w) / 2;
         let oy = self.doc.height.saturating_sub(h) / 2;
         // The pasted image is placed freely; an old selection would clip it
@@ -4547,6 +4993,7 @@ impl EfudeApp {
             if points.is_empty() {
                 self.rollback_vector_stroke();
                 self.vector_live = None;
+                self.history.commit();
                 self.reset_stroke_buffers();
                 return;
             }
@@ -4570,6 +5017,7 @@ impl EfudeApp {
             return;
         }
         if points.is_empty() {
+            self.history.commit();
             self.reset_stroke_buffers();
             return;
         }
@@ -4885,6 +5333,10 @@ impl EfudeApp {
         self.history.commit();
     }
     fn merge_visible_layers(&mut self) {
+        self.finish_pending_canvas_gesture();
+        if !self.can_add_layers(1) {
+            return;
+        }
         let merged_pixels = efude_canvas::composite_transparent(&self.doc);
         if !merged_pixels.chunks_exact(4).any(|px| px[3] != 0) {
             self.status = self
@@ -4923,14 +5375,7 @@ impl EfudeApp {
                 self.history.record_layer_properties(id, before, after);
             }
         }
-        let id = self
-            .doc
-            .layers
-            .iter()
-            .map(|layer| layer.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let id = self.next_layer_id();
         let mut merged =
             efude_canvas::Layer::new(id, "統合レイヤー", self.doc.width, self.doc.height);
         merged.pixels =
@@ -5013,6 +5458,55 @@ impl EfudeApp {
     /// One frame of the whole UI (everything `eframe::App::update` does;
     /// tests drive it directly).
     pub(crate) fn update_ui(&mut self, ctx: &egui::Context) {
+        self.canvas_input_handled = false;
+        self.frame_native_ends = 0;
+        let history_state_at_frame_start = self.history.state_token();
+        let focus_lost = ctx.input(|input| {
+            !input.focused
+                || input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        });
+        if focus_lost {
+            self.finish_pending_canvas_gesture();
+            self.finish_held_tool_key();
+            if !ctx.input(|input| input.focused) {
+                // Keep the fallback for hosts that only report the final focus.
+                ctx.input_mut(|input| {
+                    input.keys_down.clear();
+                    input.modifiers = egui::Modifiers::NONE;
+                });
+            }
+        }
+        // Read this frame's samples before a panel can finish the gesture.
+        let more_packets =
+            if ctx.input(|input| input.focused) && (self.use_windows_ink || self.use_wintab) {
+                // The release finishes this stroke now: leaving contact samples
+                // for an idle frame would discard its tail. The queue's fixed
+                // capacity still bounds the work, including concurrent producers.
+                let limit = if ctx.input(|input| input.pointer.primary_released()) {
+                    self.pen_queue.shared().capacity()
+                } else {
+                    8192
+                };
+                let more_samples = self
+                    .pen_queue
+                    .drain_into(&mut self.frame_pen_packets, limit);
+                let more_events = self
+                    .pen_queue
+                    .drain_events_into(&mut self.frame_pen_events, limit);
+                more_samples || more_events
+            } else {
+                self.pen_queue.clear();
+                self.frame_pen_packets.clear();
+                self.frame_pen_events.clear();
+                self.native_contact_active = false;
+                false
+            };
+        self.process_native_contacts_before_ui(ctx);
+        self.finish_released_canvas_gesture_before_ui(ctx);
+        self.capture_coalesced_window_contacts_before_ui(ctx);
         self.poll_timelapse_worker();
         if self.guide_edit_pending.is_some() && !ctx.input(|input| input.pointer.primary_down()) {
             self.commit_pending_guide_edit();
@@ -5113,6 +5607,9 @@ impl EfudeApp {
                 zoom_out |= keys.1 && !self.zoom_keys_down.1;
                 self.zoom_keys_down = keys;
             }
+            if zoom_in || zoom_out || fit {
+                self.finish_pending_canvas_gesture();
+            }
             if zoom_in {
                 self.zoom = (self.zoom * 1.25).clamp(0.01, 64.0);
             }
@@ -5125,7 +5622,6 @@ impl EfudeApp {
                     Vec2::new(self.doc.width as f32 / 2.0, self.doc.height as f32 / 2.0);
             }
         }
-        let history_state_at_frame_start = self.history.state_token();
         let view_transform_at_frame_start = (self.view_rotation, self.flip_x, self.flip_y);
         if self.paste_preview.is_some() {
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -5396,33 +5892,41 @@ impl EfudeApp {
                     let installed = if self.history.document_id() == document_id {
                         self.finish_pending_canvas_gesture();
                         self.commit_pending_guide_edit();
-                        self.selected_layer = Self::insert_image_layer(
+                        match Self::insert_image_layer(
                             &mut self.doc,
                             &mut self.history,
                             &path,
                             width,
                             height,
                             rgba,
-                        );
-                        self.editing_mask = false;
-                        self.canvas_texture_dirty = true;
-                        self.navigator_texture_dirty = true;
-                        true
+                        ) {
+                            Ok(index) => {
+                                self.selected_layer = index;
+                                self.editing_mask = false;
+                                self.canvas_texture_dirty = true;
+                                self.navigator_texture_dirty = true;
+                                Ok(true)
+                            }
+                            Err(()) => Err(()),
+                        }
                     } else {
                         self.install_image_in_parked_tab(document_id, &path, width, height, rgba)
                     };
-                    self.status = if installed {
-                        if self.language_english {
+                    self.status = match installed {
+                        Ok(true) => if self.language_english {
                             format!("Imported image as a new layer: {name}")
                         } else {
                             format!("画像を新しいレイヤーに読み込みました: {name}")
-                        }
-                    } else {
-                        self.text(
+                        },
+                        Ok(false) => self.text(
                             "読み込み先のタブが閉じられたため、画像の読み込みを取り消しました",
                             "Image import cancelled because its destination tab was closed",
                         )
-                        .into()
+                        .into(),
+                        Err(()) => self.text(
+                            "レイヤー数の上限に達したため、画像の読み込みを取り消しました（2000）",
+                            "Image import cancelled because the layer limit was reached (2000)",
+                        ).into(),
                     };
                 }
                 IoCompletion::ReferenceLoaded {
@@ -5464,6 +5968,8 @@ impl EfudeApp {
                         if let Some(guide) =
                             efude_canvas::GuideImage::fit_to_canvas(width, height, rgba, &self.doc)
                         {
+                            self.finish_pending_canvas_gesture();
+                            self.commit_pending_guide_edit();
                             self.history.set_guide(&mut self.doc, Some(guide));
                             self.canvas_texture_dirty = true;
                             self.navigator_texture_dirty = true;
@@ -5480,9 +5986,10 @@ impl EfudeApp {
                     pixels,
                 } => {
                     self.filter_pending = false;
-                    if self.history.document_id() == document_id
+                    let applied = if self.history.document_id() == document_id
                         && self.history.state_token() == state_token
                         && self.active.is_empty()
+                        && !self.history.is_active()
                         && let Some(index) = self
                             .doc
                             .layers
@@ -5502,8 +6009,25 @@ impl EfudeApp {
                         self.history.commit();
                         self.canvas_texture_dirty = true;
                         self.navigator_texture_dirty = true;
+                        true
+                    } else {
+                        self.install_filter_in_parked_tab(
+                            document_id,
+                            state_token,
+                            layer_id,
+                            pixels,
+                        )
+                    };
+                    if applied {
                         self.status = self
                             .text("フィルターを適用しました", "Filter applied")
+                            .into();
+                    } else {
+                        self.status = self
+                            .text(
+                                "編集状態が変わったため、フィルターの適用を取り消しました",
+                                "Filter cancelled because the editing state changed",
+                            )
                             .into();
                     }
                 }
@@ -5517,20 +6041,15 @@ impl EfudeApp {
                 }
             }
         }
-        // `drain_into` reports whether packets are still waiting.
-        let more_packets = self.pen_queue.drain_into(&mut self.frame_pen_packets, 8192);
-        if !self.use_windows_ink && !self.use_wintab {
-            self.frame_pen_packets.clear();
-        }
         // Keep polling the tablet queue only while the pen is in use; an
         // idle window does not redraw.
         if more_packets
             || !self.frame_pen_packets.is_empty()
-            || ctx.input(|input| input.pointer.any_down())
+            || ctx.input(|input| input.focused && input.pointer.any_down())
         {
             ctx.request_repaint();
         }
-        let shortcuts_enabled = !ctx.wants_keyboard_input();
+        let shortcuts_enabled = ctx.input(|input| input.focused) && !ctx.wants_keyboard_input();
         if shortcuts_enabled {
             // [ and ] change the brush size, as in most painting software.
             let (smaller, larger) = ctx.input(|input| {
@@ -5762,6 +6281,39 @@ impl EfudeApp {
 }
 
 impl eframe::App for EfudeApp {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let last_loss = raw_input
+            .events
+            .iter()
+            .rposition(|event| matches!(event, egui::Event::WindowFocused(false)));
+        if raw_input.focused && last_loss.is_none() {
+            return;
+        }
+        if let Some(last_loss) = last_loss {
+            let mut index = 0;
+            raw_input.events.retain(|event| {
+                let stale = index < last_loss
+                    && matches!(
+                        event,
+                        egui::Event::Key { .. }
+                            | egui::Event::PointerMoved(_)
+                            | egui::Event::MouseMoved(_)
+                            | egui::Event::PointerButton { .. }
+                            | egui::Event::PointerGone
+                    );
+                index += 1;
+                !stale
+            });
+        }
+        // Reset the old state before egui consumes this frame, so new key and
+        // pointer presses after focus returns are processed normally.
+        ctx.input_mut(|input| {
+            input.keys_down.clear();
+            input.modifiers = egui::Modifiers::NONE;
+            input.pointer = Default::default();
+        });
+        ctx.stop_dragging();
+    }
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.update_ui(ctx);
     }
@@ -5935,6 +6487,117 @@ mod gesture_command_tests;
 mod golden_tests;
 #[cfg(test)]
 mod layer_operation_tests;
+#[cfg(test)]
+mod id_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn id_reservations_preserve_the_last_consecutive_ids_and_skip_used_positive_ids() {
+        assert_eq!(allocate_ids([2, 8], 2), vec![9, 10]);
+        assert_eq!(
+            allocate_ids([u64::MAX - 2], 2),
+            vec![u64::MAX - 1, u64::MAX]
+        );
+        assert_eq!(allocate_ids([0, 1, 3, u64::MAX], 3), vec![2, 4, 5]);
+        assert!(allocate_ids([u64::MAX], 0).is_empty());
+    }
+
+    fn load_document(doc: &Document) -> Document {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id-boundary.efude");
+        efude_io::save(&path, doc).unwrap();
+        efude_io::load(&path).unwrap()
+    }
+
+    fn assert_unique_ids(doc: &Document) {
+        let ids = doc
+            .layers
+            .iter()
+            .map(|layer| layer.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), doc.layers.len());
+    }
+
+    #[test]
+    fn native_max_id_can_add_raster_vector_and_image_layers() {
+        let mut original = Document::new(8, 8);
+        original.layers[0].id = u64::MAX;
+        original
+            .layers
+            .push(efude_canvas::Layer::new(1, "Existing", 8, 8));
+        original.layers[0].pixels.set_pixel(0, 0, [1, 2, 3, 255]);
+        let mut app = EfudeApp::default();
+        app.doc = load_document(&original);
+        app.add_raster_layer();
+        assert_eq!(app.doc.layers[app.selected_layer].id, 2);
+        assert_unique_ids(&app.doc);
+        app.undo();
+        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(app.doc.layers[0].id, u64::MAX);
+        app.redo();
+        app.add_vector_layer();
+        assert_eq!(app.doc.layers[app.selected_layer].id, 3);
+        let index = EfudeApp::insert_image_layer(
+            &mut app.doc,
+            &mut app.history,
+            std::path::Path::new("image.png"),
+            1,
+            1,
+            vec![9, 8, 7, 255],
+        )
+        .unwrap();
+        assert_eq!(app.doc.layers[index].id, 4);
+        assert_unique_ids(&app.doc);
+        let saved = load_document(&app.doc);
+        assert_eq!(saved.layers[0].id, u64::MAX);
+        assert_eq!(saved.layers[0].pixels.pixel(0, 0), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn native_max_id_can_duplicate_a_layer_subtree() {
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].id = u64::MAX - 1;
+        doc.layers[0].kind = LayerKind::Folder;
+        let mut child = efude_canvas::Layer::new(1, "Child", 8, 8);
+        child.parent_id = Some(u64::MAX - 1);
+        doc.layers.push(child);
+        let mut app = EfudeApp::default();
+        app.doc = load_document(&doc);
+        app.selected_layer = app
+            .doc
+            .layers
+            .iter()
+            .position(|layer| layer.id == u64::MAX - 1)
+            .unwrap();
+        app.duplicate_layer_subtree();
+        assert_eq!(app.doc.layers.len(), 4);
+        assert_unique_ids(&app.doc);
+        let copy = &app.doc.layers[app.selected_layer];
+        assert_eq!(copy.id, 3);
+        assert_eq!(copy.kind, LayerKind::Folder);
+        assert!(
+            app.doc
+                .layers
+                .iter()
+                .any(|layer| layer.id == 2 && layer.parent_id == Some(3))
+        );
+        app.undo();
+        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(
+            app.doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == 1)
+                .unwrap()
+                .parent_id,
+            Some(u64::MAX - 1)
+        );
+        app.redo();
+        assert_unique_ids(&load_document(&app.doc));
+    }
+}
+#[cfg(test)]
+mod input_state_tests;
 #[cfg(test)]
 mod tool_tests;
 

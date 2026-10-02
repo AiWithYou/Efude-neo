@@ -85,14 +85,19 @@ impl Filter {
     pub fn reach(&self) -> u32 {
         match *self {
             Filter::Blur { kind, amount, .. } => {
-                let r = amount.max(0.0);
+                let r = amount.clamp(0.0, 200.0);
                 match kind {
-                    BlurKind::Gaussian => (r * 1.6).ceil() as u32 + 2,
+                    BlurKind::Gaussian => {
+                        gaussian_box_radii(r / 2.0).into_iter().sum::<usize>() as u32
+                    }
+                    BlurKind::Smooth => r.min(64.0).round().max(1.0) as u32 * 2,
                     BlurKind::Motion => r.ceil() as u32 + 1,
                     _ => r.ceil() as u32 + 1,
                 }
             }
-            Filter::Sharpen { radius, .. } => (radius * 1.6).ceil() as u32 + 2,
+            Filter::Sharpen { radius, .. } => gaussian_box_radii(radius.clamp(0.3, 50.0))
+                .into_iter()
+                .sum::<usize>() as u32,
             Filter::Denoise { strength } => strength,
             Filter::ChromaticAberration { amount, .. } => amount.abs().ceil() as u32 + 1,
             Filter::Mosaic { size } => size,
@@ -291,10 +296,10 @@ fn running_mean(input: &[[f32; 4]], output: &mut [[f32; 4]], r: usize) {
     }
 }
 
-/// Gaussian blur of standard deviation `sigma` (three box blurs).
-fn gaussian(image: &Premul, sigma: f32) -> Premul {
+/// Radii of the three box passes, shared by processing and crop padding.
+fn gaussian_box_radii(sigma: f32) -> [usize; 3] {
     if sigma < 0.3 {
-        return image.clone();
+        return [0; 3];
     }
     // Box sizes whose three passes approximate the Gaussian.
     let n = 3.0;
@@ -307,10 +312,16 @@ fn gaussian(image: &Premul, sigma: f32) -> Premul {
     let m = ((12.0 * sigma * sigma - n * (lower * lower) as f32 - 4.0 * n * lower as f32 - 3.0 * n)
         / (-4.0 * lower as f32 - 4.0))
         .round() as i32;
+    std::array::from_fn(|pass| {
+        let size = if (pass as i32) < m { lower } else { upper };
+        ((size - 1) / 2).max(0) as usize
+    })
+}
+
+/// Gaussian blur of standard deviation `sigma` (three box blurs).
+fn gaussian(image: &Premul, sigma: f32) -> Premul {
     let mut out = image.clone();
-    for pass in 0..3 {
-        let size = if pass < m { lower } else { upper };
-        let r = ((size - 1) / 2).max(0) as usize;
+    for r in gaussian_box_radii(sigma) {
         box_blur(&mut out, r, r);
     }
     out
@@ -941,6 +952,54 @@ mod tests {
         .apply(&mut rgba, 40, 10, (0, 0));
         assert!(at(&rgba, 40, 19, 5)[0] < 100);
         assert!(at(&rgba, 40, 20, 5)[0] > 160);
+    }
+
+    fn centre_filtered_with_reach(
+        filter: Filter,
+        rgba: Vec<u8>,
+        centre: usize,
+    ) -> ([u8; 4], [u8; 4]) {
+        let width = rgba.len() / 4;
+        let margin = filter.reach() as usize;
+        let left = centre.saturating_sub(margin);
+        let right = (centre + margin + 1).min(width);
+        let mut crop = rgba[left * 4..right * 4].to_vec();
+        let mut whole = rgba;
+        filter.apply(&mut whole, width, 1, (0, 0));
+        filter.apply(&mut crop, right - left, 1, (left as i64, 0));
+        (
+            at(&whole, width, centre, 0),
+            at(&crop, right - left, centre - left, 0),
+        )
+    }
+
+    #[test]
+    fn sharpening_reach_makes_partial_processing_match_whole_processing() {
+        let filter = Filter::Sharpen {
+            amount: 5.0,
+            radius: 20.0,
+        };
+        let picture = picture(257, 1, |x, _| {
+            let v = if x <= 163 { 128 } else { 240 };
+            [v, v, v, 255]
+        });
+        let (whole, crop) = centre_filtered_with_reach(filter, picture, 128);
+        assert_eq!(whole, crop, "whole={whole:?}, crop={crop:?}");
+    }
+
+    #[test]
+    fn smoothing_reach_makes_partial_processing_match_whole_processing() {
+        let filter = Filter::Blur {
+            kind: BlurKind::Smooth,
+            amount: 64.0,
+            angle: 0.0,
+        };
+        let picture = picture(513, 1, |x, _| {
+            let v = if x <= 322 { 120 } else { 180 };
+            [v, v, v, 255]
+        });
+        let (whole, crop) = centre_filtered_with_reach(filter, picture, 256);
+        assert_eq!(whole, crop, "whole={whole:?}, crop={crop:?}");
     }
 
     #[test]

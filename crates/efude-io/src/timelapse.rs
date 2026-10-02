@@ -5,7 +5,7 @@ use efude_canvas::{Document, composite, composite_with_guide};
 use image::{ColorType, ImageBuffer, Rgba, codecs::jpeg::JpegEncoder, imageops::FilterType};
 use std::{
     fs::{self, File},
-    io::{Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -72,10 +72,7 @@ pub fn create_session(
 }
 
 pub fn open_session(folder: &Path) -> Result<Session, Box<dyn std::error::Error>> {
-    let bytes = fs::read(folder.join("session.json"))?;
-    if bytes.len() > 64 * 1024 {
-        return Err("timelapse manifest is too large".into());
-    }
+    let bytes = read_session_manifest(File::open(folder.join("session.json"))?)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     if value["version"].as_u64() != Some(1)
         || value["frame_rate"].as_u64() != Some(FRAME_RATE as u64)
@@ -101,6 +98,15 @@ pub fn open_session(folder: &Path) -> Result<Session, Box<dyn std::error::Error>
             .as_bool()
             .ok_or("missing guide mode")?,
     })
+}
+
+fn read_session_manifest(reader: impl Read) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    reader.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 64 * 1024 {
+        return Err("timelapse manifest is too large".into());
+    }
+    Ok(bytes)
 }
 
 pub fn frame_paths(session: &Session) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
@@ -170,12 +176,10 @@ pub fn write_frame(
         ColorType::Rgb8.into(),
     )?;
     let target = session.folder.join(format!("frame_{index:08}.jpg"));
-    let temp = session.folder.join(format!("frame_{index:08}.tmp"));
-    let mut file = File::create_new(&temp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(temp, target)?;
+    let mut temp = tempfile::NamedTempFile::new_in(&session.folder)?;
+    temp.write_all(&bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(target)?;
     Ok(bytes.len())
 }
 
@@ -359,6 +363,49 @@ pub fn export_avi_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_session_manifest_stops_reading_at_the_limit() {
+        let input = vec![b' '; 128 * 1024];
+        let mut reader = std::io::Cursor::new(input);
+        assert_eq!(
+            read_session_manifest(&mut reader).unwrap_err().to_string(),
+            "timelapse manifest is too large"
+        );
+        assert_eq!(reader.position(), 64 * 1024 + 1);
+        let directory = tempfile::tempdir().unwrap();
+        let document = Document::new(4, 4);
+        let session = create_session(directory.path(), &document, true, 720).unwrap();
+        let restored = open_session(&session.folder).unwrap();
+        assert_eq!(restored.folder, session.folder);
+        assert_eq!((restored.width, restored.height), (4, 4));
+        assert!(restored.include_guide);
+        let path = session.folder.join("session.json");
+        let mut manifest = fs::read(&path).unwrap();
+        manifest.resize(64 * 1024, b' ');
+        fs::write(&path, &manifest).unwrap();
+        assert!(open_session(&session.folder).is_ok());
+        manifest.push(b' ');
+        fs::write(&path, &manifest).unwrap();
+        assert_eq!(
+            open_session(&session.folder).unwrap_err().to_string(),
+            "timelapse manifest is too large"
+        );
+    }
+
+    #[test]
+    fn failed_frame_persistence_allows_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let document = Document::new(4, 4);
+        let session = create_session(directory.path(), &document, false, 720).unwrap();
+        let target = session.folder.join("frame_00000001.jpg");
+        fs::create_dir(&target).unwrap();
+        assert!(write_frame(&session, 1, &document).is_err());
+        fs::remove_dir(&target).unwrap();
+        write_frame(&session, 1, &document).unwrap();
+        assert_eq!(frame_paths(&session).unwrap(), vec![target]);
+        assert_eq!(fs::read_dir(&session.folder).unwrap().count(), 2);
+    }
 
     #[test]
     fn guide_setting_applies_to_every_document_derived_frame() {

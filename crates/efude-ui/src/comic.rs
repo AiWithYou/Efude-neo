@@ -164,16 +164,6 @@ impl EfudeApp {
         }
     }
 
-    fn next_layer_id(&self) -> u64 {
-        self.doc
-            .layers
-            .iter()
-            .map(|layer| layer.id)
-            .max()
-            .unwrap_or(0)
-            + 1
-    }
-
     fn layer_index(&self, id: u64) -> Option<usize> {
         self.doc.layers.iter().position(|layer| layer.id == id)
     }
@@ -256,11 +246,16 @@ impl EfudeApp {
     }
 
     /// Adds a panel folder for `polygon` with its border and a drawing layer.
-    fn add_panel(&mut self, layout: &mut PanelLayout, polygon: Vec<glam::Vec2>) -> Panel {
+    fn add_panel(
+        &mut self,
+        layout: &mut PanelLayout,
+        polygon: Vec<glam::Vec2>,
+        ids: [u64; 3],
+    ) -> Panel {
         let english = self.language_english;
         let number = layout.panels.len() + 1;
         let (w, h) = (self.doc.width, self.doc.height);
-        let folder_id = self.next_layer_id();
+        let [folder_id, drawing_id, border_id] = ids;
         let mut folder = efude_canvas::Layer::new(
             folder_id,
             if english {
@@ -275,13 +270,11 @@ impl EfudeApp {
         folder.mask = Some(self.panel_mask(&polygon));
         let at = self.doc.layers.len();
         self.history.insert_layer(&mut self.doc.layers, at, folder);
-        let drawing_id = self.next_layer_id();
         let mut drawing =
             efude_canvas::Layer::new(drawing_id, if english { "Drawing" } else { "作画" }, w, h);
         drawing.parent_id = Some(folder_id);
         let at = self.doc.layers.len();
         self.history.insert_layer(&mut self.doc.layers, at, drawing);
-        let border_id = self.next_layer_id();
         let mut border =
             efude_canvas::Layer::new(border_id, if english { "Border" } else { "枠線" }, w, h);
         border.parent_id = Some(folder_id);
@@ -333,9 +326,13 @@ impl EfudeApp {
                 .into();
             return;
         };
+        if !self.can_add_layers(3) {
+            return;
+        }
         let [min, max] = region.unwrap_or(comic.page.geometry().inner);
+        let ids = self.next_layer_ids(3).try_into().unwrap();
         self.history.begin();
-        self.add_panel(&mut comic.layout, panels::rectangle(min, max));
+        self.add_panel(&mut comic.layout, panels::rectangle(min, max), ids);
         self.store_comic(&comic);
         self.history.commit();
         self.canvas_texture_dirty = true;
@@ -377,12 +374,16 @@ impl EfudeApp {
         if second_first {
             std::mem::swap(&mut first, &mut second);
         }
+        if !self.can_add_layers(3) {
+            return false;
+        }
+        let ids = self.next_layer_ids(3).try_into().unwrap();
         self.history.begin();
         let mut panel = comic.layout.panels[index].clone();
         panel.polygon = first;
         comic.layout.panels[index] = panel.clone();
         self.update_panel(&panel, comic.layout.border_width);
-        self.add_panel(&mut comic.layout, second);
+        self.add_panel(&mut comic.layout, second, ids);
         self.store_comic(&comic);
         self.history.commit();
         self.canvas_texture_dirty = true;
@@ -444,14 +445,19 @@ impl EfudeApp {
         if cells.len() < 2 {
             return false;
         }
+        let additional_layers = (cells.len() - 1) * 3;
+        if !self.can_add_layers(additional_layers) {
+            return false;
+        }
+        let ids = self.next_layer_ids(additional_layers);
         self.history.begin();
         let mut cells = cells.into_iter();
         let mut panel = comic.layout.panels[index].clone();
         panel.polygon = cells.next().unwrap();
         comic.layout.panels[index] = panel.clone();
         self.update_panel(&panel, comic.layout.border_width);
-        for cell in cells {
-            self.add_panel(&mut comic.layout, cell);
+        for (cell, ids) in cells.zip(ids.chunks_exact(3)) {
+            self.add_panel(&mut comic.layout, cell, ids.try_into().unwrap());
         }
         self.store_comic(&comic);
         self.history.commit();
@@ -490,6 +496,9 @@ impl EfudeApp {
     /// A new tone layer above the selected layer, filled at `density`
     /// inside the selection, else the current panel, else the whole page.
     pub(crate) fn tone_fill(&mut self, settings: ToneSettings, density: f32) {
+        if !self.can_add_layers(1) {
+            return;
+        }
         let (w, h) = (self.doc.width, self.doc.height);
         let english = self.language_english;
         let parent = self.doc.layers.get(self.selected_layer).and_then(|layer| {
@@ -581,6 +590,13 @@ impl EfudeApp {
 
     /// Draws the effect lines onto their layer (a new one the first time).
     pub(crate) fn draw_effect_lines(&mut self, kind: EffectKind) {
+        let existing_layer = self
+            .comic_ui
+            .effect_layer
+            .and_then(|id| self.layer_index(id));
+        if existing_layer.is_none() && !self.can_add_layers(1) {
+            return;
+        }
         let (w, h) = (self.doc.width, self.doc.height);
         let coverage = match kind {
             EffectKind::Focus => self.comic_ui.focus.render(w, h),
@@ -588,11 +604,7 @@ impl EfudeApp {
         };
         let color = [self.color.r(), self.color.g(), self.color.b()];
         self.history.begin();
-        let index = match self
-            .comic_ui
-            .effect_layer
-            .and_then(|id| self.layer_index(id))
-        {
+        let index = match existing_layer {
             Some(index) => index,
             None => {
                 let parent = self.doc.layers.get(self.selected_layer).and_then(|layer| {
@@ -1310,6 +1322,250 @@ pub(crate) fn tone_settings_ui(ui: &mut egui::Ui, tone: &mut ToneSettings, engli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layer_capacity_app(count: usize) -> EfudeApp {
+        let mut app = panel_app();
+        let next_id = app.next_layer_id();
+        for offset in 0..count - app.doc.layers.len() {
+            app.doc.layers.push(efude_canvas::Layer::new(
+                next_id + offset as u64,
+                "empty",
+                128,
+                96,
+            ));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comic-capacity.efude");
+        efude_io::save(&path, &app.doc).unwrap();
+        app.doc = efude_io::load(&path).unwrap();
+        app.history = Default::default();
+        app
+    }
+
+    fn assert_capacity_document(actual: &Document, expected: &Document) {
+        let (width, height) = (expected.width, expected.height);
+        assert_eq!(actual.metadata, expected.metadata);
+        assert_eq!(actual.layers.len(), expected.layers.len());
+        for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+            assert_eq!(actual.id, expected.id);
+            assert!(actual.property_state() == expected.property_state());
+            assert_eq!(actual.pixels.tile_keys(), expected.pixels.tile_keys());
+            for ((x, y), data) in expected.pixels.tiles() {
+                assert!(
+                    actual.pixels.tile_data(x, y) == Some(data),
+                    "paint changed on layer {}, tile ({x},{y})",
+                    actual.id
+                );
+            }
+            match (&actual.mask, &expected.mask) {
+                (Some(actual), Some(expected)) => {
+                    for y in 0..height {
+                        for x in 0..width {
+                            assert_eq!(
+                                actual.pixel_or_tile_default(x, y, [255; 4])[0],
+                                expected.pixel_or_tile_default(x, y, [255; 4])[0],
+                                "mask coverage changed at ({x},{y})"
+                            );
+                        }
+                    }
+                }
+                (None, None) => {}
+                _ => panic!("layer mask changed"),
+            }
+        }
+    }
+
+    fn assert_capacity_rejection(app: &mut EfudeApp, operation: impl FnOnce(&mut EfudeApp)) {
+        let clean = app.doc.clone();
+        app.history.begin();
+        app.history
+            .set_metadata(&mut app.doc, "earlier-step", Some("pending".into()));
+        let before = app.doc.clone();
+        let selected = app.selected_layer;
+        let effect_layer = app.comic_ui.effect_layer;
+        let state = app.history.state_token();
+        operation(app);
+        let directory = tempfile::tempdir().unwrap();
+        let saved = efude_io::save(&directory.path().join("still-savable.efude"), &app.doc);
+        assert!(
+            saved.is_ok(),
+            "creation made the native document unsavable: {:?}",
+            saved.err()
+        );
+        assert_capacity_document(&app.doc, &before);
+        assert_eq!(app.selected_layer, selected);
+        assert_eq!(app.comic_ui.effect_layer, effect_layer);
+        assert_eq!(app.history.state_token(), state);
+        assert!(
+            app.history.is_active(),
+            "rejection must preserve an earlier pending action"
+        );
+        assert!(!app.history.can_undo());
+        app.history.cancel(&mut app.doc);
+        assert_capacity_document(&app.doc, &clean);
+        assert!(!app.history.is_dirty());
+    }
+
+    fn assert_capacity_success(app: &mut EfudeApp, operation: impl FnOnce(&mut EfudeApp)) {
+        let before = app.doc.clone();
+        operation(app);
+        assert_eq!(app.doc.layers.len(), 2000);
+        assert!(!app.history.is_active());
+        let after = app.doc.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("last-slot.efude");
+        efude_io::save(&path, &app.doc).unwrap();
+        // Native load puts children immediately below their folder while
+        // preserving sibling order, IDs, paint and editable panel metadata.
+        let mut saved = after.clone();
+        efude_canvas::tidy_layer_order(&mut saved.layers);
+        assert_capacity_document(&efude_io::load(&path).unwrap(), &saved);
+        app.undo();
+        assert_capacity_document(&app.doc, &before);
+        assert!(
+            !app.history.can_undo(),
+            "one Undo must reverse the entire creation"
+        );
+        app.redo();
+        assert_capacity_document(&app.doc, &after);
+        assert!(!app.history.can_redo());
+    }
+
+    #[test]
+    fn layer_capacity_panel_creation_is_atomic() {
+        for count in [1998, 1999, 2000] {
+            let mut app = layer_capacity_app(count);
+            assert_capacity_rejection(&mut app, |app| {
+                app.create_panel(Some([
+                    glam::Vec2::new(8.0, 8.0),
+                    glam::Vec2::new(120.0, 88.0),
+                ]));
+            });
+        }
+    }
+
+    #[test]
+    fn layer_capacity_panel_split_is_atomic() {
+        for count in [1998, 1999, 2000] {
+            let mut app = layer_capacity_app(count);
+            let mut split = true;
+            assert_capacity_rejection(&mut app, |app| {
+                split = app.split_panel(glam::Vec2::new(64.0, 8.0), glam::Vec2::new(64.0, 88.0));
+            });
+            assert!(!split);
+        }
+    }
+
+    #[test]
+    fn layer_capacity_grid_split_checks_every_new_panel() {
+        let mut app = layer_capacity_app(1992);
+        let mut split = true;
+        assert_capacity_rejection(&mut app, |app| split = app.grid_split_panel(2, 2));
+        assert!(!split);
+    }
+
+    #[test]
+    fn layer_capacity_panels_can_fill_the_remaining_slots() {
+        for operation in 0..3 {
+            let mut app = layer_capacity_app(if operation == 2 { 1991 } else { 1997 });
+            assert_capacity_success(&mut app, |app| match operation {
+                0 => app.create_panel(Some([
+                    glam::Vec2::new(8.0, 8.0),
+                    glam::Vec2::new(120.0, 88.0),
+                ])),
+                1 => assert!(
+                    app.split_panel(glam::Vec2::new(64.0, 8.0), glam::Vec2::new(64.0, 88.0))
+                ),
+                _ => assert!(app.grid_split_panel(2, 2)),
+            });
+        }
+    }
+
+    #[test]
+    fn layer_capacity_tone_creation_is_atomic() {
+        let mut app = layer_capacity_app(2000);
+        assert_capacity_rejection(&mut app, |app| app.tone_fill(ToneSettings::default(), 0.4));
+    }
+
+    #[test]
+    fn layer_capacity_new_effect_creation_is_atomic() {
+        let mut app = layer_capacity_app(2000);
+        app.comic_ui.effect_layer = Some(u64::MAX); // A deleted target also needs a new layer.
+        assert_capacity_rejection(&mut app, |app| app.draw_effect_lines(EffectKind::Focus));
+    }
+
+    #[test]
+    fn layer_capacity_tone_and_effect_can_use_the_last_slot() {
+        for effect in [false, true] {
+            let mut app = layer_capacity_app(1999);
+            assert_capacity_success(&mut app, |app| {
+                if effect {
+                    app.draw_effect_lines(EffectKind::Focus);
+                } else {
+                    app.tone_fill(ToneSettings::default(), 0.4);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn layer_capacity_existing_effect_can_still_be_redrawn() {
+        let mut app = layer_capacity_app(1999);
+        app.draw_effect_lines(EffectKind::Focus);
+        let index = app.layer_index(app.comic_ui.effect_layer.unwrap()).unwrap();
+        app.doc.layers[index]
+            .pixels
+            .set_pixel(0, 0, [90, 30, 10, 255]);
+        app.history = Default::default();
+        assert_capacity_success(&mut app, |app| app.draw_effect_lines(EffectKind::Speed));
+    }
+
+    #[test]
+    fn native_max_id_can_create_and_grid_split_a_panel() {
+        let mut doc = Document::new(128, 96);
+        doc.layers[0].id = u64::MAX - 2;
+        let comic = ComicDoc {
+            page: PageSpec::presets()[0].2.clone(),
+            layout: PanelLayout::for_dpi(72.0),
+        };
+        doc.metadata
+            .insert(METADATA_KEY.into(), serde_json::to_string(&comic).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("panel-ids.efude");
+        efude_io::save(&path, &doc).unwrap();
+        let mut app = EfudeApp::default();
+        app.doc = efude_io::load(&path).unwrap();
+        app.create_panel(Some([
+            glam::Vec2::new(8.0, 8.0),
+            glam::Vec2::new(120.0, 88.0),
+        ]));
+        let panel = app.comic_doc().unwrap().layout.panels[0].clone();
+        assert_eq!((panel.folder_id, panel.border_id), (1, 3));
+        assert_eq!(app.doc.layers[app.selected_layer].id, 2);
+        assert_eq!(app.doc.layers.len(), 4);
+        assert!(app.grid_split_panel(2, 2));
+        assert_eq!(app.comic_doc().unwrap().layout.panels.len(), 4);
+        let ids = app
+            .doc
+            .layers
+            .iter()
+            .map(|layer| layer.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), app.doc.layers.len());
+        app.undo();
+        assert_eq!(app.comic_doc().unwrap().layout.panels.len(), 1);
+        assert_eq!(app.doc.layers.len(), 4);
+        app.undo();
+        assert!(app.comic_doc().unwrap().layout.panels.is_empty());
+        assert_eq!(app.doc.layers.len(), 1);
+        assert_eq!(app.doc.layers[0].id, u64::MAX - 2);
+        app.redo();
+        app.redo();
+        efude_io::save(&path, &app.doc).unwrap();
+        let saved = efude_io::load(&path).unwrap();
+        assert_eq!(saved.layers[0].id, u64::MAX - 2);
+        assert_eq!(saved.layers.len(), 13);
+    }
 
     fn panel_app() -> EfudeApp {
         let mut app = EfudeApp::default();

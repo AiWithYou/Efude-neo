@@ -5,8 +5,480 @@
 use super::*;
 
 impl EfudeApp {
+    fn canvas_contains_screen_position(&self, pos: Pos2, rect: Rect, scale: f32) -> bool {
+        let point = self.document_position_unsnapped(pos, rect, scale);
+        (0.0..=self.doc.width as f32).contains(&point.x)
+            && (0.0..=self.doc.height as f32).contains(&point.y)
+    }
+
+    fn start_window_samples(&mut self, ctx: &egui::Context, origin: Pos2, rect: Rect, scale: f32) {
+        self.stroke_started_at = Some(std::time::Instant::now());
+        self.window_samples_started = false;
+        self.stroke_window_origin = Some(origin)
+            .filter(|origin| self.canvas_contains_screen_position(*origin, rect, scale))
+            .map(|origin| {
+                let point = self.document_position(origin, rect, scale);
+                let pressure = Self::pressure_at(ctx, origin).clamp(0.0, 1.0);
+                let time_ms = ctx
+                    .input(|input| (input.time * 1000.0) as u64)
+                    .saturating_sub(1);
+                (origin, InkPoint::new(point.x, point.y, pressure, time_ms))
+            });
+    }
+
+    fn uses_contact_strokes(&self) -> bool {
+        matches!(
+            self.tool,
+            Tool::Brush
+                | Tool::Blur
+                | Tool::Smudge
+                | Tool::Eraser
+                | Tool::SelectionBrush
+                | Tool::QuickMask
+        )
+    }
+
+    pub(crate) fn capture_coalesced_window_contacts_before_ui(&mut self, ctx: &egui::Context) {
+        if self.canvas_input_handled
+            || !self.uses_contact_strokes()
+            || self.paste_preview.is_some()
+            || self.selection_start.is_some()
+            || self.stroke_builder.is_some()
+            || !self.active.is_empty()
+            || !self.frame_pen_packets.is_empty()
+            || !ctx.input(|input| input.focused)
+        {
+            return;
+        }
+        let Some((rect, scale)) = self.canvas_screen else {
+            return;
+        };
+        let events = ctx.input(|input| input.events.clone());
+        let presses = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let first_press = events.iter().position(|event| {
+            matches!(
+                event,
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                }
+            )
+        });
+        let last_release = events.iter().rposition(|event| {
+            matches!(
+                event,
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    ..
+                }
+            )
+        });
+        let completed_contact = first_press
+            .zip(last_release)
+            .is_some_and(|(press, release)| press < release);
+        if presses >= 2 || completed_contact {
+            // A contact may finish before egui can allocate a drag. Keep
+            // their ordered presses, samples and releases through the same
+            // gesture functions used for an already captured stroke.
+            self.sync_tool_change();
+            self.continue_window_contacts(ctx, &events, rect, scale);
+        }
+    }
+
+    fn begin_sampled_canvas_gesture(
+        &mut self,
+        ctx: &egui::Context,
+        pos: Pos2,
+        origin: Pos2,
+        rect: Rect,
+        scale: f32,
+        modifiers: egui::Modifiers,
+    ) {
+        let q = self.document_position(pos, rect, scale);
+        self.selection_start = Some((q.x.round() as i32, q.y.round() as i32));
+        if matches!(self.tool, Tool::SelectionBrush | Tool::QuickMask) {
+            self.begin_selection_operation(modifiers);
+            if self.selection_erase {
+                self.selection_combine_mode = SelectionCombineMode::Subtract;
+            }
+            self.selection.active = false;
+            self.selection.mask.clear();
+            self.stroke_builder = None;
+            self.provisional = None;
+        } else {
+            self.reset_stroke_buffers();
+            self.begin_grain(glam::Vec2::new(q.x, q.y));
+            if matches!(
+                self.tool,
+                Tool::Brush | Tool::Blur | Tool::Smudge | Tool::Eraser
+            ) {
+                self.begin_brush_stroke();
+            } else {
+                self.stroke_builder = None;
+                self.provisional = None;
+            }
+            self.history.begin();
+            self.raster.previous_mix_color = [
+                self.color.r() as f32 / 255.,
+                self.color.g() as f32 / 255.,
+                self.color.b() as f32 / 255.,
+            ];
+            self.raster.remaining_charge = self.brushes[self.selected_brush].mix.charge;
+        }
+        self.active.clear();
+        self.stabilized_cursor = None;
+        self.raster.last_dab = None;
+        self.input_diagnostics = InputDiagnostics::default();
+        self.start_window_samples(ctx, origin, rect, scale);
+        self.canvas_gesture_interrupted = false;
+    }
+
+    fn canvas_accepts_contact(
+        &self,
+        ctx: &egui::Context,
+        pos: Pos2,
+        rect: Rect,
+        scale: f32,
+    ) -> bool {
+        self.canvas_viewport.0.contains(pos)
+            && self.canvas_contains_screen_position(pos, rect, scale)
+            && self.canvas_input_layer.is_some()
+            && self.canvas_input_layer == ctx.layer_id_at(pos)
+    }
+
+    pub(crate) fn process_native_contacts_before_ui(&mut self, ctx: &egui::Context) {
+        use efude_input::PenInputEvent;
+        let events = std::mem::take(&mut self.frame_pen_events);
+        let Some((rect, scale)) = self.canvas_screen else {
+            for event in events {
+                if let PenInputEvent::Start(packet) | PenInputEvent::Sample(packet) = event {
+                    self.frame_pen_packets.push(packet);
+                }
+            }
+            return;
+        };
+        if !self.uses_contact_strokes()
+            || self.paste_preview.is_some()
+            || !ctx.input(|input| input.focused)
+        {
+            for event in events {
+                if let PenInputEvent::Start(packet) | PenInputEvent::Sample(packet) = event {
+                    self.frame_pen_packets.push(packet);
+                }
+            }
+            return;
+        }
+        for event in events {
+            match event {
+                PenInputEvent::Start(packet) => {
+                    let captured = self.selection_start.is_some()
+                        || self.stroke_builder.is_some()
+                        || !self.active.is_empty();
+                    if captured
+                        && (self.native_contact_active || self.input_diagnostics.tablet_samples > 0)
+                    {
+                        self.finish_canvas_gesture(false);
+                    }
+                    let pos = Pos2::new(packet.x, packet.y);
+                    if self.selection_start.is_none() {
+                        if !self.canvas_accepts_contact(ctx, pos, rect, scale) {
+                            self.native_contact_active = false;
+                            continue;
+                        }
+                        self.sync_tool_change();
+                        self.begin_sampled_canvas_gesture(
+                            ctx,
+                            pos,
+                            pos,
+                            rect,
+                            scale,
+                            ctx.input(|input| input.modifiers),
+                        );
+                    }
+                    self.native_contact_active = true;
+                    self.canvas_input_handled = true;
+                    self.sample_native_packet(ctx, packet, rect, scale);
+                }
+                PenInputEvent::Sample(packet) => {
+                    if self.native_contact_active || self.selection_start.is_some() {
+                        self.native_contact_active = true;
+                        self.canvas_input_handled = true;
+                        self.sample_native_packet(ctx, packet, rect, scale);
+                    } else {
+                        // Drivers without an unambiguous tip button retain the
+                        // existing window capture path; do not infer pen-up.
+                        self.frame_pen_packets.push(packet);
+                    }
+                }
+                PenInputEvent::End(_) => {
+                    if self.native_contact_active {
+                        self.frame_native_ends += 1;
+                        self.canvas_input_handled = true;
+                        self.finish_canvas_gesture(false);
+                        self.canvas_gesture_interrupted = true;
+                    }
+                    self.native_contact_active = false;
+                }
+            }
+        }
+        if self.native_contact_active {
+            self.flush_provisional();
+        } else if self.frame_native_ends > 0 && self.selection_start.is_none() {
+            // After the native contact's promoted release, a mouse can start
+            // another stroke in this same frame. egui retains only one drag
+            // response, so capture that later press through the existing path.
+            let events = ctx.input(|input| input.events.clone());
+            let release_index = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    matches!(
+                        event,
+                        egui::Event::PointerButton {
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            ..
+                        }
+                    )
+                    .then_some(index)
+                })
+                .nth(self.frame_native_ends - 1);
+            if let Some(index) = release_index {
+                self.continue_window_contacts(ctx, &events[index + 1..], rect, scale);
+            }
+        }
+    }
+
+    fn sample_native_packet(
+        &mut self,
+        ctx: &egui::Context,
+        packet: efude_input::PenPacket,
+        rect: Rect,
+        scale: f32,
+    ) -> bool {
+        let screen = Pos2::new(packet.x, packet.y);
+        if !self.canvas_contains_screen_position(screen, rect, scale) {
+            self.input_diagnostics.outside_canvas += 1;
+            return false;
+        }
+        self.input_diagnostics.tablet_samples += 1;
+        self.input_diagnostics.record_pressure(packet.pressure);
+        self.tablet_seen = true;
+        let point = self.document_position(screen, rect, scale);
+        let mut sample = InkPoint::new(
+            point.x,
+            point.y,
+            packet.pressure.clamp(0.0, 1.0),
+            packet.time_ms,
+        );
+        sample.tilt = glam::Vec2::new(packet.tilt_x, packet.tilt_y);
+        sample.rotation = packet.rotation;
+        if matches!(self.tool, Tool::Line | Tool::EllipseRuler) {
+            self.active.push(sample);
+        } else if self.tool == Tool::PerspectiveRuler {
+            self.gesture_end = Some((point.x.round() as i32, point.y.round() as i32));
+        } else {
+            self.push_live_sample(sample, Some(packet.received_at), ctx);
+        }
+        true
+    }
+
+    pub(crate) fn finish_released_canvas_gesture_before_ui(&mut self, ctx: &egui::Context) {
+        if self.canvas_gesture_interrupted
+            || self.paste_preview.is_some()
+            || !ctx.input(|input| input.focused)
+            || self.tool != self.last_tool
+            || !matches!(
+                self.tool,
+                Tool::Brush
+                    | Tool::Blur
+                    | Tool::Smudge
+                    | Tool::Eraser
+                    | Tool::SelectionBrush
+                    | Tool::QuickMask
+                    | Tool::Move
+                    | Tool::RectangleSelect
+                    | Tool::EllipseSelect
+            )
+            || (self.selection_start.is_none()
+                && self.stroke_builder.is_none()
+                && self.active.is_empty())
+        {
+            return;
+        }
+        let events = ctx.input(|input| input.events.clone());
+        let release = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    ..
+                } => Some((index, *pos)),
+                _ => None,
+            })
+            // Native End has already committed these contacts. Their promoted
+            // window releases must not finish a later contact in this frame.
+            .nth(self.frame_native_ends);
+        if let (Some((release_index, pos)), Some((rect, scale))) = (release, self.canvas_screen) {
+            if matches!(
+                self.tool,
+                Tool::Move | Tool::RectangleSelect | Tool::EllipseSelect
+            ) {
+                let q = self.document_position(pos, rect, scale);
+                let xy = (q.x.round() as i32, q.y.round() as i32);
+                self.gesture_end = Some(xy);
+                if self.tool == Tool::Move {
+                    self.continue_move(xy);
+                } else if let Some(start) = self.selection_start {
+                    if self.tool == Tool::EllipseSelect {
+                        self.selection
+                            .ellipse(self.doc.width, self.doc.height, start, xy);
+                    } else {
+                        self.selection
+                            .rectangle(self.doc.width, self.doc.height, start, xy);
+                    }
+                }
+            } else {
+                self.sample_stroke_at(ctx, pos, rect, scale, true);
+            }
+            self.finish_canvas_gesture(false);
+            self.canvas_gesture_interrupted = true;
+            if self.uses_contact_strokes() && !self.canvas_input_handled {
+                self.continue_window_contacts(ctx, &events[release_index + 1..], rect, scale);
+            }
+        }
+    }
+
+    fn continue_window_contacts(
+        &mut self,
+        ctx: &egui::Context,
+        events: &[egui::Event],
+        rect: Rect,
+        scale: f32,
+    ) {
+        for event in events {
+            match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                } => {
+                    if !self.canvas_accepts_contact(ctx, *pos, rect, scale) {
+                        break;
+                    }
+                    self.begin_sampled_canvas_gesture(ctx, *pos, *pos, rect, scale, *modifiers);
+                    self.canvas_input_handled = true;
+                    self.sample_stroke_at(ctx, *pos, rect, scale, false);
+                }
+                egui::Event::PointerMoved(pos) if self.selection_start.is_some() => {
+                    self.sample_stroke_at(ctx, *pos, rect, scale, false);
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    ..
+                } if self.selection_start.is_some() => {
+                    self.sample_stroke_at(ctx, *pos, rect, scale, true);
+                    self.finish_canvas_gesture(false);
+                    self.canvas_gesture_interrupted = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn sample_stroke_at(
+        &mut self,
+        ctx: &egui::Context,
+        pos: Pos2,
+        rect: Rect,
+        scale: f32,
+        ending: bool,
+    ) {
+        let q = self.document_position(pos, rect, scale);
+        let xy = (q.x.round() as i32, q.y.round() as i32);
+        self.gesture_end = Some(xy);
+        let local = InkPoint::new(q.x, q.y, 1.0, 0).position;
+        let packets = std::mem::take(&mut self.frame_pen_packets);
+        let mut used_native = false;
+        for packet in packets {
+            used_native |= self.sample_native_packet(ctx, packet, rect, scale);
+        }
+        // Once tablet packets have arrived in this stroke, a
+        // frame without packets just means none were due;
+        // a window sample here would inject full pressure.
+        if used_native {
+            self.tablet_seen = true;
+        }
+        // With a tablet in use, its packets can arrive a frame
+        // after the press: wait briefly instead of taking the
+        // window's pressure-less sample (full pressure).
+        let waiting_for_tablet = !ending
+            && (self.use_windows_ink || self.use_wintab)
+            && self.tablet_seen
+            && self
+                .stroke_started_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(150));
+        if !used_native && self.input_diagnostics.tablet_samples == 0 && waiting_for_tablet {
+            ctx.request_repaint();
+        } else if !used_native && self.input_diagnostics.tablet_samples == 0 {
+            // Window samples: start where the pointer went down
+            // (a slow frame can deliver the press and the first
+            // moves together).
+            if !self.window_samples_started {
+                self.window_samples_started = true;
+                if matches!(
+                    self.tool,
+                    Tool::Brush
+                        | Tool::Blur
+                        | Tool::Smudge
+                        | Tool::Eraser
+                        | Tool::SelectionBrush
+                        | Tool::QuickMask
+                ) && let Some((origin, start)) = self.stroke_window_origin
+                    && origin.distance(pos) > 0.5
+                {
+                    self.push_live_sample(start, None, ctx);
+                }
+            }
+            self.input_diagnostics.window_fallbacks += 1;
+            let pressure = Self::pressure_at(ctx, pos).clamp(0.0, 1.0);
+            self.input_diagnostics.record_pressure(pressure);
+            let time_ms = ctx.input(|input| (input.time * 1000.0) as u64);
+            let sample = InkPoint::new(local.x, local.y, pressure, time_ms);
+            if matches!(self.tool, Tool::Line | Tool::EllipseRuler) {
+                self.active.push(sample);
+            } else if self.tool == Tool::PerspectiveRuler {
+                self.gesture_end = Some((xy.0, xy.1));
+            } else {
+                self.push_live_sample(sample, None, ctx);
+            }
+        }
+        self.flush_provisional();
+    }
+
     /// Completes a gesture on its document before pen-up or a tab switch.
     pub(crate) fn finish_canvas_gesture(&mut self, canvas_clicked: bool) {
+        self.native_contact_active = false;
         if matches!(self.tool, Tool::Balloon | Tool::Text) {
             self.balloon_drag_stop(canvas_clicked);
         }
@@ -19,7 +491,6 @@ impl EfudeApp {
                 self.comic_ui.split_end.take(),
             )
             && (end - start).length() > 4.0
-            && !self.split_panel(comic::to_glam(start), comic::to_glam(end))
         {
             self.status = self
                 .text(
@@ -27,6 +498,7 @@ impl EfudeApp {
                     "Drag a line across a panel",
                 )
                 .into();
+            self.split_panel(comic::to_glam(start), comic::to_glam(end));
         }
         if matches!(
             self.tool,
@@ -153,6 +625,7 @@ impl EfudeApp {
         // The navigator centre sits at the middle of the view, whatever the
         // rotation.
         self.canvas_viewport = (response.rect, fit, pixels_per_point);
+        self.canvas_input_layer = Some(response.layer_id);
         let upright = self.view_rotation.rem_euclid(360.0) == 0.0;
         let raw_canvas_rect = |scale: f32, navigator_center: Vec2| {
             Rect::from_center_size(
@@ -162,8 +635,10 @@ impl EfudeApp {
         };
         let canvas_rect = |scale: f32, navigator_center: Vec2| {
             let rect = raw_canvas_rect(scale, navigator_center);
-            // On the pixel grid, so document pixels are not split.
-            if upright {
+            // Align enlarged pixels to the physical grid. Below one
+            // physical pixel, rounding the origin moves a stationary
+            // wheel anchor by many document pixels.
+            if upright && scale * pixels_per_point >= 1.0 {
                 display::snap_to_pixels(rect, pixels_per_point)
             } else {
                 rect
@@ -676,6 +1151,12 @@ impl EfudeApp {
         self.paint_finishing_check(&painter, &to_screen);
         self.paint_balloon_overlay(&painter, &to_screen);
         self.paint_vector_overlay(&painter, &to_screen);
+        if !ctx.input(|input| input.focused) {
+            return;
+        }
+        if self.canvas_input_handled {
+            return;
+        }
         // A held pointer belongs to the document where it went down.
         // Consume its release too; only a new press may edit this document.
         if self.canvas_gesture_interrupted
@@ -719,44 +1200,13 @@ impl EfudeApp {
                 | Tool::Eraser
                 | Tool::Line
                 | Tool::EllipseRuler
-                | Tool::PerspectiveRuler => {
-                    self.reset_stroke_buffers();
-                    self.begin_grain(glam::Vec2::new(q.x, q.y));
-                    self.active.clear();
-                    self.stabilized_cursor = None;
-                    self.input_diagnostics = InputDiagnostics::default();
-                    if matches!(
-                        self.tool,
-                        Tool::Brush | Tool::Blur | Tool::Smudge | Tool::Eraser
-                    ) {
-                        self.begin_brush_stroke();
-                    } else {
-                        self.stroke_builder = None;
-                        self.provisional = None;
-                    }
-                    self.history.begin();
-                    self.raster.previous_mix_color = [
-                        self.color.r() as f32 / 255.,
-                        self.color.g() as f32 / 255.,
-                        self.color.b() as f32 / 255.,
-                    ];
-                    self.raster.last_dab = None;
-                    self.raster.remaining_charge = self.brushes[self.selected_brush].mix.charge;
-                    self.stroke_started_at = Some(std::time::Instant::now());
-                    self.window_samples_started = false;
-                }
-                Tool::SelectionBrush | Tool::QuickMask => {
-                    self.begin_selection_operation(ctx.input(|input| input.modifiers));
-                    if self.selection_erase {
-                        self.selection_combine_mode = SelectionCombineMode::Subtract;
-                    }
-                    self.selection.active = false;
-                    self.selection.mask.clear();
-                    self.stroke_builder = None;
-                    self.provisional = None;
-                    self.active.clear();
-                    self.stabilized_cursor = None;
-                    self.raster.last_dab = None;
+                | Tool::PerspectiveRuler
+                | Tool::SelectionBrush
+                | Tool::QuickMask => {
+                    let (origin, modifiers) = ctx.input(|input| {
+                        (input.pointer.press_origin().unwrap_or(pos), input.modifiers)
+                    });
+                    self.begin_sampled_canvas_gesture(ctx, pos, origin, rect, scale, modifiers);
                 }
                 Tool::Move => {
                     self.history.begin();
@@ -789,7 +1239,6 @@ impl EfudeApp {
             let q = self.document_position(pos, rect, scale);
             let xy = (q.x.round() as i32, q.y.round() as i32);
             self.gesture_end = Some(xy);
-            let local = InkPoint::new(q.x, q.y, 1.0, 0).position;
             match self.tool {
                 Tool::Brush
                 | Tool::Blur
@@ -800,95 +1249,13 @@ impl EfudeApp {
                 | Tool::Line
                 | Tool::EllipseRuler
                 | Tool::PerspectiveRuler => {
-                    let packets = std::mem::take(&mut self.frame_pen_packets);
-                    let mut used_native = false;
-                    for packet in packets {
-                        let screen = Pos2::new(packet.x, packet.y);
-                        if !rect.contains(screen) {
-                            self.input_diagnostics.outside_canvas += 1;
-                        }
-                        if rect.contains(screen) {
-                            self.input_diagnostics.tablet_samples += 1;
-                            self.input_diagnostics.record_pressure(packet.pressure);
-                            let point = self.document_position(screen, rect, scale);
-                            let mut sample = InkPoint::new(
-                                point.x,
-                                point.y,
-                                packet.pressure.clamp(0.0, 1.0),
-                                packet.time_ms,
-                            );
-                            sample.tilt = glam::Vec2::new(packet.tilt_x, packet.tilt_y);
-                            sample.rotation = packet.rotation;
-                            if matches!(self.tool, Tool::Line | Tool::EllipseRuler) {
-                                self.active.push(sample);
-                            } else if self.tool == Tool::PerspectiveRuler {
-                                self.gesture_end =
-                                    Some((point.x.round() as i32, point.y.round() as i32));
-                            } else {
-                                self.push_live_sample(sample, Some(packet.received_at), ctx);
-                            }
-                            used_native = true;
-                        }
-                    }
-                    // Once tablet packets have arrived in this stroke, a
-                    // frame without packets just means none were due;
-                    // a window sample here would inject full pressure.
-                    if used_native {
-                        self.tablet_seen = true;
-                    }
-                    // With a tablet in use, its packets can arrive a frame
-                    // after the press: wait briefly instead of taking the
-                    // window's pressure-less sample (full pressure).
-                    let waiting_for_tablet = (self.use_windows_ink || self.use_wintab)
-                        && self.tablet_seen
-                        && self
-                            .stroke_started_at
-                            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(150));
-                    if !used_native
-                        && self.input_diagnostics.tablet_samples == 0
-                        && waiting_for_tablet
-                    {
-                        ctx.request_repaint();
-                    } else if !used_native && self.input_diagnostics.tablet_samples == 0 {
-                        // Window samples: start where the pointer went down
-                        // (a slow frame can deliver the press and the first
-                        // moves together).
-                        if !self.window_samples_started {
-                            self.window_samples_started = true;
-                            if matches!(
-                                self.tool,
-                                Tool::Brush | Tool::Blur | Tool::Smudge | Tool::Eraser
-                            ) && let Some(origin) =
-                                ctx.input(|input| input.pointer.press_origin())
-                                && origin.distance(pos) > 0.5
-                                && rect.contains(origin)
-                            {
-                                let start = self.document_position(origin, rect, scale);
-                                let pressure = Self::pressure_at(ctx, origin).clamp(0.0, 1.0);
-                                let time_ms = ctx
-                                    .input(|input| (input.time * 1000.0) as u64)
-                                    .saturating_sub(1);
-                                self.push_live_sample(
-                                    InkPoint::new(start.x, start.y, pressure, time_ms),
-                                    None,
-                                    ctx,
-                                );
-                            }
-                        }
-                        self.input_diagnostics.window_fallbacks += 1;
-                        let pressure = Self::pressure_at(ctx, pos).clamp(0.0, 1.0);
-                        self.input_diagnostics.record_pressure(pressure);
-                        let time_ms = ctx.input(|input| (input.time * 1000.0) as u64);
-                        let sample = InkPoint::new(local.x, local.y, pressure, time_ms);
-                        if matches!(self.tool, Tool::Line | Tool::EllipseRuler) {
-                            self.active.push(sample);
-                        } else if self.tool == Tool::PerspectiveRuler {
-                            self.gesture_end = Some((xy.0, xy.1));
-                        } else {
-                            self.push_live_sample(sample, None, ctx);
-                        }
-                    }
-                    self.flush_provisional();
+                    self.sample_stroke_at(
+                        ctx,
+                        pos,
+                        rect,
+                        scale,
+                        response.drag_stopped_by(egui::PointerButton::Primary),
+                    );
                 }
                 Tool::RectangleSelect => {
                     if let Some(a) = self.selection_start {
@@ -955,8 +1322,7 @@ impl EfudeApp {
         if canvas_clicked && self.paste_preview.is_some() {
             self.commit_paste_preview();
             self.canvas_texture_dirty = true;
-        }
-        if canvas_clicked
+        } else if canvas_clicked
             && self.paste_preview.is_none()
             && let Some(pos) = response.interact_pointer_pos()
         {

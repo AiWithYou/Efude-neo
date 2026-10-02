@@ -258,8 +258,9 @@ impl EfudeApp {
     /// Deletes every layer and leaves one empty raster layer, as a single
     /// step that Undo reverses.
     pub(crate) fn clear_all_layers(&mut self) {
+        self.finish_pending_canvas_gesture();
         let english = self.language_english;
-        let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+        let id = self.next_layer_id();
         let layer = efude_canvas::Layer::new(
             id,
             if english {
@@ -290,13 +291,16 @@ impl EfudeApp {
     /// Adds an empty raster layer above the selected one and selects it.
     pub(crate) fn add_raster_layer(&mut self) {
         self.finish_pending_canvas_gesture();
+        if !self.can_add_layers(1) {
+            return;
+        }
         let source_id = self
             .doc
             .layers
             .get(self.selected_layer)
             .map_or(0, |layer| layer.id);
         let english = self.language_english;
-        let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+        let id = self.next_layer_id();
         let layer = efude_canvas::Layer::new(
             id,
             if english {
@@ -2844,6 +2848,18 @@ impl EfudeApp {
         }
     }
 
+    pub(super) fn replay_last_stroke(&mut self) {
+        self.finish_pending_canvas_gesture();
+        if let Some(points) = self
+            .stroke_log
+            .replay(self.stroke_log.strokes.len().saturating_sub(1))
+        {
+            self.history.begin();
+            self.render_replay(&points);
+            self.history.commit();
+        }
+    }
+
     /// Brush import/export, input logs and brush comparison.
     #[allow(unused_variables)]
     pub(crate) fn brush_io_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2978,13 +2994,8 @@ impl EfudeApp {
         if ui
             .button(self.text("最後の線を再生", "Replay Last Stroke"))
             .clicked()
-            && let Some(points) = self
-                .stroke_log
-                .replay(self.stroke_log.strokes.len().saturating_sub(1))
         {
-            self.history.begin();
-            self.render_replay(&points);
-            self.history.commit();
+            self.replay_last_stroke();
         }
         ui.horizontal(|ui| {
             if ui
@@ -3023,6 +3034,10 @@ impl EfudeApp {
             if ui
                 .button(self.text("別レイヤーで比較再生", "Replay Comparison on New Layers"))
                 .clicked()
+                && {
+                    self.finish_pending_canvas_gesture();
+                    self.can_add_layers(2)
+                }
                 && let Some(points) = self.stroke_log.replay(0)
             {
                 let original_brush = self.comparison_brush.clone().unwrap();
@@ -3030,9 +3045,12 @@ impl EfudeApp {
                 let old_brush_index = self.selected_brush;
                 let old_layer_index = self.selected_layer;
                 let parent = self.doc.layers[old_layer_index].parent_id;
+                let ids = self.next_layer_ids(2);
                 self.history.begin();
-                for (label, brush) in [("元", original_brush), ("現在", selected_brush)] {
-                    let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+                for ((label, brush), id) in [("元", original_brush), ("現在", selected_brush)]
+                    .into_iter()
+                    .zip(ids)
+                {
                     let mut layer = efude_canvas::Layer::new(
                         id,
                         format!("比較 {label}: {}", brush.name),
@@ -3089,61 +3107,124 @@ impl EfudeApp {
             .button(self.text("キャンバスサイズを適用", "Apply Canvas Size"))
             .clicked()
         {
-            self.history.begin();
-            let before_selection_active = self.selection.active;
-            let before_selection = self.selection.mask.clone();
-            let resize_result = self.history.resize_document(
-                &mut self.doc,
-                self.canvas_width_input,
-                self.canvas_height_input,
-                self.canvas_dpi_input,
+            self.apply_canvas_size();
+        }
+    }
+
+    pub(crate) fn apply_canvas_size(&mut self) {
+        self.finish_pending_canvas_gesture();
+        self.history.begin();
+        let before_selection_active = self.selection.active;
+        let before_selection = self.selection.mask.clone();
+        let resize_result = self.history.resize_document(
+            &mut self.doc,
+            self.canvas_width_input,
+            self.canvas_height_input,
+            self.canvas_dpi_input,
+        );
+        if matches!(resize_result, Ok(true)) {
+            self.selection.clear();
+            self.history.record_selection_change(
+                before_selection_active,
+                before_selection,
+                self.selection.active,
+                self.selection.mask.clone(),
             );
-            if matches!(resize_result, Ok(true)) {
-                self.selection.clear();
-                self.history.record_selection_change(
-                    before_selection_active,
-                    before_selection,
-                    self.selection.active,
-                    self.selection.mask.clone(),
+        }
+        self.history.commit();
+        match resize_result {
+            Ok(true) => {
+                self.editing_mask = false;
+                self.symmetry_center = Vec2::new(
+                    (self.doc.width - 1) as f32 / 2.0,
+                    (self.doc.height - 1) as f32 / 2.0,
                 );
+                self.navigator_center =
+                    Vec2::new(self.doc.width as f32 / 2.0, self.doc.height as f32 / 2.0);
+                self.canvas_width_input = self.doc.width;
+                self.canvas_height_input = self.doc.height;
+                self.canvas_dpi_input = self.doc.dpi;
+                self.canvas_texture_dirty = true;
+                self.navigator_texture_dirty = true;
+                self.status = self
+                    .text(
+                        "キャンバスサイズを変更しました（Undoで復元できます）",
+                        "Canvas size changed (Undo to restore)",
+                    )
+                    .into();
             }
-            self.history.commit();
-            match resize_result {
-                Ok(true) => {
-                    self.editing_mask = false;
-                    self.symmetry_center = Vec2::new(
-                        (self.doc.width - 1) as f32 / 2.0,
-                        (self.doc.height - 1) as f32 / 2.0,
-                    );
-                    self.navigator_center =
-                        Vec2::new(self.doc.width as f32 / 2.0, self.doc.height as f32 / 2.0);
-                    self.canvas_width_input = self.doc.width;
-                    self.canvas_height_input = self.doc.height;
-                    self.canvas_dpi_input = self.doc.dpi;
-                    self.canvas_texture_dirty = true;
-                    self.navigator_texture_dirty = true;
-                    self.status = self
-                        .text(
-                            "キャンバスサイズを変更しました（Undoで復元できます）",
-                            "Canvas size changed (Undo to restore)",
-                        )
-                        .into();
-                }
-                Ok(false) => {
-                    self.status = self
-                        .text("サイズは変更されていません", "Canvas size is unchanged")
-                        .into();
-                }
-                Err(_) => {
-                    self.status = self
+            Ok(false) => {
+                self.status = self
+                    .text("サイズは変更されていません", "Canvas size is unchanged")
+                    .into();
+            }
+            Err(_) => {
+                self.status = self
                                 .text(
                                     "キャンバスは幅・高さ30,000px以下、総画素数1億以下にしてください",
                                     "Canvas size must be at most 30,000 px per side and 100 million pixels total",
                                 )
                                 .into();
+            }
+        }
+    }
+
+    pub(super) fn apply_layer_mask_action(&mut self, index: usize, action: u8) {
+        self.finish_pending_canvas_gesture();
+        let width = self.doc.width;
+        let height = self.doc.height;
+        self.history.begin();
+        self.history
+            .record_all_mask_tiles(&self.doc.layers[index], width, height);
+        let mask = self.doc.layers[index].mask.as_mut().unwrap();
+        if action == 0 {
+            for y in 0..height {
+                for x in 0..width {
+                    // Missing mask tiles are white; allocate them before
+                    // the first write so later pixels keep that default.
+                    if !mask.has_tile(x, y) {
+                        mask.ensure_tile_filled(x, y, [255; 4]);
+                    }
+                    let old = mask.pixel_or_tile_default(x, y, [255; 4])[0];
+                    mask.set_pixel(x, y, [255 - old; 4]);
+                }
+            }
+        } else {
+            mask.clear_tiles();
+            let selection = &self.selection.mask;
+            for tile_y in 0..height.div_ceil(efude_canvas::TILE_SIZE) {
+                for tile_x in 0..width.div_ceil(efude_canvas::TILE_SIZE) {
+                    let origin_x = tile_x * efude_canvas::TILE_SIZE;
+                    let origin_y = tile_y * efude_canvas::TILE_SIZE;
+                    let tile_width = efude_canvas::TILE_SIZE.min(width - origin_x);
+                    let tile_height = efude_canvas::TILE_SIZE.min(height - origin_y);
+                    let has_cutout = (0..tile_height).any(|local_y| {
+                        (0..tile_width).any(|local_x| {
+                            selection
+                                .get(((origin_y + local_y) * width + origin_x + local_x) as usize)
+                                .copied()
+                                .unwrap_or(0)
+                                < 255
+                        })
+                    });
+                    if has_cutout {
+                        mask.ensure_tile_filled(origin_x, origin_y, [255; 4]);
+                        for local_y in 0..tile_height {
+                            for local_x in 0..tile_width {
+                                let x = origin_x + local_x;
+                                let y = origin_y + local_y;
+                                let value = selection
+                                    .get((y * width + x) as usize)
+                                    .copied()
+                                    .unwrap_or(0);
+                                mask.set_pixel(x, y, [value; 4]);
+                            }
+                        }
+                    }
                 }
             }
         }
+        self.history.commit();
     }
 
     /// Layer list and layer operations.
@@ -3177,13 +3258,17 @@ impl EfudeApp {
             if ui
                 .button(self.text("＋子レイヤー", "+ Child Layer"))
                 .clicked()
+                && {
+                    self.finish_pending_canvas_gesture();
+                    self.can_add_layers(1)
+                }
             {
                 let parent = if self.doc.layers[self.selected_layer].kind == LayerKind::Folder {
                     Some(self.doc.layers[self.selected_layer].id)
                 } else {
                     self.doc.layers[self.selected_layer].parent_id
                 };
-                let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+                let id = self.next_layer_id();
                 let mut child = efude_canvas::Layer::new(
                     id,
                     if english {
@@ -3199,8 +3284,11 @@ impl EfudeApp {
                 self.history.insert_layer(&mut self.doc.layers, at, child);
                 self.selected_layer = at;
             }
-            if ui.button(self.text("＋フォルダ", "+ Folder")).clicked() {
-                let id = self.doc.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+            if ui.button(self.text("＋フォルダ", "+ Folder")).clicked() && {
+                self.finish_pending_canvas_gesture();
+                self.can_add_layers(1)
+            } {
+                let id = self.next_layer_id();
                 let mut folder = efude_canvas::Layer::new(
                     id,
                     if english {
@@ -3787,63 +3875,7 @@ impl EfudeApp {
                 }
             }
             if let Some(action) = mask_action {
-                let width = self.doc.width;
-                let height = self.doc.height;
-                self.history.begin();
-                self.history
-                    .record_all_mask_tiles(&self.doc.layers[i], width, height);
-                let mask = self.doc.layers[i].mask.as_mut().unwrap();
-                if action == 0 {
-                    for y in 0..height {
-                        for x in 0..width {
-                            // Missing mask tiles are white; allocate them before
-                            // the first write so later pixels keep that default.
-                            if !mask.has_tile(x, y) {
-                                mask.ensure_tile_filled(x, y, [255; 4]);
-                            }
-                            let old = mask.pixel_or_tile_default(x, y, [255; 4])[0];
-                            mask.set_pixel(x, y, [255 - old; 4]);
-                        }
-                    }
-                } else {
-                    mask.clear_tiles();
-                    let selection = &self.selection.mask;
-                    for tile_y in 0..height.div_ceil(efude_canvas::TILE_SIZE) {
-                        for tile_x in 0..width.div_ceil(efude_canvas::TILE_SIZE) {
-                            let origin_x = tile_x * efude_canvas::TILE_SIZE;
-                            let origin_y = tile_y * efude_canvas::TILE_SIZE;
-                            let tile_width = efude_canvas::TILE_SIZE.min(width - origin_x);
-                            let tile_height = efude_canvas::TILE_SIZE.min(height - origin_y);
-                            let has_cutout = (0..tile_height).any(|local_y| {
-                                (0..tile_width).any(|local_x| {
-                                    selection
-                                        .get(
-                                            ((origin_y + local_y) * width + origin_x + local_x)
-                                                as usize,
-                                        )
-                                        .copied()
-                                        .unwrap_or(0)
-                                        < 255
-                                })
-                            });
-                            if has_cutout {
-                                mask.ensure_tile_filled(origin_x, origin_y, [255; 4]);
-                                for local_y in 0..tile_height {
-                                    for local_x in 0..tile_width {
-                                        let x = origin_x + local_x;
-                                        let y = origin_y + local_y;
-                                        let value = selection
-                                            .get((y * width + x) as usize)
-                                            .copied()
-                                            .unwrap_or(0);
-                                        mask.set_pixel(x, y, [value; 4]);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                self.history.commit();
+                self.apply_layer_mask_action(i, action);
             }
             if let Some(new_parent) = change_parent {
                 self.doc.layers[i].parent_id = new_parent;

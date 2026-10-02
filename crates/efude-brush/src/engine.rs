@@ -254,6 +254,26 @@ impl DabGeometry {
     }
 }
 
+/// The original inclusive dab range, clipped before integer conversion so
+/// very large finite brush sizes neither overflow nor walk outside the page.
+fn dab_bounds(center: Vec2, max_radius: f32, width: u32, height: u32) -> Option<[i32; 4]> {
+    if width == 0 || height == 0 || !center.is_finite() || max_radius.is_nan() {
+        return None;
+    }
+    let (x, y) = (f64::from(center.x.round()), f64::from(center.y.round()));
+    let radius = f64::from(max_radius.ceil());
+    let (x0, y0) = ((x - radius).max(0.0), (y - radius).max(0.0));
+    let (x1, y1) = (
+        (x + radius).min(f64::from(width) - 1.0),
+        (y + radius).min(f64::from(height) - 1.0),
+    );
+    if x0 > x1 || y0 > y1 {
+        None
+    } else {
+        Some([x0 as i32, y0 as i32, x1 as i32, y1 as i32])
+    }
+}
+
 /// Per-dab opacity factors; per pixel they are multiplied by the coverage,
 /// grain and selection (the same way on the CPU and the GPU).
 #[derive(Clone, Copy, Debug)]
@@ -849,7 +869,6 @@ impl StrokeRaster {
             reach,
             max_radius,
         } = DabGeometry::new(style, dynamics, &p);
-        let (x, y) = (center.x.round() as i32, center.y.round() as i32);
         let c = if style.eraser {
             [255, 255, 255, 0]
         } else {
@@ -958,17 +977,18 @@ impl StrokeRaster {
         // Blur: each pixel moves toward the average of its neighbourhood as
         // it was before this dab (premultiplied, so edges soften into
         // transparency too).
+        let Some([x0, y0, x1, y1]) = dab_bounds(center, max_radius, width, height) else {
+            return;
+        };
         let blur = if matches!(kind, BrushKind::Blur) {
             let neighbourhood = (radius * 0.3).clamp(1.0, 16.0).round() as i32;
-            let reach = max_radius.ceil() as i32 + neighbourhood;
-            let (x0, y0) = ((x - reach).max(0), (y - reach).max(0));
-            let (x1, y1) = (
-                (x + reach).min(width as i32 - 1),
-                (y + reach).min(height as i32 - 1),
-            );
-            if x0 > x1 || y0 > y1 {
-                None
-            } else {
+            dab_bounds(
+                center,
+                max_radius.ceil() + neighbourhood as f32,
+                width,
+                height,
+            )
+            .map(|[x0, y0, x1, y1]| {
                 let stride = (x1 - x0 + 1) as usize;
                 let mut region = Vec::with_capacity(stride * (y1 - y0 + 1) as usize);
                 for sy in y0..=y1 {
@@ -977,24 +997,21 @@ impl StrokeRaster {
                         region.push([r * a, g * a, b * a, a]);
                     }
                 }
-                Some(BlurRegion {
+                BlurRegion {
                     origin: (x0, y0),
                     end: (x1, y1),
                     stride,
                     pixels: region,
                     radius: neighbourhood,
-                })
-            }
+                }
+            })
         } else {
             None
         };
         let layer = target.layer;
         let factors = AlphaFactors::new(style, dynamics, mix, self.remaining_charge, c[3]);
-        for yy in y - max_radius.ceil() as i32..=y + max_radius.ceil() as i32 {
-            for xx in x - max_radius.ceil() as i32..=x + max_radius.ceil() as i32 {
-                if xx < 0 || yy < 0 || xx >= width as i32 || yy >= height as i32 {
-                    continue;
-                }
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
                 // Measure from the pixel centre, not its corner.
                 let (dx, dy) = (xx as f32 + 0.5 - center.x, yy as f32 + 0.5 - center.y);
                 let (local_x, local_y) = (dx * cos + dy * sin, -dx * sin + dy * cos);
@@ -1231,13 +1248,11 @@ impl StrokeRaster {
         let kind = style.kind;
         let g = dab.geometry;
         let (width, height) = (target.doc.width as i32, target.doc.height as i32);
-        let (x, y) = (g.center.x.round() as i32, g.center.y.round() as i32);
-        let r = g.max_radius.ceil() as i32;
-        let (bx0, by0) = ((x - r).max(0), (y - r).max(0));
-        let (bx1, by1) = ((x + r).min(width - 1), (y + r).min(height - 1));
-        if bx0 > bx1 || by0 > by1 {
+        let Some([bx0, by0, bx1, by1]) =
+            dab_bounds(g.center, g.max_radius, target.doc.width, target.doc.height)
+        else {
             return;
-        }
+        };
         let neighbourhood = if matches!(kind, BrushKind::Blur) {
             (g.radius * 0.3).clamp(1.0, 16.0).round() as i32
         } else {
@@ -1591,16 +1606,9 @@ impl StrokeRaster {
                     .map(|channel| channel as f32 / 255.0),
             });
             // Same pixel range as the CPU loop in `stamp`.
-            let (x, y) = (g.center.x.round() as i32, g.center.y.round() as i32);
-            let r = g.max_radius.ceil() as i32;
-            let (x0, y0) = ((x - r).max(0), (y - r).max(0));
-            let (x1, y1) = (
-                (x + r).min(width as i32 - 1),
-                (y + r).min(height as i32 - 1),
-            );
-            if x0 > x1 || y0 > y1 {
+            let Some([x0, y0, x1, y1]) = dab_bounds(g.center, g.max_radius, width, height) else {
                 continue;
-            }
+            };
             for ty in y0 as u32 / tile..=y1 as u32 / tile {
                 for tx in x0 as u32 / tile..=x1 as u32 / tile {
                     tile_dabs.entry((tx, ty)).or_default().push(index as u32);
@@ -2138,6 +2146,151 @@ pub fn sample_tip_bilinear(coverage: &[u8], width: u32, height: u32, u: f32, v: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn imported_enormous_dab(kind: BrushKind, accelerated: bool, size: f32) {
+        let mut brush = crate::defaults().remove(0);
+        brush.kind = kind;
+        brush.size = size;
+        brush.opacity = 0.5;
+        brush.size_source = DynamicSource::None;
+        brush.opacity_source = DynamicSource::None;
+        brush.hardness = 1.0;
+        brush.antialias = 0;
+        let bytes = crate::set_bytes(&[brush]).unwrap();
+        let brush = crate::set_from_bytes(&bytes).unwrap().remove(0);
+        assert_eq!(brush.size, size);
+        let mut doc = Document::new(16, 16);
+        let pixels = |doc: &Document| {
+            (0..16)
+                .flat_map(|y| (0..16).map(move |x| doc.layers[0].pixels.pixel(x, y)))
+                .collect::<Vec<_>>()
+        };
+        let before = pixels(&doc);
+        let selection: Vec<_> = (0..256)
+            .map(|i| match i % 3 {
+                0 => 255,
+                1 => 128,
+                _ => 0,
+            })
+            .collect();
+        let mut history = History::default();
+        history.begin();
+        let style = DabStyle {
+            brush: &brush,
+            kind,
+            eraser: false,
+            color: [23, 67, 149, 255],
+            size: brush.size,
+        };
+        let p = InkPoint::new(8.0, 8.0, 1.0, 0);
+        let d = dynamics(&brush, &p, None, 1.0);
+        let mut raster = StrokeRaster::new([0.0; 3], 1.0, Vec2::ZERO);
+        let mut target = DabTarget {
+            doc: &mut doc,
+            layer: 0,
+            selection: Some(&selection),
+            history: &mut history,
+        };
+        if accelerated {
+            raster.stamp_many(&mut target, style, &[(p, d)], Some(&CpuCover), 0.0);
+        } else {
+            raster.stamp(&mut target, style, &d, p);
+        }
+        history.commit();
+        let painted = pixels(&doc);
+        for (pixel, selected) in painted.iter().zip(selection) {
+            let expected = match selected {
+                255 => [23, 67, 149, 128],
+                128 => [23, 67, 149, 64],
+                _ => [0; 4],
+            };
+            assert_eq!(*pixel, expected);
+        }
+        history.undo_document(&mut doc);
+        assert_eq!(pixels(&doc), before);
+        history.redo_document(&mut doc);
+        assert_eq!(pixels(&doc), painted);
+    }
+
+    #[test]
+    fn enormous_imported_pen_dab_is_limited_to_document() {
+        for size in [3.0e38, 1.0e6] {
+            imported_enormous_dab(BrushKind::Pen, false, size);
+        }
+    }
+
+    #[test]
+    fn enormous_imported_airbrush_dab_is_limited_to_document() {
+        for size in [3.0e38, 1.0e6] {
+            imported_enormous_dab(BrushKind::Airbrush, false, size);
+        }
+    }
+
+    #[test]
+    fn enormous_imported_cpu_cover_dab_is_limited_to_document() {
+        for size in [3.0e38, 1.0e6] {
+            imported_enormous_dab(BrushKind::Pen, true, size);
+        }
+    }
+
+    #[test]
+    fn clipping_a_normal_dab_preserves_coverage_and_color() {
+        let render = |kind, accelerated, width, offset: f32| {
+            let mut brush = crate::defaults().remove(0);
+            brush.kind = kind;
+            brush.opacity = 0.6;
+            brush.hardness = 0.65;
+            brush.tip_aspect = 1.6;
+            brush.tip_rotation = 35.0;
+            brush.tip = Some(crate::BrushTip {
+                width: 2,
+                height: 2,
+                coverage: vec![32, 255, 128, 224],
+            });
+            let mut doc = Document::new(width, width);
+            let mut history = History::default();
+            history.begin();
+            let style = DabStyle {
+                brush: &brush,
+                kind,
+                eraser: false,
+                color: [23, 67, 149, 255],
+                size: 40.0,
+            };
+            let p = InkPoint::new(-1.25 + offset, 14.25 + offset, 1.0, 0);
+            let d = dynamics(&brush, &p, None, 1.0);
+            let mut raster = StrokeRaster::new([0.0; 3], 1.0, Vec2::ZERO);
+            let mut target = DabTarget {
+                doc: &mut doc,
+                layer: 0,
+                selection: None,
+                history: &mut history,
+            };
+            if accelerated {
+                raster.stamp_many(&mut target, style, &[(p, d)], Some(&CpuCover), 0.0);
+            } else {
+                raster.stamp(&mut target, style, &d, p);
+            }
+            doc
+        };
+        for (kind, accelerated) in [
+            (BrushKind::Pen, false),
+            (BrushKind::Airbrush, false),
+            (BrushKind::Pen, true),
+        ] {
+            let clipped = render(kind, accelerated, 16, 0.0);
+            let padded = render(kind, accelerated, 48, 16.0);
+            for y in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(
+                        clipped.layers[0].pixels.pixel(x, y),
+                        padded.layers[0].pixels.pixel(x + 16, y + 16),
+                        "{kind:?}, accelerated={accelerated}, pixel=({x},{y})"
+                    );
+                }
+            }
+        }
+    }
 
     /// Alpha painted by one pen dab at `center` with a striped grain.
     fn grain_dab(fixed: bool, center: f32) -> Vec<u8> {

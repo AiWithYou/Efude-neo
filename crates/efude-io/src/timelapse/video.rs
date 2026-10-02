@@ -129,6 +129,16 @@ pub fn plan(session: &Session, source_count: usize, options: &Options) -> Result
 }
 
 pub fn layout(source: &RgbImage, width: u32, height: u32, fit: Fit) -> RgbImage {
+    layout_with_intermediate_limit(source, width, height, fit, 16 * 1024 * 1024)
+}
+
+fn layout_with_intermediate_limit(
+    source: &RgbImage,
+    width: u32,
+    height: u32,
+    fit: Fit,
+    intermediate_limit: u64,
+) -> RgbImage {
     let sx = width as f64 / source.width() as f64;
     let sy = height as f64 / source.height() as f64;
     let scale = if fit == Fit::Contain {
@@ -138,7 +148,19 @@ pub fn layout(source: &RgbImage, width: u32, height: u32, fit: Fit) -> RgbImage 
     };
     let w = (source.width() as f64 * scale).round().max(1.0) as u32;
     let h = (source.height() as f64 * scale).round().max(1.0) as u32;
-    let resized = image::imageops::resize(source, w, h, FilterType::Triangle);
+    let resized = if fit == Fit::Cover {
+        resize_cover_region(
+            source,
+            w,
+            h,
+            width.min(w),
+            height.min(h),
+            intermediate_limit,
+        )
+    } else {
+        image::imageops::resize(source, w, h, FilterType::Triangle)
+    };
+    let (w, h) = resized.dimensions();
     let mut output = RgbImage::from_pixel(width, height, Rgb([255; 3]));
     let draw_w = width.min(w);
     let draw_h = height.min(h);
@@ -156,6 +178,85 @@ pub fn layout(source: &RgbImage, width: u32, height: u32, fit: Fit) -> RgbImage 
         }
     }
     output
+}
+
+fn resize_cover_region(
+    source: &RgbImage,
+    width: u32,
+    height: u32,
+    crop_width: u32,
+    crop_height: u32,
+    intermediate_limit: u64,
+) -> RgbImage {
+    if width as u64 * height as u64 <= intermediate_limit
+        || source.width() == 0
+        || source.height() == 0
+        || crop_width == 0
+        || crop_height == 0
+    {
+        return image::imageops::resize(source, width, height, FilterType::Triangle);
+    }
+    // Keep image::resize's vertical-then-horizontal Triangle sampling and pixel
+    // centres, but evaluate only the central crop and its source kernel support.
+    // Matches image 0.25.10: https://docs.rs/image/0.25.10/src/image/imageops/sample.rs.html
+    let from_x = (width - crop_width) / 2;
+    let from_y = (height - crop_height) / 2;
+    let columns: Vec<_> = (0..crop_width)
+        .map(|x| triangle_weights(from_x + x, source.width(), width))
+        .collect();
+    let first = columns[0].0;
+    let last = columns.last().unwrap();
+    let right = last.0 + last.1.len() as u32;
+    let mut row = vec![[0.0f32; 3]; (right - first) as usize];
+    let mut output = RgbImage::new(crop_width, crop_height);
+    for y in 0..crop_height {
+        let (top, weights) = triangle_weights(from_y + y, source.height(), height);
+        for (x, value) in row.iter_mut().enumerate() {
+            *value = [0.0; 3];
+            for (i, weight) in weights.iter().enumerate() {
+                let pixel = source.get_pixel(first + x as u32, top + i as u32);
+                for channel in 0..3 {
+                    value[channel] += pixel[channel] as f32 * weight;
+                }
+            }
+        }
+        for (x, (left, weights)) in columns.iter().enumerate() {
+            let mut value = [0.0f32; 3];
+            for (i, weight) in weights.iter().enumerate() {
+                let pixel = row[(*left - first) as usize + i];
+                for channel in 0..3 {
+                    value[channel] += pixel[channel] * weight;
+                }
+            }
+            output.put_pixel(
+                x as u32,
+                y,
+                Rgb(value.map(|v| v.clamp(0.0, 255.0).round() as u8)),
+            );
+        }
+    }
+    output
+}
+
+fn triangle_weights(position: u32, input_length: u32, output_length: u32) -> (u32, Vec<f32>) {
+    let ratio = input_length as f32 / output_length as f32;
+    let support = ratio.max(1.0);
+    let centre = (position as f32 + 0.5) * ratio;
+    let left = (centre - support)
+        .floor()
+        .clamp(0.0, input_length as f32 - 1.0) as u32;
+    let right = (centre + support)
+        .ceil()
+        .clamp(left as f32 + 1.0, input_length as f32) as u32;
+    let centre = centre - 0.5;
+    let mut weights: Vec<_> = (left..right)
+        .map(|i| (1.0 - ((i as f32 - centre) / support).abs()).max(0.0))
+        .collect();
+    let total: f32 = weights.iter().sum();
+    for weight in &mut weights {
+        *weight /= total;
+    }
+    (left, weights)
 }
 
 pub fn read_frame(session: &Session, path: &Path) -> Result<RgbImage, String> {
@@ -486,6 +587,59 @@ mod tests {
         assert_eq!(contain.get_pixel(4, 4).0, [20, 40, 80]);
         let cover = layout(&image, 8, 8, Fit::Cover);
         assert!(cover.pixels().all(|p| p.0 == [20, 40, 80]));
+    }
+
+    #[test]
+    fn cover_resizes_only_the_needed_region_when_intermediate_is_large() {
+        let source = RgbImage::from_pixel(64, 2, Rgb([20, 40, 80]));
+        let resized = resize_cover_region(&source, 256, 8, 8, 8, 64);
+        assert_eq!(resized.dimensions(), (8, 8));
+        assert_eq!(resized.as_raw().len(), 8 * 8 * 3);
+    }
+
+    #[test]
+    fn bounded_cover_matches_full_triangle_resize() {
+        for (source_width, source_height) in [(64, 32), (7, 3), (3, 7), (1, 8), (8, 1), (8, 8)] {
+            let source = RgbImage::from_fn(source_width, source_height, |x, y| {
+                Rgb([
+                    (x * 37 + y * 61) as u8,
+                    (x * 73 + y * 19) as u8,
+                    (x * 11 + y * 29) as u8,
+                ])
+            });
+            for (width, height) in [(8, 8), (11, 5), (6, 13), (32, 32)] {
+                assert_eq!(
+                    layout_with_intermediate_limit(&source, width, height, Fit::Cover, 0),
+                    layout(&source, width, height, Fit::Cover),
+                    "{source_width}x{source_height} to {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thin_recording_can_use_the_portrait_cover_preset() {
+        let directory = tempfile::tempdir().unwrap();
+        let document = efude_canvas::Document::new(2160, 2);
+        let session =
+            super::super::create_session(directory.path(), &document, false, 2160).unwrap();
+        super::super::write_frame(&session, 1, &document).unwrap();
+        let options = Options {
+            duration: 1.0,
+            hold: 0.0,
+            size: Size::Portrait,
+            fit: Fit::Cover,
+        };
+        let plan = plan(&session, 1, &options).unwrap();
+        let frame = read_frame(&session, &session.folder.join("frame_00000001.jpg")).unwrap();
+        let output = layout(&frame, plan.width, plan.height, options.fit);
+        assert_eq!(output.dimensions(), (1080, 1920));
+        assert_eq!(output.as_raw().len(), 1080 * 1920 * 3);
+        assert!(
+            output
+                .pixels()
+                .all(|pixel| pixel.0.iter().all(|v| *v > 245))
+        );
     }
 
     #[test]
