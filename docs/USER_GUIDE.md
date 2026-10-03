@@ -198,3 +198,7 @@ Windows MSIを使うとセットアップウィザードからインストール
 Efudeは自由ソフトウェアです。アプリ部分（`efude-ui`・`efude-app`）はMozilla Public License 2.0（`LICENSE-MPL`）、エンジン部分はMIT OR Apache-2.0（`LICENSE-MIT`・`LICENSE-APACHE`）です。使用しているライブラリとそのライセンスは `THIRD_PARTY_NOTICES.txt` にあります。
 
 Efude-neoのソースコードは https://github.com/AiWithYou/Efude-neo で公開しています。[852wa氏のEfude](https://github.com/852wa/Efude)から派生したプロジェクトです。
+
+### ガイドを含めるタイムラプスの変更検出
+
+「ガイドを動画に含める」が ON の記録は、ガイドの不透明度・位置・表示の変更と Undo/Redo も次のフレームに反映する。OFF の記録はガイドだけの編集ではフレームを増やさない。終了やタブを閉じる際も、最後の変更を記録する。

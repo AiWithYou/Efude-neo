@@ -12,6 +12,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Artwork revisions deliberately exclude editing-guide changes. When the
+// guide is included, document state also tracks those changes and Undo/Redo.
+fn capture_revision(history: &efude_canvas::History, include_guide: bool) -> u64 {
+    if include_guide {
+        history.state_token()
+    } else {
+        history.content_revision()
+    }
+}
+
 pub(crate) enum Task {
     Frame {
         document_id: u64,
@@ -298,7 +308,10 @@ impl EfudeApp {
                         session,
                         next_index: 1,
                         frames_written: 0,
-                        last_content_revision: self.history.content_revision(),
+                        last_content_revision: capture_revision(
+                            &self.history,
+                            self.timelapse_include_guide,
+                        ),
                         last_capture: Instant::now() - Duration::from_secs(2),
                         recording: true,
                         paused: false,
@@ -323,10 +336,10 @@ impl EfudeApp {
         reliable: bool,
     ) {
         let id = self.history.document_id();
-        let revision = self.history.content_revision();
         let Some(state) = self.timelapse_sessions.get(&id) else {
             return;
         };
+        let revision = capture_revision(&self.history, state.session.include_guide);
         if !state.recording || state.paused {
             return;
         }
@@ -406,7 +419,10 @@ impl EfudeApp {
             return;
         }
         let (mut document, revision) = if self.history.document_id() == document_id {
-            (self.document_snapshot(), self.history.content_revision())
+            (
+                self.document_snapshot(),
+                capture_revision(&self.history, state.session.include_guide),
+            )
         } else if let Some(tab) = self
             .tabs
             .slots
@@ -414,7 +430,10 @@ impl EfudeApp {
             .filter_map(|slot| slot.parked.as_ref())
             .find(|tab| tab.history.document_id() == document_id)
         {
-            (tab.doc.clone(), tab.history.content_revision())
+            (
+                tab.doc.clone(),
+                capture_revision(&tab.history, state.session.include_guide),
+            )
         } else {
             return;
         };
@@ -906,6 +925,167 @@ mod tests {
         app.timelapse_worker.receiver = receiver;
         app.poll_timelapse_worker();
         (app, root, old_folder, current_folder)
+    }
+
+    #[test]
+    fn included_guide_edits_are_captured_and_final_change_survives_tab_close() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(64, 64);
+        app.doc.guide = efude_canvas::GuideImage::fit_to_canvas(
+            64,
+            64,
+            [255, 0, 255, 255].repeat(64 * 64),
+            &app.doc,
+        );
+        let session = timelapse::create_session(root.path(), &app.doc, true, 720).unwrap();
+        let id = app.history.document_id();
+        app.timelapse_sessions.insert(
+            id,
+            Recording {
+                session: session.clone(),
+                next_index: 1,
+                frames_written: 0,
+                last_content_revision: 0,
+                last_capture: Instant::now() - Duration::from_secs(2),
+                recording: true,
+                paused: false,
+            },
+        );
+        let ctx = egui::Context::default();
+        app.capture_timelapse_frame(&ctx, true, true);
+        let mut guide = app.doc.guide.clone().unwrap();
+        guide.opacity = 1.0;
+        app.history.set_guide(&mut app.doc, Some(guide));
+        app.capture_timelapse_frame(&ctx, false, true);
+        assert_eq!(
+            app.timelapse_sessions[&id].next_index, 3,
+            "included guide opacity edit must produce a frame"
+        );
+        app.history.undo_document(&mut app.doc);
+        app.capture_timelapse_frame(&ctx, false, true);
+        assert_eq!(
+            app.timelapse_sessions[&id].next_index, 4,
+            "included guide undo must produce a frame"
+        );
+        let mut guide = app.doc.guide.clone().unwrap();
+        guide.visible = false;
+        app.history.set_guide(&mut app.doc, Some(guide));
+        app.finish_timelapse_on_tab_close(id);
+        drop(app);
+        let frames = timelapse::frame_paths(&session).unwrap();
+        assert_eq!(frames.len(), 4);
+        let pixel = |n: usize| {
+            image::open(&frames[n])
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(32, 32)
+                .0
+        };
+        assert!(pixel(1)[1] < 10, "opacity change missing");
+        assert!(pixel(2)[1] > 100, "undo missing");
+        assert!(pixel(3).iter().all(|v| *v > 245), "final hide missing");
+    }
+
+    #[test]
+    fn guide_recording_boundaries_keep_off_private_and_close_parked_on_latest_state() {
+        for include_guide in [false, true] {
+            for parked in [false, true] {
+                for paused in [false, true] {
+                    let root = tempfile::tempdir().unwrap();
+                    let mut app = EfudeApp::default();
+                    app.doc = Document::new(32, 32);
+                    app.doc.guide = efude_canvas::GuideImage::fit_to_canvas(
+                        32,
+                        32,
+                        [255, 0, 255, 255].repeat(32 * 32),
+                        &app.doc,
+                    );
+                    app.doc.guide.as_mut().unwrap().opacity = 1.0;
+                    let session =
+                        timelapse::create_session(root.path(), &app.doc, include_guide, 720)
+                            .unwrap();
+                    let id = app.history.document_id();
+                    app.timelapse_sessions.insert(
+                        id,
+                        Recording {
+                            session: session.clone(),
+                            next_index: 1,
+                            frames_written: 0,
+                            last_content_revision: capture_revision(&app.history, include_guide),
+                            last_capture: Instant::now() - Duration::from_secs(2),
+                            recording: true,
+                            paused: false,
+                        },
+                    );
+                    let ctx = egui::Context::default();
+                    app.capture_timelapse_frame(&ctx, true, true);
+                    let mut guide = app.doc.guide.clone().unwrap();
+                    guide.opacity = 0.7;
+                    app.history.set_guide(&mut app.doc, Some(guide));
+                    app.capture_timelapse_frame(&ctx, false, true);
+                    app.history.undo_document(&mut app.doc);
+                    app.capture_timelapse_frame(&ctx, false, true);
+                    app.history.redo_document(&mut app.doc);
+                    app.capture_timelapse_frame(&ctx, false, true);
+                    let expected_before_close = if include_guide { 4 } else { 1 };
+                    assert_eq!(
+                        app.timelapse_sessions[&id].next_index,
+                        expected_before_close + 1
+                    );
+                    app.timelapse_sessions.get_mut(&id).unwrap().paused = paused;
+                    let mut guide = app.doc.guide.clone().unwrap();
+                    guide.visible = false;
+                    app.history.set_guide(&mut app.doc, Some(guide));
+                    if parked {
+                        app.install_document(
+                            Document::new(32, 32),
+                            root.path().join("other.efude"),
+                        );
+                        assert_ne!(app.history.document_id(), id);
+                        assert!(app.tabs.slots.iter().any(|slot| {
+                            slot.parked
+                                .as_ref()
+                                .is_some_and(|tab| tab.history.document_id() == id)
+                        }));
+                    }
+                    app.finish_timelapse_on_tab_close(id);
+                    assert!(!app.timelapse_sessions.contains_key(&id));
+                    drop(app);
+                    let frames = timelapse::frame_paths(&session).unwrap();
+                    let expected = if include_guide { 5 } else { 1 };
+                    assert_eq!(
+                        frames.len(),
+                        expected,
+                        "include={include_guide}, parked={parked}, paused={paused}"
+                    );
+                    let decoded: Vec<_> = frames
+                        .iter()
+                        .map(|path| image::open(path).unwrap().to_rgb8())
+                        .collect();
+                    if include_guide {
+                        assert!(decoded[0].get_pixel(16, 16)[1] < 10);
+                        assert!(
+                            decoded
+                                .last()
+                                .unwrap()
+                                .get_pixel(16, 16)
+                                .0
+                                .iter()
+                                .all(|v| *v > 245),
+                            "latest parked hide missing"
+                        );
+                    } else {
+                        assert!(
+                            decoded[0]
+                                .pixels()
+                                .all(|pixel| pixel.0.iter().all(|v| *v > 245)),
+                            "excluded guide leaked"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

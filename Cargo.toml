@@ -5,7 +5,7 @@ members = ["crates/efude", "crates/efude-core", "crates/efude-input", "crates/ef
 # it is not linted, formatted or tested with the workspace.
 exclude = ["vendor/eframe-0.31.1"]
 [workspace.package]
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 authors = ["Hakoniwa"]
 repository = "https://github.com/AiWithYou/Efude-neo"
@@ -25,16 +25,16 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 png = "0.18"
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
-efude-core = { path = "crates/efude-core", version = "0.3.4" }
-efude-input = { path = "crates/efude-input", version = "0.3.4" }
-efude-stroke = { path = "crates/efude-stroke", version = "0.3.4" }
-efude-brush = { path = "crates/efude-brush", version = "0.3.4" }
-efude-canvas = { path = "crates/efude-canvas", version = "0.3.4" }
-efude-gpu = { path = "crates/efude-gpu", version = "0.3.4" }
-efude-io = { path = "crates/efude-io", version = "0.3.4" }
-efude-comic = { path = "crates/efude-comic", version = "0.3.4" }
-efude-ui = { path = "crates/efude-ui", version = "0.3.4" }
-efude = { path = "crates/efude", version = "0.3.4" }
+efude-core = { path = "crates/efude-core", version = "0.3.5" }
+efude-input = { path = "crates/efude-input", version = "0.3.5" }
+efude-stroke = { path = "crates/efude-stroke", version = "0.3.5" }
+efude-brush = { path = "crates/efude-brush", version = "0.3.5" }
+efude-canvas = { path = "crates/efude-canvas", version = "0.3.5" }
+efude-gpu = { path = "crates/efude-gpu", version = "0.3.5" }
+efude-io = { path = "crates/efude-io", version = "0.3.5" }
+efude-comic = { path = "crates/efude-comic", version = "0.3.5" }
+efude-ui = { path = "crates/efude-ui", version = "0.3.5" }
+efude = { path = "crates/efude", version = "0.3.5" }
 [workspace.lints.rust]
 unsafe_code = "deny"
 
