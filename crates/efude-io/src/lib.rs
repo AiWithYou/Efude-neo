@@ -1479,6 +1479,7 @@ pub fn import_psd_report(path: &Path) -> Result<PsdImport, Box<dyn std::error::E
                 "スマートオブジェクト" => "smart objects",
                 "レイヤー効果" => "layer effects",
                 "ベクターマスク" => "vector masks",
+                "レイヤーマスク設定" => "layer-mask settings",
                 "調整レイヤー" => "adjustment layers",
                 "圧縮方式" => "channel compression methods",
                 "画素チャンネルのないレイヤー" => {
@@ -1628,6 +1629,7 @@ fn parse_psd_layers_with_tile_limit(
         has_mask: bool,
         mask_bounds: Option<(i32, i32, i32, i32)>,
         mask_default: u8,
+        invert_mask: bool,
         section: Option<u32>,
     }
     let mut records = Vec::with_capacity(count);
@@ -1699,6 +1701,7 @@ fn parse_psd_layers_with_tile_limit(
         let mut has_mask = mask_len >= 18;
         let mut mask_bounds = None;
         let mut mask_default = 255;
+        let mut invert_mask = false;
         if has_mask {
             let mut mask_header = [0u8; 18];
             r.read_exact(&mut mask_header)?;
@@ -1712,6 +1715,7 @@ fn parse_psd_layers_with_tile_limit(
             // Disabled masks still have channel data to consume, but do not
             // affect the imported layer's appearance.
             has_mask = flags & 2 == 0;
+            invert_mask = flags & 4 != 0;
             if flags & 1 != 0 {
                 for (bound, offset) in bounds.iter_mut().zip([top, left, top, left]) {
                     *bound = bound
@@ -1720,8 +1724,58 @@ fn parse_psd_layers_with_tile_limit(
                 }
             }
             mask_bounds = Some((bounds[0], bounds[1], bounds[2], bounds[3]));
-            mask_default = mask_header[16];
-            r.seek(SeekFrom::Current(mask_len.saturating_sub(18) as i64))?;
+            mask_default = if invert_mask {
+                255 - mask_header[16]
+            } else {
+                mask_header[16]
+            };
+            let mut remaining = mask_len - 18;
+            if flags & 16 != 0 {
+                if remaining < 19 {
+                    return Err("PSD layer mask parameters are truncated".into());
+                }
+                let mut parameters = [0];
+                r.read_exact(&mut parameters)?;
+                remaining -= 1;
+                let parameters = parameters[0];
+                if parameters & !15 != 0 {
+                    return Err("invalid PSD layer mask parameter flags".into());
+                }
+                let parameter_bytes = usize::from(parameters & 1 != 0)
+                    + 8 * usize::from(parameters & 2 != 0)
+                    + usize::from(parameters & 4 != 0)
+                    + 8 * usize::from(parameters & 8 != 0);
+                // Extended headers also contain real flags, background, and
+                // a rectangle (18 bytes). Parameters cannot borrow from them.
+                if remaining < parameter_bytes + 18 {
+                    return Err("PSD layer mask parameters exceed their mask-data section".into());
+                }
+                let mut unsupported_mask_settings = false;
+                for (density, feather) in [(1, 2), (4, 8)] {
+                    if parameters & density != 0 {
+                        let mut value = [0];
+                        r.read_exact(&mut value)?;
+                        unsupported_mask_settings |= value[0] != 255;
+                    }
+                    if parameters & feather != 0 {
+                        let mut value = [0; 8];
+                        r.read_exact(&mut value)?;
+                        let value = f64::from_be_bytes(value);
+                        if !value.is_finite() || value < 0.0 {
+                            return Err("invalid PSD layer mask feather".into());
+                        }
+                        unsupported_mask_settings |= value != 0.0;
+                    }
+                }
+                remaining -= parameter_bytes;
+                if has_mask && unsupported_mask_settings {
+                    has_unsupported_features = true;
+                    if !unsupported_reasons.contains(&"レイヤーマスク設定") {
+                        unsupported_reasons.push("レイヤーマスク設定");
+                    }
+                }
+            }
+            r.seek(SeekFrom::Current(remaining as i64))?;
         } else {
             r.seek(SeekFrom::Current(mask_len as i64))?;
         }
@@ -1860,6 +1914,7 @@ fn parse_psd_layers_with_tile_limit(
             has_mask,
             mask_bounds,
             mask_default,
+            invert_mask,
             section,
         });
     }
@@ -2048,6 +2103,11 @@ fn parse_psd_layers_with_tile_limit(
                         -1 => layer.pixels[dst + 3] = value,
                         -2 => {
                             if let Some(mask) = &mut layer.mask {
+                                let value = if record.invert_mask {
+                                    255 - value
+                                } else {
+                                    value
+                                };
                                 // Pixels outside the mask rectangle keep its
                                 // default, including the rest of this tile.
                                 if !mask.has_tile(dx as u32, dy as u32) {
@@ -3129,6 +3189,15 @@ mod tests {
     }
 
     fn psd_masked_layer_fixture(mask_flags: u8, mask_default: u8, mask_value: u8) -> Vec<u8> {
+        psd_masked_layer_fixture_with_parameters(mask_flags, mask_default, mask_value, None)
+    }
+
+    fn psd_masked_layer_fixture_with_parameters(
+        mask_flags: u8,
+        mask_default: u8,
+        mask_value: u8,
+        parameters: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut record = Vec::new();
         for bound in [1i32, 1, 2, 2] {
             record.extend_from_slice(&bound.to_be_bytes());
@@ -3146,15 +3215,28 @@ mod tests {
         }
         record.extend_from_slice(b"8BIMnorm");
         record.extend_from_slice(&[255, 0, 0, 0]);
-        let mut extra = 20u32.to_be_bytes().to_vec();
+        let mut mask_data = Vec::new();
         for bound in if mask_flags & 1 != 0 {
             [0i32, 0, 1, 1]
         } else {
             [1i32, 1, 2, 2]
         } {
-            extra.extend_from_slice(&bound.to_be_bytes());
+            mask_data.extend_from_slice(&bound.to_be_bytes());
         }
-        extra.extend_from_slice(&[mask_default, mask_flags, 0, 0]);
+        mask_data.extend_from_slice(&[mask_default, mask_flags]);
+        if let Some(parameters) = parameters {
+            mask_data.extend_from_slice(parameters);
+            // Extended mask data ends with the real mask flags, background,
+            // and rectangle, after the declared density/feather parameters.
+            mask_data.extend_from_slice(&[0, mask_default]);
+            for bound in [1i32, 1, 2, 2] {
+                mask_data.extend_from_slice(&bound.to_be_bytes());
+            }
+        } else {
+            mask_data.extend_from_slice(&[0; 2]);
+        }
+        let mut extra = (mask_data.len() as u32).to_be_bytes().to_vec();
+        extra.extend_from_slice(&mask_data);
         extra.extend_from_slice(&0u32.to_be_bytes());
         extra.extend_from_slice(&[3, b'i', b'n', b'k']);
         record.extend_from_slice(&(extra.len() as u32).to_be_bytes());
@@ -3169,6 +3251,206 @@ mod tests {
         section.extend_from_slice(&info);
         section.extend_from_slice(&0u32.to_be_bytes());
         section
+    }
+
+    fn psd_with_layer_section(section: &[u8], merged: [u8; 3]) -> Vec<u8> {
+        let mut file = b"8BPS".to_vec();
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&[0; 6]);
+        file.extend_from_slice(&3u16.to_be_bytes());
+        file.extend_from_slice(&3u32.to_be_bytes());
+        file.extend_from_slice(&3u32.to_be_bytes());
+        file.extend_from_slice(&8u16.to_be_bytes());
+        file.extend_from_slice(&3u16.to_be_bytes());
+        file.extend_from_slice(&0u32.to_be_bytes());
+        file.extend_from_slice(&0u32.to_be_bytes());
+        file.extend_from_slice(&(section.len() as u32).to_be_bytes());
+        file.extend_from_slice(section);
+        file.extend_from_slice(&0u16.to_be_bytes());
+        for value in merged {
+            file.extend_from_slice(&[value; 9]);
+        }
+        file
+    }
+
+    #[test]
+    fn psd_import_normalizes_inverted_layer_masks() {
+        for flags in [4, 5] {
+            for default in [0, 255] {
+                for value in [0, 255, 128] {
+                    let (layers, unsupported, _, _) = parse_psd_layers(
+                        &psd_masked_layer_fixture(flags, default, value),
+                        3,
+                        3,
+                        3,
+                        8,
+                    )
+                    .unwrap();
+                    assert!(!unsupported);
+                    let layers = layers.unwrap();
+                    let mask = layers[0].mask.as_ref().unwrap();
+                    assert_eq!(mask.pixel(1, 1)[0], 255 - value);
+                    assert_eq!(mask.pixel_or_tile_default(0, 0, [255; 4])[0], 255 - default);
+                    let mut document = Document::new(3, 3);
+                    document.layers = layers;
+                    let pixels = composite_transparent(&document);
+                    assert_eq!(pixels[((3 + 1) * 4) + 3], 255 - value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn psd_import_keeps_disabled_inverted_layer_masks_disabled() {
+        let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
+        for flags in [6, 7] {
+            let (layers, unsupported, _, _) = parse_psd_layers_with_tile_limit(
+                &psd_masked_layer_fixture(flags, 0, 0),
+                768,
+                512,
+                3,
+                8,
+                tile_bytes,
+            )
+            .unwrap();
+            assert!(!unsupported);
+            let layers = layers.unwrap();
+            assert!(layers[0].mask.is_none());
+            assert_eq!(layers[0].pixels.pixel(1, 1), [200, 40, 60, 255]);
+        }
+    }
+
+    #[test]
+    fn psd_inverted_mask_defaults_match_shared_storage_budget() {
+        let tile_bytes = u64::from(TILE_SIZE) * u64::from(TILE_SIZE) * 4;
+        for (default, value, required_tiles) in [(0, 0, 2), (255, 255, 3)] {
+            let section = psd_masked_layer_fixture(4, default, value);
+            assert!(
+                parse_psd_layers_with_tile_limit(
+                    &section,
+                    768,
+                    512,
+                    3,
+                    8,
+                    tile_bytes * (required_tiles - 1),
+                )
+                .is_err()
+            );
+            let (layers, _, _, _) = parse_psd_layers_with_tile_limit(
+                &section,
+                768,
+                512,
+                3,
+                8,
+                tile_bytes * required_tiles,
+            )
+            .unwrap();
+            let mut layers = layers.unwrap();
+            let mask = layers[0].mask.as_mut().unwrap();
+            assert_eq!(mask.pixel(1, 1)[0], 255 - value);
+            assert_eq!(
+                mask.pixel_or_tile_default(700, 400, [255; 4])[0],
+                255 - default
+            );
+            let unique_buffers = mask
+                .tiles()
+                .map(|(_, data)| data.as_ptr())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert!(unique_buffers <= 2);
+            let original = mask.clone();
+            mask.set_pixel(300, 300, [128; 4]);
+            assert_eq!(
+                original.pixel_or_tile_default(300, 300, [255; 4])[0],
+                255 - default
+            );
+        }
+    }
+
+    #[test]
+    fn psd_import_uses_merged_image_for_active_mask_parameters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mask-parameters.psd");
+        let feather = 2.5f64.to_be_bytes();
+        let mut user_feather = vec![2];
+        user_feather.extend_from_slice(&feather);
+        let mut vector_feather = vec![8];
+        vector_feather.extend_from_slice(&feather);
+        for parameters in [
+            vec![1, 0],
+            vec![1, 128],
+            vec![4, 128],
+            user_feather,
+            vector_feather,
+        ] {
+            let section = psd_masked_layer_fixture_with_parameters(16, 255, 0, Some(&parameters));
+            std::fs::write(&path, psd_with_layer_section(&section, [200, 40, 60])).unwrap();
+            let report = import_psd_report(&path).unwrap();
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("レイヤーマスク設定"))
+            );
+            assert!(
+                report
+                    .warnings_en
+                    .iter()
+                    .any(|warning| warning.contains("layer-mask settings"))
+            );
+            assert_eq!(report.document.layers.len(), 1);
+            assert!(report.document.layers[0].mask.is_none());
+            assert_eq!(
+                report.document.layers[0].pixels.to_dense(),
+                [200, 40, 60, 255].repeat(9),
+                "the merged image must preserve pixels outside the original layer bounds",
+            );
+        }
+    }
+
+    #[test]
+    fn psd_import_preserves_disabled_and_neutral_mask_parameters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("neutral-mask-parameters.psd");
+        let mut neutral = vec![15, 255];
+        neutral.extend_from_slice(&0.0f64.to_be_bytes());
+        neutral.push(255);
+        neutral.extend_from_slice(&0.0f64.to_be_bytes());
+        let mut active_parameters = vec![3, 128];
+        active_parameters.extend_from_slice(&2.5f64.to_be_bytes());
+        for (flags, parameters, disabled) in [
+            (16, neutral, false),
+            (16, vec![0], false),
+            (18, active_parameters.clone(), true),
+            (22, active_parameters, true),
+        ] {
+            let section =
+                psd_masked_layer_fixture_with_parameters(flags, 255, 0, Some(&parameters));
+            std::fs::write(&path, psd_with_layer_section(&section, [200, 40, 60])).unwrap();
+            let report = import_psd_report(&path).unwrap();
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            assert_eq!(report.document.layers[0].name, "ink");
+            assert_eq!(report.document.layers[0].mask.is_none(), disabled);
+            assert_eq!(
+                report.document.layers[0].pixels.pixel(1, 1),
+                [200, 40, 60, 255]
+            );
+        }
+    }
+
+    #[test]
+    fn psd_import_rejects_truncated_or_invalid_mask_parameters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-mask-parameters.psd");
+        let mut nan_feather = vec![2];
+        nan_feather.extend_from_slice(&f64::NAN.to_be_bytes());
+        let mut negative_feather = vec![2];
+        negative_feather.extend_from_slice(&(-1.0f64).to_be_bytes());
+        for parameters in [vec![], vec![1], vec![2, 0], nan_feather, negative_feather] {
+            let section = psd_masked_layer_fixture_with_parameters(16, 255, 0, Some(&parameters));
+            std::fs::write(&path, psd_with_layer_section(&section, [200, 40, 60])).unwrap();
+            assert!(import_psd_report(&path).is_err(), "accepted {parameters:?}");
+        }
     }
 
     #[test]
