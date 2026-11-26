@@ -60,18 +60,25 @@ See the [User Guide](docs/USER_GUIDE.md) and in-app Help for detailed steps and 
 
 ## Features
 
-| What you want to do | Tools |
+Draw with pressure-sensitive pens, pencils and watercolours, stroke stabilization and colour mixing. Build up artwork with raster and vector layers, 14 blend modes, masks, rulers and symmetry rulers. Manga tools include panels, screentones, focus and speed lines, vertical text in speech balloons and batch PNG export for multi-page books. You can also open PNG, JPEG, BMP, GIF and PSD files and paint over them.
+
+## Differences from original Efude
+
+These additions and improvements cover the changes from the original Efude 0.1.0 (`fe7c6f7`) through Efude-neo 0.4.0.
+
+| Task | What changed in Efude-neo |
 | --- | --- |
-| Draw and paint | Use pen, pencil and watercolor brushes with pressure curves, stabilization, tapers and textured tips. Pick colours on the HSV ring and square, mix paint, draw shapes and drag out gradients. Import and export brush sets. |
-| Organize artwork in layers | Raster and vector layers, folders, 14 blend modes, transparent pixel locking, layer tinting, layer and folder merging, clipping and masks. Vector lines remain editable through their control points. |
-| Edit part of an image | Select with a rectangle, lasso, magic wand, brush or quick mask. Move, crop, fill, copy and paste, or drag handles for free transform and 4×4 mesh warp. |
-| Adjust colours and finish | Blur, sharpen, tone curve, hue/saturation/brightness, mosaic, line width, invert, luminance to opacity, posterize, threshold, colour balance, gradient map and outline, with before/after previews. |
-| Make manga | Page setup with bleed and trim, panel splitting, screentones, focus and speed lines, speech balloons with vertical text, multi-page books and batch PNG export. |
-| Set up your canvas view | Rotation, flipping, zoom, rulers, symmetry, a checkerboard for transparency, a brush-size cursor, the History panel and document tabs. |
+| Pick a colour | Choose hue on the outer ring and saturation and brightness in the inner square. Switch between RGB and HSV or enter a `#RRGGBB` value. Press `X` to swap the foreground and background swatches or `D` to reset them to black and white. The last 16 colours retain RGB independently of opacity. |
+| Find a brush and vary its marks | Search by name or filter by category. Vary hue, saturation and brightness within a stroke, or turn the brush tip to follow the direction of the line. |
+| Recolour without losing soft edges | Alpha lock preserves raster pixel opacity with CPU and GPU brushes, shapes, gradients, pastes, fills and filters. It blocks erasing, moving and transforming. Layer colour tints the artwork while preserving its original pixels. The tint appears in both CPU and GPU views and in PNG, JPEG and PSD exports. |
+| Organize layers | Merge down (`Ctrl+E`), merge a folder, or copy the visible artwork to a new layer. Merges that could change the appearance prompt for confirmation, and editable balloons and panels are protected. Make a selection from opacity, including a folder’s contents. The toolbar stays above the scrolling list, thumbnails show tints and tones, and a right-click opens layer actions. Deleting all layers requires confirmation. |
+| Draw shapes and gradients | Draw rectangles, rounded rectangles, ellipses, polygons and straight lines. Gradients can be linear, radial or reflected. |
+| Crop and reshape | Crop to a dragged rectangle or to the selection bounds. Trimming transparent margins accounts for visible vector strokes. Balloons and their tails move with the crop. Cropping is disabled on manga pages with page settings to protect their layout. Drag the free-transform frame or the control points of a 4×4 mesh directly on the canvas. |
+| Work on the canvas | The cursor shows brush diameter. Resize with `Ctrl+Alt+drag`, sample with `Alt+drag` and compare colours in the ring, or `Shift+click` to draw a straight line from the last endpoint. Rotate the view with `R+drag` and flip it horizontally with `H`. Read zoom and coordinates on the bottom status bar or click an action in History to return to that point. Canvas and paste previews adapt to display limits on documents up to 30,000 px per side. |
+| Adjust colour and outlines | Seven additional filters cover Invert, Luminance to Opacity, Posterize, Threshold, Colour Balance, Gradient Map (with presets) and Outline. |
+| Open and recover documents | PSD import handles masks and merged images more accurately. The app checks the ZIP or ZIP64 structure before loading an `.efude` document. Edited tabs get automatic recovery snapshots, even before their first save. |
 
-PNG, JPEG, BMP, GIF and PSD files can be imported. Open an image, paint on it and save it as `.efude`.
-
-## Guides, finishing checks and recording
+### Guides, finishing checks and recording
 
 - **Tracing guide** — Use **View → Tracing guide** to place an image below the drawing layers and adjust its opacity, position and scale. It is saved in the document and excluded from normal PNG, JPEG and PSD exports.
 - **Finishing check** — Use **Edit → Finishing check…** to highlight transparent holes, isolated dots and artwork outside the finish area. It does not change the pixels; click a candidate to inspect it more closely.
