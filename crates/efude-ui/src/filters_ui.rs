@@ -41,6 +41,54 @@ mod preview_regression_tests {
     }
 
     #[test]
+    fn stage3_filter_previews_match_worker_output_and_undo() {
+        use FilterKind::*;
+        for kind in [
+            Invert,
+            LuminanceToOpacity,
+            Posterize,
+            Threshold,
+            ColorBalance,
+            GradientMap,
+            Outline,
+        ] {
+            let mut app = EfudeApp::default();
+            app.doc = Document::new(3, 1);
+            app.doc.layers[0].pixels.set_pixel(1, 0, [190, 72, 85, 255]);
+            app.selection = Selection {
+                active: true,
+                mask: vec![0, 128, 255],
+            };
+            app.filter_settings.balance[1] = [0.7, -0.2, 0.2];
+            app.filter_dialog = Some(FilterDialog::open(kind));
+            let ctx = egui::Context::default();
+            let preview = after_pixels_for(&mut app, &ctx, kind);
+            let before = app.doc.layers[0].pixels.to_dense();
+            app.queue_filter(app.filter_operation(kind), &ctx);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.filter_pending && std::time::Instant::now() < until {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+                std::thread::yield_now();
+            }
+            assert!(!app.filter_pending, "{kind:?} did not finish");
+            for (i, c) in preview.iter().enumerate() {
+                let [r, g, b, a] = app.doc.layers[0].pixels.pixel(i as u32, 0);
+                let white = |v: u8| {
+                    (v as f32 * (a as f32 / 255.) + 255. * (1. - a as f32 / 255.)).round() as u8
+                };
+                assert_eq!(
+                    *c,
+                    Color32::from_rgb(white(r), white(g), white(b)),
+                    "{kind:?}"
+                );
+            }
+            assert_eq!(app.history.undo_len(), 1);
+            app.undo();
+            assert_eq!(app.doc.layers[0].pixels.to_dense(), before);
+        }
+    }
+
+    #[test]
     fn large_gaussian_preview_matches_the_applied_filter() {
         let mut app = EfudeApp::default();
         app.doc = Document::new(1000, 1);
@@ -145,6 +193,13 @@ mod preview_regression_tests {
 /// Filters that have a window.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FilterKind {
+    Outline,
+    GradientMap,
+    ColorBalance,
+    Threshold,
+    Posterize,
+    LuminanceToOpacity,
+    Invert,
     Blur,
     Sharpen,
     Denoise,
@@ -161,6 +216,20 @@ pub(crate) enum FilterKind {
 impl FilterKind {
     fn name(self, english: bool) -> &'static str {
         match (self, english) {
+            (Self::Outline, false) => "境界縁取り",
+            (Self::Outline, true) => "Outline",
+            (Self::GradientMap, false) => "グラデーションマップ",
+            (Self::GradientMap, true) => "Gradient map",
+            (Self::ColorBalance, false) => "カラーバランス",
+            (Self::ColorBalance, true) => "Color balance",
+            (Self::Threshold, false) => "二値化",
+            (Self::Threshold, true) => "Threshold",
+            (Self::Posterize, false) => "ポスタリゼーション",
+            (Self::Posterize, true) => "Posterize",
+            (Self::LuminanceToOpacity, false) => "輝度を透明度に変換",
+            (Self::LuminanceToOpacity, true) => "Luminance to opacity",
+            (Self::Invert, false) => "階調の反転",
+            (Self::Invert, true) => "Invert",
             (FilterKind::Blur, false) => "ぼかし",
             (FilterKind::Blur, true) => "Blur",
             (FilterKind::Sharpen, false) => "シャープ",
@@ -189,6 +258,14 @@ impl FilterKind {
 
 /// Settings of the filters kept between uses.
 pub(crate) struct FilterSettings {
+    levels: u8,
+    threshold: u8,
+    balance: [[f32; 3]; 3],
+    preserve: bool,
+    stops: [(f32, [u8; 3]); 3],
+    outline_width: u32,
+    outline_color: [u8; 4],
+    outside: bool,
     blur_kind: BlurKind,
     blur_amount: f32,
     blur_angle: f32,
@@ -209,6 +286,14 @@ pub(crate) struct FilterSettings {
 impl Default for FilterSettings {
     fn default() -> Self {
         Self {
+            levels: 6,
+            threshold: 128,
+            balance: [[0.; 3]; 3],
+            preserve: true,
+            stops: efude_canvas::filters::GRADIENT_MAP_PRESETS[0].2,
+            outline_width: 2,
+            outline_color: [0, 0, 0, 255],
+            outside: true,
             blur_kind: BlurKind::Gaussian,
             blur_amount: 8.0,
             blur_angle: 0.0,
@@ -287,6 +372,13 @@ impl EfudeApp {
         open(ui, self, FilterKind::Mosaic);
         open(ui, self, FilterKind::Noise);
         ui.separator();
+        open(ui, self, FilterKind::Invert);
+        open(ui, self, FilterKind::LuminanceToOpacity);
+        open(ui, self, FilterKind::Posterize);
+        open(ui, self, FilterKind::Threshold);
+        open(ui, self, FilterKind::ColorBalance);
+        open(ui, self, FilterKind::GradientMap);
+        open(ui, self, FilterKind::Outline);
         open(ui, self, FilterKind::LineWidth);
     }
 
@@ -294,6 +386,26 @@ impl EfudeApp {
     fn filter_operation(&self, kind: FilterKind) -> FilterOperation {
         let s = &self.filter_settings;
         match kind {
+            FilterKind::Invert => FilterOperation::Image(Filter::Invert),
+            FilterKind::LuminanceToOpacity => FilterOperation::Image(Filter::LuminanceToOpacity),
+            FilterKind::Posterize => FilterOperation::Image(Filter::Posterize { levels: s.levels }),
+            FilterKind::Threshold => {
+                FilterOperation::Image(Filter::Threshold { level: s.threshold })
+            }
+            FilterKind::ColorBalance => FilterOperation::Image(Filter::ColorBalance {
+                shadows: s.balance[0],
+                midtones: s.balance[1],
+                highlights: s.balance[2],
+                preserve_luminosity: s.preserve,
+            }),
+            FilterKind::GradientMap => {
+                FilterOperation::Image(Filter::GradientMap { stops: s.stops })
+            }
+            FilterKind::Outline => FilterOperation::Image(Filter::Outline {
+                width: s.outline_width,
+                color: s.outline_color,
+                outside_only: s.outside,
+            }),
             FilterKind::Blur => FilterOperation::Image(Filter::Blur {
                 kind: s.blur_kind,
                 amount: s.blur_amount,
@@ -350,15 +462,17 @@ impl EfudeApp {
 
     /// Whether the selected layer can be filtered.
     fn filterable_layer(&self) -> bool {
-        self.doc
-            .layers
-            .get(self.selected_layer)
-            .is_some_and(|layer| {
-                !layer.locked
-                    && !self.is_reference_layer(self.selected_layer)
-                    && layer.kind == LayerKind::Raster
-                    && !layer.is_vector()
-            })
+        !self.editing_mask
+            && self
+                .doc
+                .layers
+                .get(self.selected_layer)
+                .is_some_and(|layer| {
+                    !layer.locked
+                        && !self.is_reference_layer(self.selected_layer)
+                        && layer.kind == LayerKind::Raster
+                        && !layer.is_vector()
+                })
     }
 
     /// The window of the filter being set up.
@@ -389,8 +503,8 @@ impl EfudeApp {
                     ui.colored_label(
                         Color32::from_rgb(255, 205, 110),
                         self.text(
-                            "選んでいるレイヤーには適用できません（ロック・参照・フォルダー）",
-                            "The selected layer cannot be filtered (locked, reference or folder).",
+                            "選んでいるレイヤーには適用できません（マスク選択・ロック・参照・フォルダー・ベクター）",
+                            "The selected layer cannot be filtered (mask selected, locked, reference, folder or vector).",
                         ),
                     );
                 }
@@ -438,6 +552,51 @@ impl EfudeApp {
         let t = |ja: &'static str, en: &'static str| if english { en } else { ja };
         let s = &mut self.filter_settings;
         match kind {
+            FilterKind::Invert | FilterKind::LuminanceToOpacity => {}
+            FilterKind::Posterize => {
+                ui.add(egui::Slider::new(&mut s.levels, 2..=32).text(t("階調数", "Levels")));
+            }
+            FilterKind::Threshold => {
+                ui.add(
+                    egui::Slider::new(&mut s.threshold, 0..=255).text(t("しきい値", "Threshold")),
+                );
+            }
+            FilterKind::Outline => {
+                ui.add(egui::Slider::new(&mut s.outline_width, 1..=64).text(t("太さ", "Width")));
+                ui.color_edit_button_srgba_unmultiplied(&mut s.outline_color);
+                ui.checkbox(&mut s.outside, t("外側のみ", "Outside only"));
+            }
+            FilterKind::GradientMap => {
+                ui.horizontal_wrapped(|ui| {
+                    for &(ja, en, stops) in efude_canvas::filters::GRADIENT_MAP_PRESETS {
+                        if ui.selectable_label(s.stops == stops, t(ja, en)).clicked() {
+                            s.stops = stops;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for (_, color) in &mut s.stops {
+                        ui.color_edit_button_srgb(color);
+                    }
+                });
+            }
+            FilterKind::ColorBalance => {
+                for (channels, name) in s.balance.iter_mut().zip([
+                    t("シャドウ", "Shadows"),
+                    t("中間調", "Midtones"),
+                    t("ハイライト", "Highlights"),
+                ]) {
+                    ui.label(name);
+                    for (v, label) in channels.iter_mut().zip([
+                        t("シアン ↔ 赤", "Cyan ↔ Red"),
+                        t("マゼンタ ↔ 緑", "Magenta ↔ Green"),
+                        t("黄 ↔ 青", "Yellow ↔ Blue"),
+                    ]) {
+                        ui.add(egui::Slider::new(v, -1.0..=1.).text(label));
+                    }
+                }
+                ui.checkbox(&mut s.preserve, t("輝度を保持", "Preserve luminosity"));
+            }
             FilterKind::Blur => {
                 ui.horizontal_wrapped(|ui| {
                     for (value, ja, en) in [
@@ -684,6 +843,7 @@ impl EfudeApp {
             }
         }
         let mut part = efude_canvas::Layer::new(0, String::new(), cw, ch);
+        part.alpha_lock = layer.alpha_lock;
         part.pixels = efude_canvas::TilePixels::from_dense(cw, ch, &crop);
         run_filter(&mut part, cw, ch, operation, (x0, y0));
         let mut filtered = part.pixels.to_dense();
@@ -695,6 +855,9 @@ impl EfudeApp {
                     let coverage =
                         self.selection.mask.get(index).copied().unwrap_or(0) as f32 / 255.0;
                     let before = [crop[i], crop[i + 1], crop[i + 2], crop[i + 3]];
+                    if layer.alpha_lock && before[3] == 0 {
+                        continue;
+                    }
                     let after = [
                         filtered[i],
                         filtered[i + 1],

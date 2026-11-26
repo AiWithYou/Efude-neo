@@ -114,6 +114,50 @@ impl EfudeApp {
         self.history.set_metadata(&mut self.doc, METADATA_KEY, text);
     }
 
+    pub(super) fn clear_removed_layer_references(&mut self, removed: &[u64]) {
+        if removed.contains(&self.fill_reference_layer) {
+            self.fill_reference_layer = 0;
+        }
+        if removed.contains(&self.selection_reference_layer) {
+            self.selection_reference_layer = 0;
+        }
+        if self
+            .comic_ui
+            .effect_layer
+            .is_some_and(|id| removed.contains(&id))
+        {
+            self.comic_ui.effect_layer = None;
+        }
+    }
+
+    pub(super) fn editable_object_layers(&self) -> std::collections::HashSet<u64> {
+        let mut ids: std::collections::HashSet<_> =
+            self.balloons().iter().map(|b| b.layer_id).collect();
+        if let Some(comic) = self.comic_doc() {
+            ids.extend(
+                comic
+                    .layout
+                    .panels
+                    .iter()
+                    .flat_map(|p| [p.folder_id, p.border_id]),
+            );
+        }
+        ids
+    }
+
+    pub(super) fn detach_panel(&mut self, id: u64) {
+        if let Some(mut comic) = self.comic_doc() {
+            let count = comic.layout.panels.len();
+            comic
+                .layout
+                .panels
+                .retain(|p| p.folder_id != id && p.border_id != id);
+            if count != comic.layout.panels.len() {
+                self.store_comic(&comic);
+            }
+        }
+    }
+
     /// Deletes a layer subtree and its editable comic data in the same
     /// history action. Layer IDs may be reused after deletion.
     pub(crate) fn delete_document_layer(&mut self, index: usize) {
@@ -139,19 +183,7 @@ impl EfudeApp {
                     self.store_comic(&comic);
                 }
             }
-            if removed.contains(&self.fill_reference_layer) {
-                self.fill_reference_layer = 0;
-            }
-            if removed.contains(&self.selection_reference_layer) {
-                self.selection_reference_layer = 0;
-            }
-            if self
-                .comic_ui
-                .effect_layer
-                .is_some_and(|id| removed.contains(&id))
-            {
-                self.comic_ui.effect_layer = None;
-            }
+            self.clear_removed_layer_references(&removed);
             if let Some(index) = selected.and_then(|id| self.layer_index(id)) {
                 self.selected_layer = index;
                 self.sync_mask_edit_mode();
@@ -164,7 +196,7 @@ impl EfudeApp {
         }
     }
 
-    fn layer_index(&self, id: u64) -> Option<usize> {
+    pub(super) fn layer_index(&self, id: u64) -> Option<usize> {
         self.doc.layers.iter().position(|layer| layer.id == id)
     }
 
@@ -602,7 +634,7 @@ impl EfudeApp {
             EffectKind::Focus => self.comic_ui.focus.render(w, h),
             EffectKind::Speed => self.comic_ui.speed.render(w, h),
         };
-        let color = [self.color.r(), self.color.g(), self.color.b()];
+        let color = [self.color[0], self.color[1], self.color[2]];
         self.history.begin();
         let index = match existing_layer {
             Some(index) => index,
@@ -1582,6 +1614,15 @@ mod tests {
             glam::Vec2::new(120.0, 88.0),
         ]));
         app
+    }
+
+    #[test]
+    fn stage5_page_crop_keeps_frame_coordinates() {
+        let mut app = panel_app();
+        let before = app.doc.metadata.clone();
+        app.apply_crop([3, 4, 80, 60]);
+        assert_eq!((app.doc.width, app.doc.height), (128, 96));
+        assert_eq!(app.doc.metadata, before);
     }
 
     #[test]

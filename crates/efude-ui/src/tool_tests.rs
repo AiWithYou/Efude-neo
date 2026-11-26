@@ -415,7 +415,7 @@ impl Harness {
         app.use_windows_ink = false;
         app.use_wintab = false;
         app.selected_layer = 0;
-        app.color = Color32::from_rgb(0, 0, 0);
+        app.color = [0, 0, 0, 255];
         let ctx = egui::Context::default();
         layout::apply_theme(&ctx);
         let mut harness = Self {
@@ -430,11 +430,15 @@ impl Harness {
     }
 
     fn frame_with(&mut self, events: Vec<egui::Event>) {
+        self.frame_modified(events, egui::Modifiers::NONE);
+    }
+    fn frame_modified(&mut self, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
         self.time += 1.0 / 60.0;
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
             time: Some(self.time),
             events,
+            modifiers,
             ..Default::default()
         };
         let app = &mut self.app;
@@ -1057,7 +1061,7 @@ fn fill_fills_the_clicked_region_only() {
     let mut h = Harness::new(400, 300);
     h.fill_rect(198, 0, 202, 300, [0, 0, 0, 255]);
     h.use_tool(Tool::Fill);
-    h.app.color = Color32::from_rgb(20, 160, 60);
+    h.app.color = [20, 160, 60, 255];
     h.click(v(100.0, 100.0));
     assert_eq!(h.pixel(100, 100), [20, 160, 60, 255]);
     assert_eq!(h.pixel(300, 100)[3], 0);
@@ -1070,7 +1074,7 @@ fn eyedropper_picks_the_clicked_colour() {
     h.use_tool(Tool::Eyedropper);
     h.app.eyedropper_radius = 0;
     h.click(v(100.0, 100.0));
-    assert_eq!(h.app.color, Color32::from_rgb(10, 200, 90));
+    assert_eq!(h.app.color, [10, 200, 90, 255]);
 }
 
 #[test]
@@ -2680,7 +2684,7 @@ fn fill_respects_soft_selection_coverage_and_undo_redo() {
             active: true,
             mask: vec![255, 128, 64, 0],
         };
-        app.color = Color32::from_rgb(20, 100, 220);
+        app.color = [20, 100, 220, 255];
         app.transparent_color = transparent;
         app.fill_at(0, 0);
         for (x, pixel) in expected.iter().enumerate() {
@@ -2931,6 +2935,114 @@ fn rulers_draw_vector_lines() {
     let layer = &h.app.doc.layers[h.app.selected_layer];
     assert_eq!(layer.vector.as_ref().unwrap().len(), 1);
     assert!(h.pixel(200, 150)[3] > 200);
+}
+
+#[test]
+fn narrow_selection_cuts_between_sparse_vector_points_and_undo_restores_them() {
+    use efude_canvas::vector::{self, VectorPoint, VectorStroke};
+
+    {
+        let mut h = Harness::new(400, 300);
+        h.app.add_vector_layer();
+        let index = h.app.selected_layer;
+        let original = VectorStroke::fitted(
+            vec![
+                VectorPoint {
+                    x: 20.0,
+                    y: 150.0,
+                    width: 4.0,
+                },
+                VectorPoint {
+                    x: 380.0,
+                    y: 150.0,
+                    width: 4.0,
+                },
+            ],
+            [20, 40, 200, 255],
+            1.0,
+        );
+        // Stored samples alone must not decide whether the path is selected.
+        let mut original = original;
+        original.points = vec![original.points[0], *original.points.last().unwrap()];
+        h.app.doc.layers[index].vector = Some(vec![original.clone()]);
+        vector::render_all(&mut h.app.doc.layers[index], 400, 300, None);
+        let before = h.app.doc.layers[index].pixels.to_dense();
+        h.app.selection.active = true;
+        h.app.selection.mask = vec![0; 400 * 300];
+        for y in 140..160 {
+            for x in 195..205 {
+                h.app.selection.mask[y * 400 + x] = 255;
+            }
+        }
+        let selection = h.app.selection.mask.clone();
+        h.app.delete_selected_pixels();
+        let after = h.app.doc.layers[index].pixels.to_dense();
+        let parts = h.app.doc.layers[index].vector.clone().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(h.pixel(200, 150)[3], 0);
+        assert_eq!(h.pixel(100, 150), [20, 40, 200, 255]);
+        assert_eq!(h.pixel(300, 150), [20, 40, 200, 255]);
+        assert_eq!(h.app.selection.mask, selection);
+        let mut redrawn = h.app.doc.layers[index].clone();
+        vector::render_all(&mut redrawn, 400, 300, None);
+        assert_eq!(after, redrawn.pixels.to_dense());
+        h.app.undo();
+        assert_eq!(
+            h.app.doc.layers[index].vector.as_ref().unwrap(),
+            &[original]
+        );
+        assert_eq!(h.app.doc.layers[index].pixels.to_dense(), before);
+        h.app.redo();
+        assert_eq!(h.app.doc.layers[index].vector.as_ref().unwrap(), &parts);
+        assert_eq!(h.app.doc.layers[index].pixels.to_dense(), after);
+        assert_eq!(h.app.selection.mask, selection);
+    }
+}
+
+#[test]
+fn vector_selection_miss_keeps_curve_pixels_and_history_unchanged() {
+    use efude_canvas::vector::{self, VectorPoint, VectorStroke};
+
+    let mut h = Harness::new(400, 300);
+    h.app.add_vector_layer();
+    let index = h.app.selected_layer;
+    let original = VectorStroke::fitted(
+        vec![
+            VectorPoint {
+                x: 20.0,
+                y: 150.0,
+                width: 4.0,
+            },
+            VectorPoint {
+                x: 200.0,
+                y: 100.0,
+                width: 5.0,
+            },
+            VectorPoint {
+                x: 380.0,
+                y: 150.0,
+                width: 4.0,
+            },
+        ],
+        [20, 40, 200, 255],
+        0.6,
+    );
+    h.app.doc.layers[index].vector = Some(vec![original.clone()]);
+    vector::render_all(&mut h.app.doc.layers[index], 400, 300, None);
+    let pixels = h.app.doc.layers[index].pixels.to_dense();
+    h.app.history.mark_saved(h.app.history.state_token());
+    let token = h.app.history.state_token();
+    h.app.selection.active = true;
+    h.app.selection.mask = vec![0; 400 * 300];
+    h.app.selection.mask[20 * 400 + 200] = 255;
+    h.app.delete_selected_pixels();
+    assert_eq!(
+        h.app.doc.layers[index].vector.as_ref().unwrap(),
+        &[original]
+    );
+    assert_eq!(h.app.doc.layers[index].pixels.to_dense(), pixels);
+    assert_eq!(h.app.history.state_token(), token);
+    assert!(!h.app.history.is_dirty());
 }
 
 #[test]
@@ -3650,4 +3762,1026 @@ fn masked_mesh_apply_preserves_visible_pixels_native_file_and_one_undo() {
         &[0, 0, 255, 255],
         "hidden red must not hide or tint blue"
     );
+}
+
+#[test]
+fn stage3_default_shortcuts_are_distinct() {
+    let app = EfudeApp::default();
+    assert!(app.conflicting_tool_keys().is_empty());
+    assert_eq!(app.shortcuts.magic_wand_tool, "M");
+    assert_eq!(app.shortcuts.quick_mask_tool, "K");
+    assert_eq!(app.shortcuts.gradient_tool, "F");
+    assert_eq!(app.shortcuts.shape_tool, "S");
+    assert_eq!(app.shortcuts.crop_tool, "C");
+}
+#[test]
+fn stage3_black_accepts_saturation_and_value_after_hue_change() {
+    let mut app = EfudeApp::default();
+    app.color = [0, 0, 0, 255];
+    app.set_picker_hsv(0.5, 0.0, 0.0);
+    app.set_picker_hsv(app.hue_cache, 1.0, 1.0);
+    assert_eq!(app.color, [0, 255, 255, 255]);
+}
+#[test]
+fn stage3_hex_rejects_unicode_and_partial_input() {
+    for text in ["aa", "é00000", "#12345g", "１２３４５６"] {
+        assert!(color_panel::parse_hex(text).is_none());
+    }
+    assert_eq!(color_panel::parse_hex("#1234aB"), Some([18, 52, 171]));
+}
+#[test]
+fn stage3_history_navigation_restores_layer_stack() {
+    let mut app = EfudeApp::default();
+    let count = app.doc.layers.len();
+    app.add_raster_layer();
+    app.add_raster_layer();
+    app.go_to_history_step(0);
+    assert_eq!(app.doc.layers.len(), count);
+    app.go_to_history_step(2);
+    assert_eq!(app.doc.layers.len(), count + 2);
+}
+#[test]
+fn stage3_color_history_is_recent_unique_and_bounded() {
+    let mut app = EfudeApp::default();
+    for red in 0..18 {
+        app.color = [red, 10, 20, 255];
+        app.remember_color();
+    }
+    app.color = [5, 10, 20, 255];
+    app.remember_color();
+    assert_eq!(app.recent_colors.len(), 16);
+    assert_eq!(app.recent_colors[0], app.color);
+    assert_eq!(
+        app.recent_colors
+            .iter()
+            .filter(|c| **c == app.color)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn stage3_selected_alpha_and_merge_restore_pixels() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(8, 8);
+    app.add_raster_layer();
+    app.doc.layers[1].pixels.set_pixel(2, 3, [100, 50, 30, 128]);
+    app.select_layer_alpha();
+    assert_eq!(app.selection.mask[26], 128);
+    app.merge_selected(false);
+    assert_eq!(app.doc.layers.len(), 1);
+    app.undo();
+    assert_eq!(app.doc.layers.len(), 2);
+}
+#[test]
+fn stage3_crop_restores_canvas_and_selection_on_undo() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(12, 10);
+    app.selection.rectangle(12, 10, (1, 1), (4, 6));
+    let mask = app.selection.mask.clone();
+    app.apply_crop([1, 1, 4, 6]);
+    assert_eq!((app.doc.width, app.doc.height), (4, 6));
+    assert!(!app.selection.active);
+    app.undo();
+    assert_eq!((app.doc.width, app.doc.height), (12, 10));
+    assert_eq!(app.selection.mask, mask);
+}
+#[test]
+fn stage3_transform_cancel_preserves_document_and_history() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(12, 10);
+    app.doc.layers[0].pixels.set_pixel(2, 3, [20, 30, 40, 255]);
+    app.start_transform(true);
+    assert!(app.transform_session.is_some());
+    app.mesh_offsets[5] = [2., 3.];
+    app.cancel_studio_session();
+    assert_eq!(app.doc.layers[0].pixels.pixel(2, 3), [20, 30, 40, 255]);
+    assert_eq!(app.history.undo_len(), 0);
+}
+#[test]
+fn stage3_new_filters_have_distinct_operations() {
+    use filters_ui::FilterKind::*;
+    let app = EfudeApp::default();
+    let ops: std::collections::HashSet<_> = [
+        Invert,
+        LuminanceToOpacity,
+        Posterize,
+        Threshold,
+        ColorBalance,
+        GradientMap,
+        Outline,
+    ]
+    .map(|kind| format!("{:?}", app.filter_operation_for_tests(kind)))
+    .into_iter()
+    .collect();
+    assert_eq!(ops.len(), 7);
+}
+
+#[test]
+fn stage3_geometry_tools_commit_from_the_canvas() {
+    for (tool, label) in [(Tool::Gradient, "グラデーション"), (Tool::Shape, "図形")] {
+        let mut h = Harness::new(48, 32);
+        h.app.switch_tool(tool);
+        h.drag(&[v(8., 8.), v(36., 24.)]);
+        assert!(h.pixel(16, 14)[3] > 0, "{tool:?}");
+        assert_eq!(h.app.history.undo_labels(), [label]);
+        h.app.undo();
+        assert_eq!(h.pixel(16, 14)[3], 0);
+    }
+}
+#[test]
+fn stage3_free_transform_moves_pixels_and_undo_restores_source() {
+    let mut h = Harness::new(64, 48);
+    h.app.doc.layers[0]
+        .pixels
+        .set_pixel(32, 24, [120, 20, 10, 255]);
+    h.app.start_transform(false);
+    h.drag(&[v(32., 24.), v(40., 28.)]);
+    assert_eq!(h.pixel(32, 24)[3], 255);
+    h.app.commit_transform();
+    assert_eq!(h.pixel(40, 28)[3], 255);
+    assert_eq!(h.pixel(32, 24)[3], 0);
+    h.app.undo();
+    assert_eq!(h.pixel(32, 24)[3], 255);
+}
+#[test]
+fn stage3_tab_switch_cancels_mesh_session() {
+    let mut h = Harness::new(48, 32);
+    h.app.add_raster_layer();
+    h.app.open_document_tab();
+    h.app.start_transform(true);
+    assert!(h.app.transform_session.is_some());
+    h.app.switch_tab(0);
+    assert!(h.app.transform_session.is_none());
+}
+#[test]
+fn stage3_canvas_brush_preserves_locked_alpha() {
+    let mut h = Harness::new(48, 32);
+    h.app.doc.layers[0]
+        .pixels
+        .set_pixel(24, 16, [240, 220, 210, 130]);
+    h.app.doc.layers[0].alpha_lock = true;
+    h.drag(&[v(12., 16.), v(36., 16.)]);
+    assert_eq!(h.pixel(18, 16)[3], 0);
+    assert_eq!(h.pixel(24, 16)[3], 130);
+    assert_ne!(h.pixel(24, 16)[0], 240);
+}
+
+fn modified_drag(h: &mut Harness, a: Vec2, b: Vec2, mods: egui::Modifiers) {
+    let a = h.screen(a);
+    let b = h.screen(b);
+    h.frame_modified(vec![egui::Event::PointerMoved(a)], mods);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        pressed,
+        button: egui::PointerButton::Primary,
+        modifiers: mods,
+    };
+    h.frame_modified(vec![button(a, true)], mods);
+    h.frame_modified(vec![egui::Event::PointerMoved(b)], mods);
+    h.frame_modified(vec![button(b, false)], mods);
+    h.frames(2);
+}
+#[test]
+fn stage3_alt_samples_and_ctrl_alt_resizes_without_painting() {
+    let mut h = Harness::new(64, 48);
+    let pos = v(32.1, 24.1);
+    h.app.doc.layers[0]
+        .pixels
+        .set_pixel(32, 24, [240, 100, 20, 255]);
+    h.app.eyedropper_radius = 0;
+    modified_drag(&mut h, pos, pos, egui::Modifiers::ALT);
+    assert_eq!(h.app.color, [240, 100, 20, 255]);
+    assert_eq!(h.app.tool, Tool::Brush);
+    let size = h.app.size;
+    modified_drag(
+        &mut h,
+        pos,
+        pos + v(10., 0.),
+        egui::Modifiers::ALT | egui::Modifiers::CTRL,
+    );
+    assert!(h.app.size > size);
+    assert_eq!(h.app.history.undo_len(), 0);
+}
+#[test]
+fn stage3_shift_connects_to_the_last_stroke_in_one_step() {
+    let mut h = Harness::new(64, 48);
+    h.app.size = 2.;
+    h.click(v(12., 24.));
+    modified_drag(&mut h, v(48., 24.), v(48., 24.), egui::Modifiers::SHIFT);
+    assert!(h.pixel(30, 24)[3] > 0);
+    assert_eq!(h.app.history.undo_len(), 2);
+    h.app.undo();
+    assert_eq!(h.pixel(30, 24)[3], 0);
+}
+#[test]
+fn stage3_crop_drag_waits_for_enter_and_escape_discards_frame() {
+    let mut h = Harness::new(64, 48);
+    h.use_tool(Tool::Crop);
+    h.drag(&[v(8., 10.), v(36., 34.)]);
+    h.key(egui::Key::Escape, true);
+    h.key(egui::Key::Escape, false);
+    h.key(egui::Key::Enter, true);
+    h.key(egui::Key::Enter, false);
+    assert_eq!(h.app.history.undo_len(), 0);
+    h.drag(&[v(8., 10.), v(36., 34.)]);
+    h.key(egui::Key::Enter, true);
+    h.key(egui::Key::Enter, false);
+    assert_eq!((h.app.doc.width, h.app.doc.height), (28, 24));
+    assert_eq!(h.app.history.undo_len(), 1);
+}
+#[test]
+fn stage3_mesh_handle_preview_and_commit_share_fixed_grid() {
+    let mut h = Harness::new(49, 49);
+    h.app.doc.layers[0].pixels.set_pixel(16, 16, [255; 4]);
+    h.app.start_transform(true);
+    h.drag(&[v(16.5, 16.5), v(21.5, 19.5)]);
+    assert_eq!(h.app.history.undo_len(), 0);
+    assert_eq!(h.app.mesh_offsets[5].map(f32::round), [5., 3.]);
+    h.key(egui::Key::Enter, true);
+    h.key(egui::Key::Enter, false);
+    assert_eq!(h.app.history.undo_len(), 1);
+    assert_ne!(h.pixel(16, 16)[3], 255);
+    h.app.undo();
+    assert_eq!(h.pixel(16, 16), [255; 4]);
+}
+#[test]
+fn stage3_folder_merge_is_one_reversible_edit() {
+    let mut h = Harness::new(32, 24);
+    h.app.doc.layers[0].kind = LayerKind::Folder;
+    let mut child = efude_canvas::Layer::new(2, "child", 32, 24);
+    child.parent_id = Some(h.app.doc.layers[0].id);
+    child.pixels.set_pixel(8, 8, [255; 4]);
+    h.app.doc.layers.push(child);
+    h.app.merge_selected(true);
+    assert_eq!(h.app.doc.layers.len(), 1);
+    assert_eq!(h.pixel(8, 8), [255; 4]);
+    h.app.undo();
+    assert_eq!(h.app.doc.layers.len(), 2);
+}
+
+#[test]
+fn stage3_sv_click_from_black_changes_the_actual_brush_color() {
+    let mut h = Harness::new(64, 48);
+    h.app.color = [0, 0, 0, 255];
+    h.frames(2);
+    let tex = h.app.sv_texture.as_ref().unwrap().1.id();
+    let square = h
+        .shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Mesh(mesh) if mesh.texture_id == tex => Some(mesh.calc_bounds()),
+            _ => None,
+        })
+        .expect("SV square is painted");
+    h.click_screen(square.center());
+    let [r, g, b, _] = h.app.color;
+    assert!(r > 0 && (r != g || g != b));
+}
+#[test]
+fn stage3_color_keys_and_new_tool_bindings_work_in_the_workspace() {
+    let mut h = Harness::new(48, 32);
+    h.app.color = [255, 0, 0, 255];
+    h.app.secondary_color = [0, 0, 255, 255];
+    h.app.transparent_color = true;
+    for (key, tool) in [
+        (egui::Key::M, Tool::MagicWand),
+        (egui::Key::K, Tool::QuickMask),
+        (egui::Key::F, Tool::Gradient),
+        (egui::Key::S, Tool::Shape),
+        (egui::Key::C, Tool::Crop),
+        (egui::Key::G, Tool::SelectionBrush),
+    ] {
+        h.key(key, true);
+        h.key(key, false);
+        assert_eq!(h.app.tool, tool);
+    }
+    h.key(egui::Key::X, true);
+    h.key(egui::Key::X, false);
+    assert_eq!(h.app.color, [0, 0, 255, 255]);
+    assert!(!h.app.transparent_color);
+    h.key(egui::Key::D, true);
+    h.key(egui::Key::D, false);
+    assert_eq!(
+        (h.app.color, h.app.secondary_color),
+        ([0, 0, 0, 255], [255; 4])
+    );
+    h.key(egui::Key::H, true);
+    h.key(egui::Key::H, false);
+    assert!(h.app.flip_x);
+}
+
+#[test]
+fn stage3_blur_uses_existing_paint_without_adding_a_foreground_swatch() {
+    let mut h = Harness::new(48, 32);
+    h.fill_rect(5, 3, 24, 29, [220, 100, 20, 255]);
+    h.use_tool(Tool::Blur);
+    h.app.color = [0, 255, 0, 255];
+    h.drag(&[v(20., 16.), v(32., 16.)]);
+    assert!(h.app.history.can_undo());
+    assert!(h.app.recent_colors.is_empty());
+}
+
+#[test]
+fn stage5_alpha_lock_guards_pixel_edits() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(3, 1);
+    for (x, a) in [0, 128, 255].into_iter().enumerate() {
+        app.doc.layers[0]
+            .pixels
+            .set_pixel(x as u32, 0, [0, 0, 0, a]);
+    }
+    app.doc.layers[0].alpha_lock = true;
+    let alpha = |app: &EfudeApp| {
+        (0..3)
+            .map(|x| app.doc.layers[0].pixels.pixel(x, 0)[3])
+            .collect::<Vec<_>>()
+    };
+    app.paste_preview = Some((3, 1, vec![255; 12], Vec2::ZERO));
+    app.commit_paste_preview();
+    assert_eq!(alpha(&app), [0, 128, 255]);
+    app.delete_selected_pixels();
+    app.copy_selection(true);
+    assert_eq!(alpha(&app), [0, 128, 255]);
+    for x in 0..3 {
+        app.fill_at(x, 0);
+    }
+    assert_eq!(alpha(&app), [0, 128, 255]);
+    app.start_transform(false);
+    assert!(app.transform_session.is_none());
+    app.begin_move((0, 0));
+    assert!(app.move_origin.is_none());
+}
+#[test]
+fn stage5_mask_edit_guards_transform_filter_and_paste() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(1, 1);
+    app.doc.layers[0].mask = Some(efude_canvas::TilePixels::new(1, 1));
+    app.editing_mask = true;
+    app.start_transform(false);
+    assert!(app.transform_session.is_none());
+    app.apply_auto_levels(&egui::Context::default());
+    assert!(!app.filter_pending);
+    app.paste_preview = Some((1, 1, vec![255; 4], Vec2::ZERO));
+    app.commit_paste_preview();
+    assert_eq!(app.doc.layers[0].pixels.pixel(0, 0), [0; 4]);
+}
+#[test]
+fn stage5_folder_selection_uses_visible_child_alpha() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(2, 1);
+    app.select_layer_alpha();
+    assert!(!app.selection.active);
+    app.doc.layers[0].kind = LayerKind::Folder;
+    app.select_layer_alpha();
+    assert!(!app.selection.active);
+    let mut l = efude_canvas::Layer::new(2, "child", 2, 1);
+    l.parent_id = Some(1);
+    l.pixels.set_pixel(1, 0, [0, 0, 0, 128]);
+    app.doc.layers.push(l);
+    app.select_layer_alpha();
+    assert_eq!(app.selection.mask, [0, 128]);
+}
+#[test]
+fn stage5_history_follows_mask_layer_by_id() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(1, 1);
+    app.add_raster_layer();
+    for l in &mut app.doc.layers {
+        l.mask = Some(efude_canvas::TilePixels::new(1, 1));
+    }
+    app.history.move_layer(&mut app.doc.layers, 1, 0);
+    app.selected_layer = 0;
+    app.editing_mask = true;
+    let id = app.doc.layers[0].id;
+    app.undo();
+    assert_eq!(app.doc.layers[app.selected_layer].id, id);
+    assert!(app.editing_mask);
+}
+#[test]
+fn stage5_clear_history_and_english_psd_labels() {
+    let mut app = EfudeApp::default();
+    app.language_english = false;
+    app.clear_all_layers();
+    assert_eq!(
+        app.history.undo_labels().into_iter().last().unwrap(),
+        "レイヤーをすべて削除"
+    );
+    app.language_english = true;
+    app.doc.layers[0].pixels.set_pixel(0, 0, [255; 4]);
+    app.merge_visible(true);
+    assert!(app.doc.layers.last().unwrap().name.is_ascii());
+    for w in [
+        "透明ピクセルのロック設定はPSDに保存されません",
+        "レイヤーカラーを画素に焼き込みました",
+    ] {
+        assert!(localize_io_warning(w, true).is_ascii());
+    }
+}
+
+#[test]
+fn stage5_shortcuts_ignore_repeat_modifiers_and_respect_user_binding() {
+    use egui::{Event, Key, Modifiers};
+    let mut h = Harness::new(8, 8);
+    h.app.add_raster_layer();
+    for (key, modifiers, repeat) in [
+        (Key::H, Modifiers::NONE, true),
+        (Key::H, Modifiers::SHIFT, false),
+        (Key::X, Modifiers::NONE, true),
+        (Key::E, Modifiers::COMMAND, true),
+        (Key::E, Modifiers::COMMAND | Modifiers::SHIFT, false),
+    ] {
+        if repeat {
+            // egui derives the repeat flag from its held-key set. Seed that set
+            // on a frame with a different chord, so no fixed action fires.
+            h.frame_modified(
+                vec![Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::ALT,
+                }],
+                Modifiers::ALT,
+            );
+        }
+        let before = h.app.color;
+        h.frame_modified(
+            vec![Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat,
+                modifiers,
+            }],
+            modifiers,
+        );
+        assert!(!h.app.flip_x);
+        assert_eq!(h.app.color, before);
+        assert_eq!(h.app.doc.layers.len(), 2);
+        h.key(key, false);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    h.app.doc_path = Some(dir.path().join("binding.efude"));
+    h.app.shortcuts.save = "E".into();
+    h.frame_modified(
+        vec![Event::Key {
+            key: Key::E,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }],
+        Modifiers::COMMAND,
+    );
+    assert_eq!(h.app.doc.layers.len(), 2);
+}
+
+#[test]
+fn stage5_parent_opacity_requires_confirmation() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(1, 1);
+    app.doc.layers[0].kind = LayerKind::Folder;
+    app.doc.layers[0].opacity = 0.5;
+    for id in [2, 3] {
+        let mut l = efude_canvas::Layer::new(id, "child", 1, 1);
+        l.parent_id = Some(1);
+        l.pixels.set_pixel(0, 0, [255; 4]);
+        app.doc.layers.push(l);
+    }
+    app.selected_layer = 2;
+    app.merge_selected(false);
+    assert_eq!(efude_canvas::composite_transparent(&app.doc)[3], 192);
+    assert_eq!(app.doc.layers.len(), 3);
+    assert!(matches!(
+        app.pending_merge,
+        Some((
+            _,
+            _,
+            _,
+            efude_canvas::MergeAppearanceReason::AncestorOpacityOrMask
+        ))
+    ));
+    app.resolve_merge_confirmation(false);
+    assert_eq!(app.history.undo_len(), 0);
+    app.merge_selected(false);
+    app.resolve_merge_confirmation(true);
+    assert_eq!(app.doc.layers.len(), 2);
+    app.undo();
+    assert_eq!(efude_canvas::composite_transparent(&app.doc)[3], 192);
+}
+
+#[test]
+fn stage5_filter_lock_covers_transparent_and_partial_alpha() {
+    for filter in [
+        efude_canvas::filters::Filter::LuminanceToOpacity,
+        efude_canvas::filters::Filter::Outline {
+            width: 1,
+            outside_only: true,
+            color: [0, 0, 0, 255],
+        },
+    ] {
+        let mut l = efude_canvas::Layer::new(1, "ink", 3, 1);
+        l.alpha_lock = true;
+        for (x, a) in [0, 128, 255].into_iter().enumerate() {
+            l.pixels.set_pixel(x as u32, 0, [180, 70, 80, a]);
+        }
+        run_filter(&mut l, 3, 1, FilterOperation::Image(filter), (0, 0));
+        assert_eq!(l.pixels.pixel(0, 0), [0; 4]);
+        assert_eq!(l.pixels.pixel(1, 0)[3], 128);
+        assert_eq!(l.pixels.pixel(2, 0)[3], 255);
+    }
+}
+
+#[test]
+fn stage5_drawing_color_retains_straight_rgb_at_zero_alpha() {
+    let mut app = EfudeApp::default();
+    app.color = [255, 0, 0, 128];
+    app.remember_color();
+    app.palette.push(app.color);
+    app.color = *app.palette.last().unwrap();
+    assert_eq!(app.color, [255, 0, 0, 128]);
+    app.color[3] = 0;
+    app.set_picker_hsv(0., 1., 1.);
+    app.color[3] = 255;
+    assert_eq!(app.color, [255, 0, 0, 255]);
+}
+#[test]
+fn stage5_cancelled_save_preserves_pending_transform() {
+    let mut app = EfudeApp::default();
+    app.start_transform(false);
+    assert!(
+        !app.save_to_chosen_path(None, &egui::Context::default())
+            .unwrap()
+    );
+    assert!(app.transform_session.is_some());
+    app.cancel_studio_session();
+    app.studio.crop = Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(4.)));
+    assert!(
+        !app.save_to_chosen_path(None, &egui::Context::default())
+            .unwrap()
+    );
+    assert!(app.studio.crop.is_some());
+}
+
+#[test]
+fn stage5_large_document_previews_stay_within_view_and_device_budget() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(20000, 20000);
+    app.doc.layers[0].pixels.set_pixel(10000, 10000, [255; 4]);
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |ctx| {
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::splat(256.));
+        let region = app
+            .preview_region(
+                area,
+                area,
+                0.01,
+                ctx.pixels_per_point(),
+                app.max_texture_side(ctx).min(2048),
+            )
+            .unwrap();
+        for tool in [Tool::Shape, Tool::Gradient] {
+            app.tool = tool;
+            app.studio.drag = Some((Vec2::splat(200.), Vec2::splat(19000.)));
+            app.preview_drawing(ctx, region, format!("{tool:?}"));
+            assert!(
+                app.studio
+                    .preview
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .size()
+                    .iter()
+                    .all(|&v| v <= 256)
+            );
+        }
+        for mesh in [false, true] {
+            app.start_transform(mesh);
+            app.transform_scale_x = 2.;
+            app.mesh_offsets[5] = [100., 50.];
+            app.preview_transform(ctx, region, format!("mesh {mesh}"));
+            assert!(
+                app.studio
+                    .preview
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .size()
+                    .iter()
+                    .all(|&v| v <= 256)
+            );
+        }
+    });
+}
+
+#[test]
+fn stage5_text_entry_owns_enter_during_paste() {
+    let mut h = Harness::new(32, 32);
+    h.app.start_paste_preview(&h.ctx, 1, 1, vec![255; 4]);
+    let text_id = egui::Id::new("paste-focus");
+    let mut text = String::new();
+    let _ = h.ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
+                .request_focus();
+        });
+    });
+    assert!(h.ctx.wants_keyboard_input());
+    h.key(egui::Key::Enter, true);
+    assert!(h.app.paste_preview.is_some());
+    assert_eq!(h.app.history.undo_len(), 0);
+}
+#[test]
+fn stage5_brush_and_shape_use_same_straight_color() {
+    let mut h = Harness::new(32, 32);
+    h.app.color = [255, 0, 0, 128];
+    h.click(v(8., 8.));
+    let ink = h.pixel(8, 8);
+    assert_eq!(&ink[..3], &[255, 0, 0]);
+    assert!(ink[3] > 0);
+    h.use_tool(Tool::Shape);
+    h.drag(&[v(18., 18.), v(28., 28.)]);
+    assert_eq!(h.pixel(23, 23), [255, 0, 0, 128]);
+}
+
+#[test]
+fn stage5_history_jump_stops_after_first_stationary_step() {
+    let mut attempts = 0;
+    layout::walk_history(7, 0, |_| {
+        attempts += 1;
+        assert!(attempts <= 1);
+        7
+    });
+    assert_eq!(attempts, 1);
+}
+#[test]
+fn stage5_merge_drops_deleted_reference_ids() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(1, 1);
+    app.add_raster_layer();
+    let id = app.doc.layers[app.selected_layer].id;
+    app.fill_reference_layer = id;
+    app.selection_reference_layer = id;
+    app.comic_ui.effect_layer = Some(id);
+    app.merge_selected(false);
+    assert_eq!(app.doc.layers.len(), 1);
+    assert_eq!(
+        (
+            app.fill_reference_layer,
+            app.selection_reference_layer,
+            app.comic_ui.effect_layer
+        ),
+        (0, 0, None)
+    );
+}
+
+#[test]
+fn stage7_fixed_key_yields_to_one_configured_tool() {
+    let mut h = Harness::new(16, 16);
+    h.app.shortcuts.gradient_tool = "H".into();
+    h.key(egui::Key::H, true);
+    assert_eq!(h.app.tool, Tool::Gradient);
+    assert!(!h.app.flip_x);
+    h.key(egui::Key::H, false);
+    h.app.shortcuts.brush_tool = "H".into();
+    h.app.tool = Tool::Fill;
+    h.key(egui::Key::H, true);
+    assert_eq!(h.app.tool, Tool::Fill);
+    assert!(!h.app.flip_x);
+}
+
+#[test]
+fn stage7_rendering_swatches_preserves_transparent_rgb() {
+    let mut app = EfudeApp::default();
+    app.color = [255, 31, 77, 0];
+    app.secondary_color = [45, 90, 180, 0];
+    let ctx = egui::Context::default();
+    for _ in 0..3 {
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.color_ui(ui, ctx));
+        });
+        assert_eq!(app.color, [255, 31, 77, 0]);
+        assert_eq!(app.secondary_color, [45, 90, 180, 0]);
+    }
+    app.color[3] = 255;
+    assert_eq!(app.color, [255, 31, 77, 255]);
+}
+
+#[test]
+fn stage7_invalid_vector_scale_preserves_preview_and_history() {
+    let mut h = Harness::new(32, 32);
+    h.app.add_vector_layer();
+    h.app.vector_dabs(&[InkPoint::new(5., 8., 1., 0)]);
+    h.app.finish_vector_stroke();
+    let index = h.app.selected_layer;
+    h.app.selection.rectangle(32, 32, (1, 1), (16, 16));
+    let before = h.app.doc.layers[index].vector.clone();
+    let pixels = h.app.doc.layers[index].pixels.to_dense();
+    let mask = h.app.selection.mask.clone();
+    let token = h.app.history.state_token();
+    for (x, y) in [(0., 1.), (1., 0.), (1e-8, 1.), (1., f32::NAN)] {
+        h.app.language_english = x != 0.;
+        h.app.start_transform(false);
+        h.app.transform_scale_x = x;
+        h.app.transform_scale_y = y;
+        let page = shape_gradient::PreviewRegion::new(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(32.)),
+            1.,
+            32,
+        );
+        let expected = efude_canvas::composite_display(&h.app.doc, h.app.display_checker());
+        let output = h.ctx.run(Default::default(), |ctx| {
+            h.app.preview_transform(ctx, page, format!("scale {x} {y}"))
+        });
+        let texture = h.app.studio.preview.as_ref().unwrap().1.id();
+        let delta = output
+            .textures_delta
+            .set
+            .iter()
+            .find(|(id, _)| *id == texture)
+            .unwrap();
+        let egui::ImageData::Color(image) = &delta.1.image else {
+            panic!("expected composite preview")
+        };
+        assert_eq!(
+            image.pixels,
+            egui::ColorImage::from_rgba_unmultiplied([32, 32], &expected).pixels
+        );
+        assert_eq!(h.app.doc.layers[index].vector, before);
+        h.app.commit_transform();
+        assert_eq!(h.app.doc.layers[index].vector, before);
+        assert_eq!(h.app.doc.layers[index].pixels.to_dense(), pixels);
+        assert_eq!(h.app.selection.mask, mask);
+        assert_eq!(h.app.history.state_token(), token);
+        assert!(h.app.status.contains('0'));
+    }
+}
+
+#[test]
+fn stage7_oversize_canvas_and_navigator_bound_all_uploads() {
+    check_oversize_tools(30_000, 8);
+}
+
+#[test]
+fn tall_canvas_previews_and_commits_all_four_tools() {
+    check_oversize_tools(8, 30_000);
+}
+
+fn check_oversize_tools(w: u32, h: u32) {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(w, h);
+    app.navigator_center = v(w as f32 / 2., h as f32 / 2.);
+    app.doc.layers[0].pixels.set_pixel(w / 2, h / 2, [255; 4]);
+    let ctx = egui::Context::default();
+    app.workspace = egui_dock::DockState::new(vec![layout::Pane::Canvas]);
+    app.zoom = 64.;
+    let frame = |app: &mut EfudeApp, events: Vec<egui::Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            max_texture_side: Some(8192),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            app.update_ui(ctx);
+            egui::Window::new("Navigator test")
+                .default_pos(Pos2::new(20., 20.))
+                .default_width(160.)
+                .show(ctx, |ui| {
+                    ctx.memory_mut(|m| m.set_everything_is_visible(true));
+                    app.navigator_ui(ui, ctx);
+                    ctx.memory_mut(|m| m.set_everything_is_visible(false));
+                });
+        });
+        for (_, delta) in output.textures_delta.set {
+            assert!(delta.image.size().iter().all(|&side| side <= 8192));
+        }
+        assert!(
+            app.navigator_texture
+                .as_ref()
+                .is_some_and(|t| t.size()[0] <= 1280)
+        );
+    };
+    for _ in 0..3 {
+        frame(&mut app, vec![]);
+    }
+    let region = app.canvas_region.unwrap();
+    assert!(region.rect.size().max_elem() < 30_000. && region.size.iter().all(|&n| n <= 1280));
+    let (rect, scale) = app.canvas_screen.unwrap();
+    let delta = if w > h {
+        v(20., 2. * scale)
+    } else {
+        v(2. * scale, 20.)
+    };
+    let a = rect.center() - delta;
+    let b = rect.center() + delta;
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        pressed,
+        button: egui::PointerButton::Primary,
+        modifiers: egui::Modifiers::NONE,
+    };
+    for tool in [Tool::Shape, Tool::Gradient] {
+        app.tool = tool;
+        let token = app.history.state_token();
+        frame(&mut app, vec![egui::Event::PointerMoved(a)]);
+        frame(&mut app, vec![button(a, true)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(b)]);
+        assert!(app.studio.preview.is_some(), "{tool:?}");
+        frame(&mut app, vec![button(b, false)]);
+        assert_ne!(app.history.state_token(), token);
+    }
+    for mesh in [false, true] {
+        let x = w as i32 / 2;
+        let y = h as i32 / 2;
+        app.selection
+            .rectangle(w, h, (x - 30, y - 30), (x + 30, y + 30));
+        let token = app.history.state_token();
+        app.start_transform(mesh);
+        app.transform_scale_x = -1.;
+        app.mesh_offsets[5] = [2., 1.];
+        frame(&mut app, vec![]);
+        assert!(app.studio.preview.is_some());
+        app.commit_transform();
+        assert_ne!(app.history.state_token(), token, "mesh={mesh}");
+        frame(&mut app, vec![]);
+    }
+}
+
+#[test]
+fn stage7_tall_navigator_fits_the_visible_panel() {
+    let mut app = EfudeApp::default();
+    app.doc = Document::new(8, 30_000);
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+        max_texture_side: Some(8192),
+        ..Default::default()
+    };
+    let output = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.memory_mut(|m| m.set_everything_is_visible(true));
+            app.navigator_ui(ui, ctx);
+        });
+    });
+    let texture = app.navigator_texture.as_ref().unwrap();
+    assert!(texture.size()[1] <= SCREEN.y as usize);
+    let image = output
+        .shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Mesh(m) if m.texture_id == texture.id() => Some(m.calc_bounds()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        image.height() <= SCREEN.y + 0.01,
+        "navigator height {}",
+        image.height()
+    );
+}
+
+#[test]
+fn upper_clip_merge_can_be_cancelled_then_confirmed() {
+    let mut h = Harness::new(1, 1);
+    h.app.doc.layers[0].pixels.set_pixel(0, 0, [0, 0, 0, 128]);
+    for _ in 0..2 {
+        h.app.add_raster_layer();
+        let layer = &mut h.app.doc.layers[h.app.selected_layer];
+        layer.clipping = true;
+        layer.pixels.set_pixel(0, 0, [255; 4]);
+    }
+    h.app.selected_layer = 1;
+    h.app.language_english = true;
+    let before = efude_canvas::composite_transparent(&h.app.doc);
+    assert_eq!(before[3], 224);
+    h.app.merge_selected(false);
+    assert!(h.app.pending_merge.is_some());
+    h.frames(3);
+    h.click_label("Cancel");
+    assert!(h.app.pending_merge.is_none());
+    assert_eq!(efude_canvas::composite_transparent(&h.app.doc), before);
+    h.app.merge_selected(false);
+    h.frames(3);
+    h.click_label("Merge");
+    assert_eq!(h.app.doc.layers.len(), 2);
+    assert_eq!(efude_canvas::composite_transparent(&h.app.doc)[3], 239);
+}
+
+#[test]
+fn oversize_paste_keeps_both_ends_at_original_resolution() {
+    for (w, h) in [(30_000, 8), (8, 30_000)] {
+        let mut app = EfudeApp::default();
+        app.doc = Document::new(w, h);
+        app.workspace = egui_dock::DockState::new(vec![layout::Pane::Canvas]);
+        let mut pixels = vec![0; (w * h * 4) as usize];
+        pixels[..4].copy_from_slice(&[7, 8, 9, 255]);
+        let last = pixels.len() - 4;
+        pixels[last..].copy_from_slice(&[150, 40, 70, 255]);
+        let mut clipboard = Some(pixels);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+                max_texture_side: Some(8192),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                if let Some(pixels) = clipboard.take() {
+                    app.start_paste_preview(ctx, w, h, pixels);
+                }
+                app.update_ui(ctx);
+            });
+        }
+        assert!(
+            app.paste_texture
+                .as_ref()
+                .unwrap()
+                .size()
+                .iter()
+                .all(|&n| (1..=8192).contains(&n))
+        );
+        app.commit_paste_preview();
+        assert_eq!(app.doc.layers[0].pixels.pixel(0, 0), [7, 8, 9, 255]);
+        assert_eq!(
+            app.doc.layers[0].pixels.pixel(w - 1, h - 1),
+            [150, 40, 70, 255]
+        );
+    }
+}
+
+#[test]
+fn single_pixel_mesh_drag_selects_each_nearest_grid_point() {
+    let mut h = Harness::new(32, 32);
+    h.app.selection.rectangle(32, 32, (12, 14), (12, 14));
+    h.app.zoom = 1.;
+    for i in 0..16 {
+        h.app.start_transform(true);
+        h.frames(2);
+        let point = v(12.5 + (i % 4) as f32 / 3., 14.5 + (i / 4) as f32 / 3.);
+        h.drag(&[point, point + v(4., 3.)]);
+        assert_eq!(h.app.mesh_offsets[i].map(f32::round), [4., 3.], "point {i}");
+    }
+}
+
+#[test]
+fn layer_merge_checks_only_run_for_open_menus() {
+    let mut h = Harness::new(8, 8);
+    h.app.doc.layers[0].pixels.set_pixel(2, 2, [255; 4]);
+    h.app.add_raster_layer();
+    h.app.doc.layers[1].pixels.set_pixel(2, 2, [255; 4]);
+    h.app.add_raster_layer();
+    h.app.doc.layers[2].clipping = true;
+    h.app.doc.layers[2].pixels.set_pixel(2, 2, [255; 4]);
+    h.app.language_english = true;
+    let tab = h.app.workspace.find_tab(&layout::Pane::Layers).unwrap();
+    h.app.workspace.set_active_tab(tab);
+    layer_panel::MERGE_CHECKS.set(0);
+    h.frames(3);
+    assert_eq!(layer_panel::MERGE_CHECKS.get(), 0);
+    let id = h.app.doc.layers[2].id;
+    let row = h
+        .app
+        .layer_rows
+        .iter()
+        .find(|(layer, _)| *layer == id)
+        .unwrap()
+        .1;
+    h.move_to(row.center());
+    h.button(true, egui::PointerButton::Secondary);
+    h.button(false, egui::PointerButton::Secondary);
+    h.frames(2);
+    assert!(layer_panel::MERGE_CHECKS.get() > 0);
+    h.click_label("Merge down");
+    assert_eq!(h.app.doc.layers.len(), 2);
+}
+
+#[test]
+fn swatch_popup_restores_foreground_and_background_rgb() {
+    for background in [false, true] {
+        let mut h = Harness::new(8, 8);
+        h.app.workspace = egui_dock::DockState::new(vec![layout::Pane::Color]);
+        h.app.language_english = true;
+        h.app.color = [255, 31, 77, 0];
+        h.app.secondary_color = [45, 90, 180, 0];
+        h.frames(3);
+        let swap = h.label_rect("⇄").unwrap();
+        let pos = swap.left_center()
+            + if background {
+                v(-20., 9.)
+            } else {
+                v(-45., -6.)
+            };
+        h.click_screen(pos);
+        let label = h.label_rect("Alpha").expect("swatch alpha slider");
+        h.click_screen(label.left_center() - v(h.ctx.style().spacing.item_spacing.x + 1., 0.));
+        if background {
+            assert_eq!(h.app.secondary_color, [45, 90, 180, 255]);
+            assert_eq!(h.app.color, [255, 31, 77, 0]);
+        } else {
+            assert_eq!(h.app.color, [255, 31, 77, 255]);
+            assert_eq!(h.app.secondary_color, [45, 90, 180, 0]);
+        }
+    }
 }

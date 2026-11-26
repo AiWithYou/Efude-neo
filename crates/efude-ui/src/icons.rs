@@ -41,6 +41,24 @@ pub(crate) fn paint_tool_icon(painter: &egui::Painter, rect: Rect, tool: Tool, c
         painter.extend(egui::Shape::dashed_line(&path, thin, 2.5, 2.0));
     };
     match tool {
+        Tool::Crop => {
+            line(&[(0.20, 0.05), (0.20, 0.78), (0.94, 0.78)], stroke);
+            line(&[(0.06, 0.22), (0.80, 0.22), (0.80, 0.94)], stroke);
+        }
+        Tool::Shape => {
+            closed(&[(0.48, 0.07), (0.93, 0.84), (0.08, 0.84)], stroke);
+        }
+        Tool::Gradient => {
+            for i in 0..6 {
+                let x = 0.08 + i as f32 * 0.14;
+                painter.rect_filled(
+                    Rect::from_min_max(at(x, 0.18), at(x + 0.14, 0.82)),
+                    0.,
+                    color.gamma_multiply((i + 1) as f32 / 6.),
+                );
+            }
+        }
+
         Tool::Brush => {
             // Handle, ferrule and a pointed tip.
             line(&[(0.95, 0.05), (0.52, 0.48)], stroke);

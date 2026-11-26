@@ -566,22 +566,7 @@ impl EfudeApp {
                                         egui::ComboBox::from_id_salt("blend")
                                             .selected_text(format!("{mode:?}"))
                                             .show_ui(ui, |ui| {
-                                                for option in [
-                                                    BlendMode::Normal,
-                                                    BlendMode::Multiply,
-                                                    BlendMode::Screen,
-                                                    BlendMode::Overlay,
-                                                    BlendMode::Darken,
-                                                    BlendMode::Lighten,
-                                                    BlendMode::ColorDodge,
-                                                    BlendMode::ColorBurn,
-                                                    BlendMode::HardLight,
-                                                    BlendMode::SoftLight,
-                                                    BlendMode::Difference,
-                                                    BlendMode::Exclusion,
-                                                    BlendMode::Add,
-                                                    BlendMode::Subtract,
-                                                ] {
+                                                for option in BLEND_MODES {
                                                     ui.selectable_value(
                                                         mode,
                                                         option,

@@ -52,7 +52,7 @@ struct LayerInfo {
     opacity: f32,
     blend_mode: u32,
     flags: u32,
-    _padding: u32,
+    layer_color_packed: u32,
 }
 struct CompositeParams {
     origin: vec2<u32>,
@@ -147,11 +147,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var i = 0u; i < arrayLength(&layer_info); i += 1u) {
         let info = layer_info[i];
         let packed = layer_pixels[i * 65536u + pixel_index];
-        let source = vec3<f32>(
+        var source = vec3<f32>(
             f32(packed & 255u),
             f32((packed >> 8u) & 255u),
             f32((packed >> 16u) & 255u)
         ) / 255.0;
+        if ((info.flags & 8u) != 0u) {
+            let t = info.layer_color_packed;
+            let tint = vec3<f32>(f32(t & 255u), f32((t >> 8u) & 255u), f32((t >> 16u) & 255u)) / 255.0;
+            let luma = dot(source, vec3<f32>(0.2126, 0.7152, 0.0722));
+            source = floor((tint + (1.0 - tint) * luma) * 255.0 + 0.5) / 255.0;
+        }
         let source_alpha = f32((packed >> 24u) & 255u) / 255.0;
         var alpha = source_alpha * info.opacity * layer_coverage[i * 65536u + pixel_index];
         let clipping = (info.flags & 1u) != 0u;
@@ -186,6 +192,7 @@ pub struct GpuCompositeLayer {
     pub clipping: bool,
     /// A display backdrop, such as a guide, does not supply clipping coverage.
     pub background: bool,
+    pub layer_color: Option<[u8; 3]>,
 }
 
 pub struct GpuCompositeTileInput {
@@ -538,9 +545,11 @@ impl GpuDabPipeline {
                 metadata.extend_from_slice(&layer.blend_mode.to_le_bytes());
                 let flags = u32::from(layer.clipping)
                     | (u32::from(layer.linear_blend) << 1)
-                    | (u32::from(layer.background) << 2);
+                    | (u32::from(layer.background) << 2)
+                    | (u32::from(layer.layer_color.is_some()) << 3);
                 metadata.extend_from_slice(&flags.to_le_bytes());
-                metadata.extend_from_slice(&0u32.to_le_bytes());
+                let [r, g, b] = layer.layer_color.unwrap_or_default();
+                metadata.extend_from_slice(&[r, g, b, 0]);
             }
             let pixel_buffer = self
                 .device
@@ -640,6 +649,11 @@ mod mip_tests {
         let instance = wgpu::Instance::default();
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        eprintln!(
+            "Composite adapter: {} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
         pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
@@ -656,6 +670,14 @@ mod mip_tests {
     /// The GPU display composites exactly like the CPU compositor.
     #[test]
     fn gpu_composite_stays_within_one_byte_of_cpu() {
+        compare_composites(false);
+    }
+    #[test]
+    fn tinted_gpu_composite_stays_within_one_byte_of_cpu() {
+        compare_composites(true);
+    }
+
+    fn compare_composites(tinted: bool) {
         use efude_canvas::{BlendMode, Document, Layer, composite_display};
         let Some((device, queue)) = device() else {
             return;
@@ -680,6 +702,9 @@ mod mip_tests {
         for (i, mode) in modes.iter().enumerate() {
             let mut layer = Layer::new(i as u64 + 10, "l", size, size);
             layer.blend = *mode;
+            if tinted && i % 2 == 0 {
+                layer.layer_color = Some([26, 112, 231]);
+            }
             layer.opacity = [1.0, 0.7, 0.45][i % 3];
             for y in 0..size {
                 for x in 0..size {
@@ -711,6 +736,7 @@ mod mip_tests {
                     linear_blend: false,
                     clipping: false,
                     background: false,
+                    layer_color: layer.layer_color,
                 }
             })
             .collect();

@@ -8,6 +8,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Restore straight alpha after filtering and discard color on transparent pixels.
+pub fn restore_locked_alpha(pixels: &mut super::TilePixels, original: &super::TilePixels) {
+    let mut result = original.clone();
+    for ((tx, ty), tile) in &mut result.tiles {
+        let filtered = pixels.tile_data(*tx, *ty);
+        for (i, p) in std::sync::Arc::make_mut(tile)
+            .chunks_exact_mut(4)
+            .enumerate()
+        {
+            if p[3] == 0 {
+                p.fill(0);
+            } else if let Some(src) = filtered {
+                p[..3].copy_from_slice(&src[4 * i..4 * i + 3]);
+            } else {
+                p[..3].fill(0);
+            }
+        }
+    }
+    *pixels = result;
+}
+
 /// The kinds of blur (see [`Filter::Blur`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlurKind {
@@ -57,6 +78,28 @@ pub const GRADE_NAMES: [(&str, &str); GRADE_COUNT] = [
 /// A filter and its settings.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Filter {
+    Invert,
+    LuminanceToOpacity,
+    Posterize {
+        levels: u8,
+    },
+    Threshold {
+        level: u8,
+    },
+    ColorBalance {
+        shadows: [f32; 3],
+        midtones: [f32; 3],
+        highlights: [f32; 3],
+        preserve_luminosity: bool,
+    },
+    GradientMap {
+        stops: [(f32, [u8; 3]); 3],
+    },
+    Outline {
+        width: u32,
+        color: [u8; 4],
+        outside_only: bool,
+    },
     /// `amount` is the radius in pixels.
     Blur {
         kind: BlurKind,
@@ -65,19 +108,38 @@ pub enum Filter {
         angle: f32,
     },
     /// Unsharp mask: `amount` 0..=5, `radius` in pixels.
-    Sharpen { amount: f32, radius: f32 },
+    Sharpen {
+        amount: f32,
+        radius: f32,
+    },
     /// `strength` 1..=3 (window radius of a median).
-    Denoise { strength: u32 },
+    Denoise {
+        strength: u32,
+    },
     /// Look `preset` (index into [`GRADE_NAMES`]) mixed in by `strength`.
-    Grade { preset: usize, strength: f32 },
+    Grade {
+        preset: usize,
+        strength: f32,
+    },
     /// Red and blue moved `amount` pixels apart along `direction`.
-    ChromaticAberration { direction: Direction, amount: f32 },
+    ChromaticAberration {
+        direction: Direction,
+        amount: f32,
+    },
     /// Cells of `size` pixels.
-    Mosaic { size: u32 },
+    Mosaic {
+        size: u32,
+    },
     /// Grain of `amount` 0..=1; `mono` makes it grey.
-    Noise { amount: f32, mono: bool, seed: u32 },
+    Noise {
+        amount: f32,
+        mono: bool,
+        seed: u32,
+    },
     /// Lines made `amount` pixels thicker (negative: thinner).
-    LineWidth { amount: i32 },
+    LineWidth {
+        amount: i32,
+    },
 }
 
 impl Filter {
@@ -102,7 +164,15 @@ impl Filter {
             Filter::ChromaticAberration { amount, .. } => amount.abs().ceil() as u32 + 1,
             Filter::Mosaic { size } => size,
             Filter::LineWidth { amount } => amount.unsigned_abs(),
-            Filter::Grade { .. } | Filter::Noise { .. } => 0,
+            Filter::Outline { width, .. } => width.clamp(1, 64) + 1,
+            Filter::Invert
+            | Filter::LuminanceToOpacity
+            | Filter::Posterize { .. }
+            | Filter::Threshold { .. }
+            | Filter::ColorBalance { .. }
+            | Filter::GradientMap { .. }
+            | Filter::Grade { .. }
+            | Filter::Noise { .. } => 0,
         }
     }
 
@@ -140,9 +210,257 @@ impl Filter {
             }
             Filter::Mosaic { size } => mosaic(rgba, width, height, size.max(1), origin),
             Filter::Noise { amount, mono, seed } => noise(rgba, width, amount, mono, seed, origin),
+            Filter::Outline {
+                width: radius,
+                color,
+                outside_only,
+            } => outline(
+                &mut rgba[..width * height * 4],
+                width,
+                height,
+                radius.clamp(1, 64),
+                color,
+                outside_only,
+            ),
+            Filter::Invert
+            | Filter::LuminanceToOpacity
+            | Filter::Posterize { .. }
+            | Filter::Threshold { .. }
+            | Filter::ColorBalance { .. }
+            | Filter::GradientMap { .. } => {
+                let mut filter = *self;
+                if let Filter::GradientMap { ref mut stops } = filter {
+                    stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+                }
+                par_rows(&mut rgba[..width * height * 4], width * 4, |_, row| {
+                    for pixel in row.chunks_exact_mut(4) {
+                        filter.adjust_pixel(pixel);
+                    }
+                });
+            }
             Filter::LineWidth { amount } => line_width(rgba, width, height, amount),
         }
     }
+}
+
+pub const GRADIENT_MAP_PRESETS: &[(&str, &str, [(f32, [u8; 3]); 3])] = &[
+    (
+        "セピア",
+        "Sepia",
+        [
+            (0., [25, 15, 7]),
+            (0.5, [150, 111, 75]),
+            (1., [255, 240, 202]),
+        ],
+    ),
+    (
+        "青橙",
+        "Blue and orange",
+        [
+            (0., [14, 30, 76]),
+            (0.5, [154, 107, 83]),
+            (1., [255, 191, 99]),
+        ],
+    ),
+    (
+        "夕焼け",
+        "Sunset",
+        [
+            (0., [62, 20, 72]),
+            (0.5, [221, 86, 91]),
+            (1., [255, 220, 148]),
+        ],
+    ),
+    (
+        "サイバーパンク",
+        "Cyberpunk",
+        [
+            (0., [20, 4, 67]),
+            (0.5, [201, 28, 185]),
+            (1., [103, 255, 242]),
+        ],
+    ),
+    (
+        "モノクロインク",
+        "Monochrome ink",
+        [(0., [0; 3]), (0.5, [112; 3]), (1., [255; 3])],
+    ),
+    (
+        "森",
+        "Forest",
+        [
+            (0., [8, 32, 27]),
+            (0.5, [79, 115, 55]),
+            (1., [235, 231, 174]),
+        ],
+    ),
+    (
+        "パステル",
+        "Pastel",
+        [
+            (0., [110, 98, 148]),
+            (0.5, [233, 176, 194]),
+            (1., [255, 244, 219]),
+        ],
+    ),
+];
+
+impl Filter {
+    fn adjust_pixel(&self, p: &mut [u8]) {
+        let rgb = [p[0], p[1], p[2]].map(f32::from);
+        // Sum the Rec. 709 weights as integers so exact threshold ties stay inclusive.
+        let light = (2126 * u32::from(p[0]) + 7152 * u32::from(p[1]) + 722 * u32::from(p[2]))
+            as f32
+            / 10000.;
+        let value = light / 255.;
+        let out = match *self {
+            Self::Invert => rgb.map(|c| 255. - c),
+            Self::LuminanceToOpacity => {
+                p[3] = (p[3] as f32 * (1. - value)).round() as u8;
+                [0.; 3]
+            }
+            Self::Posterize { levels } => {
+                let steps = f32::from(levels.clamp(2, 32) - 1);
+                rgb.map(|c| (c / 255. * steps).round() / steps * 255.)
+            }
+            Self::Threshold { level } => [if light >= level as f32 { 255. } else { 0. }; 3],
+            Self::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+                preserve_luminosity,
+            } => {
+                let dark = (1. - value).powi(2);
+                let bright = value * value;
+                let mid = 2. * value * (1. - value);
+                let adjusted: [f32; 3] = std::array::from_fn(|i| {
+                    rgb[i]
+                        + 255.
+                            * (dark * shadows[i].clamp(-1., 1.)
+                                + mid * midtones[i].clamp(-1., 1.)
+                                + bright * highlights[i].clamp(-1., 1.))
+                });
+                if preserve_luminosity {
+                    let center = luma(adjusted[0], adjusted[1], adjusted[2]);
+                    let chroma = adjusted.map(|c| c - center);
+                    let mut scale = 1f32;
+                    for c in chroma {
+                        if c > 0. {
+                            scale = scale.min((255. - light) / c);
+                        } else if c < 0. {
+                            scale = scale.min(-light / c);
+                        }
+                    }
+                    chroma.map(|c| light + c * scale)
+                } else {
+                    adjusted
+                }
+            }
+            Self::GradientMap { stops } => {
+                let i = stops.partition_point(|s| s.0 <= value);
+                if i == 0 {
+                    stops[0].1.map(f32::from)
+                } else if i == 3 {
+                    stops[2].1.map(f32::from)
+                } else {
+                    let (a, b) = (stops[i - 1], stops[i]);
+                    let t = (value - a.0) / (b.0 - a.0);
+                    std::array::from_fn(|c| a.1[c] as f32 + (b.1[c] as f32 - a.1[c] as f32) * t)
+                }
+            }
+            _ => unreachable!("point adjustment"),
+        };
+        for (channel, v) in p.iter_mut().zip(out) {
+            *channel = v.round() as u8;
+        }
+    }
+}
+
+fn outline(
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    radius: u32,
+    color: [u8; 4],
+    outside_only: bool,
+) {
+    let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
+    let r = radius as usize;
+    // For each vertical offset, the disk has a solid horizontal interval
+    // plus a thin anti-aliased fringe. A sliding maximum evaluates the
+    // solid interval in linear time per row, even at the largest width.
+    let kernel: Vec<_> = (0..=r)
+        .map(|dy| {
+            let extent = ((r * r - dy * dy) as f32).sqrt().floor() as usize;
+            let fringe: Vec<_> = (extent + 1..=r)
+                .map(|dx| (dx, r as f32 + 1. - (dx as f32).hypot(dy as f32)))
+                .take_while(|(_, weight)| *weight > 0.)
+                .collect();
+            (extent, fringe)
+        })
+        .collect();
+    let nonempty: Vec<_> = alpha
+        .chunks_exact(width)
+        .map(|line| line.iter().any(|&a| a > 0))
+        .collect();
+    par_rows(rgba, width * 4, |y, row| {
+        if row.chunks_exact(4).all(|p| p[3] == 255) {
+            return;
+        }
+        let mut dilation = vec![0f32; width];
+        let mut queue = std::collections::VecDeque::<usize>::with_capacity(2 * r + 1);
+        for sy in y.saturating_sub(r)..=(y + r).min(height - 1) {
+            if !nonempty[sy] {
+                continue;
+            }
+            let input = &alpha[sy * width..(sy + 1) * width];
+            let (extent, fringe) = &kernel[y.abs_diff(sy)];
+            let mut next = 0;
+            queue.clear();
+            for (x, maximum) in dilation.iter_mut().enumerate() {
+                while queue
+                    .front()
+                    .is_some_and(|&i| i < x.saturating_sub(*extent))
+                {
+                    queue.pop_front();
+                }
+                while next < (x + extent + 1).min(width) {
+                    while queue.back().is_some_and(|&i| input[i] <= input[next]) {
+                        queue.pop_back();
+                    }
+                    queue.push_back(next);
+                    next += 1;
+                }
+                *maximum = maximum.max(f32::from(input[queue[0]]));
+                if *maximum < 255. {
+                    for &(dx, weight) in fringe {
+                        if x >= dx {
+                            *maximum = maximum.max(f32::from(input[x - dx]) * weight);
+                        }
+                        if x + dx < width {
+                            *maximum = maximum.max(f32::from(input[x + dx]) * weight);
+                        }
+                    }
+                }
+            }
+        }
+        for (p, dilated) in row.chunks_exact_mut(4).zip(dilation) {
+            if p[3] == 255 {
+                continue;
+            }
+            let coverage = if outside_only {
+                (dilated - p[3] as f32).max(0.)
+            } else {
+                dilated
+            };
+            let mut edge = color;
+            edge[3] = (color[3] as f32 * coverage / 255.).round() as u8;
+            if edge[3] > 0 {
+                let out = super::ops::paint_over(edge, [p[0], p[1], p[2], p[3]], 1., false);
+                p.copy_from_slice(&out);
+            }
+        }
+    });
 }
 
 /// Premultiplied linear-in-storage RGBA as floats (0..=1).

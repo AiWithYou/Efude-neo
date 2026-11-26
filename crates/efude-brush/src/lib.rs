@@ -110,6 +110,15 @@ pub struct Brush {
     #[serde(default)]
     pub tip_rotation: f32,
     #[serde(default)]
+    pub hue_jitter: f32,
+    #[serde(default)]
+    pub saturation_jitter: f32,
+    #[serde(default)]
+    pub brightness_jitter: f32,
+    #[serde(default)]
+    pub follow_stroke_direction: bool,
+
+    #[serde(default)]
     pub scatter: f32,
     pub color: [u8; 4],
     #[serde(default)]
@@ -300,6 +309,18 @@ impl PaintMix {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn dynamics_controls_are_opt_in_and_validated() {
+    let mut b = defaults().remove(0);
+    assert_eq!(
+        [b.hue_jitter, b.saturation_jitter, b.brightness_jitter],
+        [0.; 3]
+    );
+    assert!(!b.follow_stroke_direction);
+    b.hue_jitter = 1.1;
+    assert!(validate_brush(&b).is_err());
+}
 fn validate_brush(brush: &Brush) -> Result<(), Box<dyn std::error::Error>> {
     fn within(value: f32, low: f32, high: f32) -> bool {
         value.is_finite() && (low..=high).contains(&value)
@@ -337,6 +358,9 @@ fn validate_brush(brush: &Brush) -> Result<(), Box<dyn std::error::Error>> {
         && within(brush.grain, 0.0, 1.0)
         && within(brush.grain_scale, 0.05, 8.0)
         && within(brush.tip_aspect, f32::MIN_POSITIVE, 10.0)
+        && within(brush.hue_jitter, 0., 1.)
+        && within(brush.saturation_jitter, 0., 1.)
+        && within(brush.brightness_jitter, 0., 1.)
         && within(brush.tip_rotation, -180.0, 180.0)
         && within(brush.scatter, 0.0, 2.0)
         && within(brush.mix.blend, 0.0, 1.0)
@@ -499,6 +523,11 @@ pub fn defaults() -> Vec<Brush> {
         grain_binary: false,
         tip_aspect: 1.0,
         tip_rotation: 0.0,
+        hue_jitter: 0.,
+        saturation_jitter: 0.,
+        brightness_jitter: 0.,
+        follow_stroke_direction: false,
+
         scatter: 0.0,
         color: [35, 35, 42, 255],
         tip: None,

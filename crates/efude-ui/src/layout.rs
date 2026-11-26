@@ -28,23 +28,27 @@ pub(crate) enum Pane {
     Color,
     Navigator,
     CanvasSettings,
+    History,
     /// Properties of the current tool.
     Tool,
 }
 
 impl Pane {
     /// Panels the user can open and close from the View menu.
-    pub(crate) const OPTIONAL: [Pane; 6] = [
+    pub(crate) const OPTIONAL: [Pane; 7] = [
         Pane::Layers,
         Pane::Brushes,
         Pane::Color,
         Pane::Tool,
+        Pane::History,
         Pane::Navigator,
         Pane::CanvasSettings,
     ];
 
     fn title(self, english: bool) -> &'static str {
         match (self, english) {
+            (Pane::History, false) => "履歴",
+            (Pane::History, true) => "History",
             (Pane::Canvas, false) => "キャンバス",
             (Pane::Canvas, true) => "Canvas",
             (Pane::Layers, false) => "レイヤー",
@@ -121,18 +125,14 @@ impl egui_dock::TabViewer for PaneViewer<'_> {
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| match tab {
                 Pane::Brushes => app.brush_tab(ui, ctx),
-                Pane::Layers => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("pane_layers")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| app.layers_ui(ui, ctx));
-                }
+                Pane::Layers => app.layers_ui(ui, ctx),
                 Pane::Color => {
                     egui::ScrollArea::vertical()
                         .id_salt("pane_color")
                         .auto_shrink([false, false])
                         .show(ui, |ui| app.color_ui(ui, ctx));
                 }
+                Pane::History => app.history_panel(ui),
                 Pane::Navigator => app.navigator_ui(ui, ctx),
                 Pane::Tool => {
                     ui.label(
@@ -251,6 +251,9 @@ const TOOL_GROUPS: &[&[(Tool, &str, &str)]] = &[
         (Tool::Eraser, "消しゴム", "Eraser"),
         (Tool::Blur, "ぼかし", "Blur"),
         (Tool::Smudge, "指先", "Smudge"),
+        (Tool::Gradient, "グラデーション", "Gradient"),
+        (Tool::Shape, "図形", "Shape"),
+        (Tool::Crop, "切り抜き", "Crop"),
         (Tool::Fill, "塗りつぶし", "Fill"),
         (Tool::Eyedropper, "スポイト", "Eyedropper"),
     ],
@@ -282,7 +285,7 @@ const TOOL_GROUPS: &[&[(Tool, &str, &str)]] = &[
     ],
 ];
 
-fn tool_name(tool: Tool, english: bool) -> &'static str {
+pub(super) fn tool_name(tool: Tool, english: bool) -> &'static str {
     TOOL_GROUPS
         .iter()
         .flat_map(|group| group.iter())
@@ -314,10 +317,73 @@ pub(crate) fn brush_label(name: &str, english: bool) -> &str {
     }
 }
 
+/// Stop at an unreadable entry; retrying it cannot advance the history cursor.
+pub(super) fn walk_history(mut current: usize, target: usize, mut step: impl FnMut(bool) -> usize) {
+    while current != target {
+        let next = step(current > target);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+}
+
 impl EfudeApp {
     /// Lays out everything: menu bar, tool rail and the workspace.
     pub(crate) fn layout_ui(&mut self, ctx: &egui::Context) {
         self.menu_bar(ctx);
+        if let Some((_, _, _, reason)) = self.pending_merge {
+            use efude_canvas::MergeAppearanceReason::*;
+            let message = match reason {
+                AncestorOpacityOrMask => self.text(
+                    "親フォルダーの不透明度・マスクにより外観が変わる場合があります。結合しますか？",
+                    "Parent folder opacity or masks may change the result. Merge?",
+                ),
+                BackgroundBlend => self.text(
+                    "背景に依存する合成設定により外観が変わる場合があります。結合しますか？",
+                    "Blending with the background may change the result. Merge?",
+                ),
+                TranslucentClipBase => self.text(
+                    "クリッピング下地が半透明のため外観が変わる場合があります。結合しますか？",
+                    "The clipping base is translucent. Merging may change the result. Merge?",
+                ),
+            };
+            let modal = egui::Modal::new(egui::Id::new("confirm-merge")).show(ctx, |ui| {
+                ui.label(message);
+                ui.horizontal(|ui| {
+                    if ui.button(self.text("キャンセル", "Cancel")).clicked() {
+                        self.pending_merge = None;
+                    }
+                    if ui.button(self.text("結合", "Merge")).clicked() {
+                        self.resolve_merge_confirmation(true);
+                    }
+                });
+            });
+            if modal.should_close() {
+                self.pending_merge = None;
+            }
+        }
+        if self.confirm_layer_clear {
+            let modal =
+                egui::Modal::new(egui::Id::new("confirm-delete-all-layers")).show(ctx, |ui| {
+                    ui.label(self.text(
+                        "すべてのレイヤーを削除しますか？",
+                        "Delete every layer in this document?",
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button(self.text("キャンセル", "Cancel")).clicked() {
+                            self.confirm_layer_clear = false;
+                        }
+                        if ui.button(self.text("削除", "Delete")).clicked() {
+                            self.clear_all_layers();
+                            self.confirm_layer_clear = false;
+                        }
+                    });
+                });
+            if modal.should_close() {
+                self.confirm_layer_clear = false;
+            }
+        }
         if self.show_tools_panel {
             egui::SidePanel::left("tool_rail")
                 .exact_width(RAIL_WIDTH)
@@ -381,6 +447,9 @@ impl EfudeApp {
 
     /// Only the properties of the current tool.
     fn tool_options_contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.studio_options(ui) {
+            return;
+        }
         if self.tool == Tool::VectorEdit {
             self.vector_edit_options(ui);
             return;
@@ -582,6 +651,7 @@ impl EfudeApp {
                     ui.menu_button(self.text("編集", "Edit"), |ui| {
                         ui.set_min_width(160.0);
                         self.undo_redo_ui(ui, ctx);
+                        self.geometry_menu(ui);
                         if ui
                             .button(self.text("塗り残し・消し忘れチェック…", "Finishing check…"))
                             .clicked()
@@ -605,7 +675,10 @@ impl EfudeApp {
                             self.copy_selection(true);
                         }
                         if ui
-                            .add(item(self.text("貼り付け", "Paste"), "Ctrl+V"))
+                            .add_enabled(
+                                !self.editing_mask,
+                                item(self.text("貼り付け", "Paste"), "Ctrl+V"),
+                            )
                             .clicked()
                         {
                             self.paste_clipboard(ctx);
@@ -642,6 +715,7 @@ impl EfudeApp {
                         }
                         close_menu_on_click(ui);
                     });
+                    ui.menu_button(self.text("レイヤー", "Layer"), |ui| self.layer_menu(ui));
                     ui.menu_button(self.text("記録", "Record"), |ui| {
                         self.timelapse_menu_ui(ui, ctx);
                         ui.separator();
@@ -662,7 +736,7 @@ impl EfudeApp {
                     ui.menu_button(self.text("漫画", "Manga"), |ui| self.comic_menu(ui));
                     ui.menu_button(self.text("フィルター", "Filter"), |ui| {
                         ui.set_min_width(240.0);
-                        self.filter_menu(ui, ctx);
+                        ui.add_enabled_ui(!self.editing_mask, |ui| self.filter_menu(ui, ctx));
                     });
                     ui.menu_button(self.text("表示", "View"), |ui| {
                         ui.set_min_width(200.0);
@@ -718,20 +792,19 @@ impl EfudeApp {
                         ui.selectable_value(&mut self.language_english, false, "日本語");
                         ui.selectable_value(&mut self.language_english, true, "English");
                     });
-                    let clear = clear_all_button(ui).on_hover_text(self.text(
-                        "レイヤー全削除（元に戻す で戻せます）",
-                        "Delete All Layers (Undo brings them back)",
-                    ));
-                    if clear.clicked() {
-                        self.clear_all_layers();
-                    }
                     // Quick undo/redo, then status on the right.
                     ui.add_space(8.0);
-                    let undo = icon_button(ui, false).on_hover_text(self.text("元に戻す", "Undo"));
+                    let undo = ui
+                        .add_enabled_ui(self.history.can_undo(), |ui| icon_button(ui, false))
+                        .inner
+                        .on_hover_text(self.text("元に戻す", "Undo"));
                     if undo.clicked() {
                         self.undo();
                     }
-                    let redo = icon_button(ui, true).on_hover_text(self.text("やり直し", "Redo"));
+                    let redo = ui
+                        .add_enabled_ui(self.history.can_redo(), |ui| icon_button(ui, true))
+                        .inner
+                        .on_hover_text(self.text("やり直し", "Redo"));
                     if redo.clicked() {
                         self.redo();
                     }
@@ -758,21 +831,64 @@ impl EfudeApp {
             });
     }
 
+    pub(super) fn go_to_history_step(&mut self, target: usize) {
+        let current = self.history.undo_len();
+        let target = target.min(current + self.history.redo_len());
+        walk_history(current, target, |undo| {
+            if undo {
+                self.undo();
+            } else {
+                self.redo();
+            }
+            self.history.undo_len()
+        });
+    }
+    fn history_panel(&mut self, ui: &mut egui::Ui) {
+        let current = self.history.undo_len();
+        let names = std::iter::once(self.text("開始", "Start").to_owned())
+            .chain(self.history.undo_labels())
+            .chain(self.history.redo_labels());
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, name) in names.enumerate() {
+                if ui
+                    .selectable_label(
+                        i == current,
+                        localized_history_name(&name, self.language_english),
+                    )
+                    .clicked()
+                {
+                    self.go_to_history_step(i);
+                }
+            }
+        });
+    }
     pub(crate) fn undo(&mut self) {
+        self.cancel_studio_session();
         self.finish_pending_canvas_gesture();
         self.commit_pending_guide_edit();
+        let selected = self.doc.layers.get(self.selected_layer).map(|l| l.id);
         self.history.undo_document(&mut self.doc);
-        self.after_history_step();
+        self.after_history_step(selected);
     }
 
     pub(crate) fn redo(&mut self) {
+        self.cancel_studio_session();
         self.finish_pending_canvas_gesture();
         self.commit_pending_guide_edit();
+        let selected = self.doc.layers.get(self.selected_layer).map(|l| l.id);
         self.history.redo_document(&mut self.doc);
-        self.after_history_step();
+        self.after_history_step(selected);
     }
 
-    fn after_history_step(&mut self) {
+    fn after_history_step(&mut self, selected: Option<u64>) {
+        if let Some(index) = selected.and_then(|id| self.layer_index(id)) {
+            self.selected_layer = index;
+        } else {
+            self.selected_layer = self
+                .selected_layer
+                .min(self.doc.layers.len().saturating_sub(1));
+            self.editing_mask = false;
+        }
         self.apply_selection_history_update();
         self.sync_mask_edit_mode();
         self.canvas_width_input = self.doc.width;
@@ -842,14 +958,36 @@ impl EfudeApp {
     }
 
     pub(crate) fn brush_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // The size/opacity block stays pinned at the bottom.
-        let bottom_height = 150.0;
+        ui.add(
+            egui::TextEdit::singleline(&mut self.brush_search).hint_text(
+                if self.language_english {
+                    "Search brushes"
+                } else {
+                    "ブラシを検索"
+                },
+            ),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for (index, (ja, en)) in [
+                ("すべて", "All"),
+                ("ペン・鉛筆", "Pen / pencil"),
+                ("塗り・水彩", "Paint / watercolor"),
+                ("消去・ぼかし・指先", "Erase / blur / smudge"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                ui.selectable_value(
+                    &mut self.brush_category,
+                    index,
+                    if self.language_english { en } else { ja },
+                );
+            }
+        });
         egui::ScrollArea::vertical()
             .id_salt("dock_brush")
             .auto_shrink([false, false])
-            .max_height((ui.available_height() - bottom_height).max(120.0))
             .show(ui, |ui| {
-                section_title(ui, self.text("ブラシプリセット", "Brush Presets"));
                 self.brush_presets_ui(ui, ctx);
                 ui.add_space(8.0);
                 if ui
@@ -868,15 +1006,30 @@ impl EfudeApp {
                 .default_open(false)
                 .show(ui, |ui| self.brush_io_ui(ui, ctx));
             });
-        ui.separator();
-        self.quick_brush_controls(ui);
     }
 
     fn brush_presets_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut action = None;
         // Presets flow down in columns as wide as the panel allows (each
         // column reads as its own list).
-        let count = self.brushes.len();
+        let query = self.brush_search.to_lowercase();
+        let indices: Vec<_> = self
+            .brushes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                let cat = match b.kind {
+                    BrushKind::Eraser | BrushKind::Blur | BrushKind::Smudge => 3,
+                    BrushKind::Pen | BrushKind::Pencil => 1,
+                    _ => 2,
+                };
+                (self.brush_category == 0 || self.brush_category == cat)
+                    && (b.name.to_lowercase().contains(&query)
+                        || brush_label(&b.name, true).to_lowercase().contains(&query))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let count = indices.len();
         let spacing = 8.0;
         // Columns of (up to) ten presets, as many as fit side by side.
         let fit = ((ui.available_width() + spacing) / (170.0 + spacing))
@@ -893,7 +1046,7 @@ impl EfudeApp {
                     for row in 0..rows {
                         let index = column * rows + row;
                         if index < count {
-                            self.brush_preset_cell(ui, ctx, index, width, &mut action);
+                            self.brush_preset_cell(ui, ctx, indices[index], width, &mut action);
                         }
                     }
                 });
@@ -1211,28 +1364,39 @@ impl EfudeApp {
     }
 }
 
-/// Small undo (or redo) button drawn with a vector arrow.
-/// A dotted circle: the "delete all layers" button.
-fn clear_all_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(26.0, 22.0), egui::Sense::click());
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 5.0, Color32::from_rgb(48, 49, 58));
+fn localized_history_name(name: &str, english: bool) -> &str {
+    for (ja, en) in [
+        ("編集", "Edit"),
+        ("描画", "Paint"),
+        ("消しゴム", "Erase"),
+        ("ぼかし", "Blur"),
+        ("指先", "Smudge"),
+        ("塗りつぶし", "Fill"),
+        ("図形", "Shape"),
+        ("切り抜き", "Crop"),
+        ("グラデーション", "Gradient"),
+        ("自由変形", "Free transform"),
+        ("メッシュ変形", "Mesh transform"),
+        ("フィルター", "Filter"),
+        ("レイヤー結合", "Merge layers"),
+        ("レイヤーをすべて削除", "Delete all layers"),
+        ("レイヤーを追加", "Add layer"),
+        ("レイヤーを削除", "Delete layer"),
+        ("レイヤーを移動", "Move layer"),
+        ("キャンバスを編集", "Edit canvas"),
+        ("レイヤー属性", "Layer properties"),
+        ("レイヤーマスク", "Layer mask"),
+        ("ベクター編集", "Edit vector"),
+        ("選択範囲", "Selection"),
+        ("文書設定", "Document settings"),
+        ("下絵", "Tracing guide"),
+    ] {
+        if name == ja || name == en {
+            return if english { en } else { ja };
+        }
     }
-    let color = if response.hovered() {
-        Color32::from_rgb(255, 150, 140)
-    } else {
-        Color32::from_rgb(210, 210, 222)
-    };
-    let (center, radius) = (rect.center(), 6.5);
-    for i in 0..12 {
-        let angle = i as f32 / 12.0 * std::f32::consts::TAU;
-        ui.painter()
-            .circle_filled(center + Vec2::angled(angle) * radius, 1.1, color);
-    }
-    response
+    name
 }
-
 fn icon_button(ui: &mut egui::Ui, redo: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(26.0, 22.0), egui::Sense::click());
     if response.hovered() {
@@ -1246,11 +1410,6 @@ fn icon_button(ui: &mut egui::Ui, redo: bool) -> egui::Response {
         Color32::from_rgb(210, 210, 222),
     );
     response
-}
-
-fn section_title(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).strong().size(13.5));
-    ui.add_space(2.0);
 }
 
 /// Closes the open menu when one of its buttons was clicked.
@@ -1281,7 +1440,11 @@ fn brush_signature(brush: &Brush) -> u64 {
         brush.grain_random_rotation
     )
     .hash(&mut hasher);
+    brush.follow_stroke_direction.hash(&mut hasher);
     for value in [
+        brush.hue_jitter,
+        brush.saturation_jitter,
+        brush.brightness_jitter,
         brush.size,
         brush.opacity,
         brush.spacing,
@@ -1330,7 +1493,7 @@ fn render_brush_preview(brush: &Brush) -> Vec<u8> {
     let acts_on_paint = matches!(
         brush.kind,
         BrushKind::Eraser | BrushKind::Blur | BrushKind::Smudge
-    ) || (brush.mix.dilution >= 0.99 && brush.mix.blend > 0.0);
+    ) || (brush.mix.dilution >= 0.7 && brush.mix.blend > 0.0);
     if acts_on_paint {
         for y in 0..height as u32 {
             for x in 0..width as u32 {
@@ -1341,9 +1504,9 @@ fn render_brush_preview(brush: &Brush) -> Vec<u8> {
                     x < width as u32 / 2
                 };
                 let band = if left {
-                    [196, 92, 120, 255]
+                    [146, 95, 110, 255]
                 } else {
-                    [92, 110, 205, 255]
+                    [87, 110, 151, 255]
                 };
                 if (8..height as u32 - 8).contains(&y) {
                     doc.layers[0].pixels.set_pixel(x, y, band);

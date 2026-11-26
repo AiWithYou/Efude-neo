@@ -165,7 +165,7 @@ fn render(brush_index: usize, strokes: &[Vec<InkPoint>]) -> Vec<u8> {
     app.tool = Tool::Brush;
     app.selected_brush = brush_index;
     app.size = app.brushes[brush_index].size;
-    app.color = Color32::from_rgb(30, 110, 60);
+    app.color = [30, 110, 60, 255];
     background(&mut app.doc);
     for stroke in strokes {
         app.reset_stroke_buffers();

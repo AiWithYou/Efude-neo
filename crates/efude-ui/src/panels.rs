@@ -146,6 +146,7 @@ impl EfudeApp {
 
     /// Opens `path` by its extension (see `open_document_dialog`).
     pub(crate) fn open_path(&mut self, path: std::path::PathBuf, ctx: &egui::Context) {
+        self.cancel_studio_session();
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -223,18 +224,14 @@ impl EfudeApp {
 
     /// Asks for a file name and saves the document there.
     pub(crate) fn save_as_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(path) = rfd::FileDialog::new()
+        let path = rfd::FileDialog::new()
             .add_filter("Efude", &["efude"])
             .set_file_name(self.suggested_save_name())
-            .save_file()
-        {
-            self.finish_pending_canvas_gesture();
-            self.commit_pending_guide_edit();
-            self.last_backup = std::time::Instant::now();
-            self.status = match self.queue_document_save(path, false, ctx) {
-                Ok(()) => self.text("別名保存中…", "Saving As…").into(),
-                Err(error) => error,
-            };
+            .save_file();
+        match self.save_to_chosen_path(path, ctx) {
+            Ok(true) => self.status = self.text("別名保存中…", "Saving As…").into(),
+            Ok(false) => {}
+            Err(error) => self.status = error,
         }
     }
 
@@ -281,7 +278,8 @@ impl EfudeApp {
                 break;
             }
         }
-        self.history.commit();
+        self.history
+            .commit_labeled(self.text("レイヤーをすべて削除", "Delete all layers"));
         self.selected_layer = 0;
         self.status = self
             .text("レイヤーをすべて削除しました", "Deleted all layers")
@@ -372,7 +370,8 @@ impl EfudeApp {
     pub(crate) fn undo_redo_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let english = self.language_english;
         if ui
-            .add(
+            .add_enabled(
+                self.history.can_undo(),
                 egui::Button::new(if english { "Undo" } else { "取り消し" })
                     .shortcut_text("Ctrl+Z"),
             )
@@ -381,7 +380,8 @@ impl EfudeApp {
             self.undo();
         }
         if ui
-            .add(
+            .add_enabled(
+                self.history.can_redo(),
                 egui::Button::new(if english { "Redo" } else { "やり直し" })
                     .shortcut_text("Ctrl+Y"),
             )
@@ -400,6 +400,9 @@ impl EfudeApp {
     /// Tablet input, shortcuts, latency and backups.
     #[allow(unused_variables)]
     pub(crate) fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.collapsing(self.text("入力診断", "Input diagnostics"), |ui| {
+            self.input_diagnostics_ui(ui)
+        });
         let english = self.language_english;
         #[cfg(target_os = "windows")]
         egui::ComboBox::from_label(self.text("タブレット入力", "Tablet Input"))
@@ -610,6 +613,13 @@ impl EfudeApp {
                         &mut self.shortcuts.selection_brush_tool,
                     ),
                     (
+                        "Gradient",
+                        "グラデーション",
+                        &mut self.shortcuts.gradient_tool,
+                    ),
+                    ("Shape", "図形", &mut self.shortcuts.shape_tool),
+                    ("Crop", "切り抜き", &mut self.shortcuts.crop_tool),
+                    (
                         "Quick Mask",
                         "クイックマスク",
                         &mut self.shortcuts.quick_mask_tool,
@@ -624,22 +634,66 @@ impl EfudeApp {
                         ui.text_edit_singleline(shortcut);
                     });
                 }
-                let mut conflict_labels = self
+                let mut duplicates = self
                     .conflicting_tool_keys()
                     .into_iter()
                     .map(|key| format!("{key:?}"))
                     .collect::<Vec<_>>();
+                duplicates.sort();
+                if !duplicates.is_empty() {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        format!(
+                            "{} {}",
+                            self.text(
+                                "複数のツールに割り当てたキーは無効です",
+                                "Disabled keys assigned to multiple tools"
+                            ),
+                            duplicates.join(", ")
+                        ),
+                    );
+                }
+                let mut conflict_labels = Vec::new();
+                let tool_bindings = self.tool_bindings();
+                for key in [egui::Key::X, egui::Key::D, egui::Key::H, egui::Key::R] {
+                    if tool_bindings
+                        .iter()
+                        .filter(|(bound, _)| *bound == key)
+                        .count()
+                        == 1
+                    {
+                        conflict_labels.push(format!("{key:?}"));
+                    }
+                }
+                let bindings = [
+                    &self.shortcuts.undo,
+                    &self.shortcuts.redo,
+                    &self.shortcuts.save,
+                    &self.shortcuts.copy,
+                    &self.shortcuts.cut,
+                    &self.shortcuts.paste,
+                    &self.shortcuts.select_all,
+                    &self.shortcuts.deselect,
+                ];
+                for key in ["E", "T"] {
+                    if bindings.iter().any(|s| s.trim().eq_ignore_ascii_case(key)) {
+                        conflict_labels.push(format!("Ctrl+{key}"));
+                    }
+                }
                 conflict_labels.sort();
                 if !conflict_labels.is_empty() {
                     ui.colored_label(
                         Color32::YELLOW,
                         if self.language_english {
                             format!(
-                                "Conflicting tool keys are disabled: {}",
+                                "Conflicting shortcuts (configured commands take priority): {}",
                                 conflict_labels.join(", ")
                             )
                         } else {
-                            format!("重複キーは無効です: {}", conflict_labels.join("、"))
+                            format!(
+                                "重複キー（設定したコマンドを優先）: {}",
+                                conflict_labels.join("、")
+                            )
                         },
                     );
                 }
@@ -719,12 +773,39 @@ impl EfudeApp {
     pub(crate) fn navigator_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let english = self.language_english;
         ui.collapsing(self.text("ナビゲーター", "Navigator"), |ui| {
-            if self.navigator_texture_dirty || self.navigator_texture.is_none() {
-                let merged = efude_canvas::composite_display(&self.doc, self.display_checker());
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [self.doc.width as usize, self.doc.height as usize],
-                    &merged,
-                );
+            let page = Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(self.doc.width as f32, self.doc.height as f32),
+            );
+            let oversized = self.needs_viewport_texture(ctx);
+            let mut scale = ui.available_width() / page.width();
+            if oversized {
+                let height = ui.available_height().min(ctx.screen_rect().height());
+                scale = scale.min(height / page.height());
+            }
+            let display_size = (page.size() * scale).max(Vec2::splat(1.));
+            let region = oversized.then(|| {
+                shape_gradient::PreviewRegion::new(
+                    page,
+                    scale * ctx.pixels_per_point(),
+                    self.max_texture_side(ctx),
+                )
+            });
+            let size = region.map_or([self.doc.width as usize, self.doc.height as usize], |r| {
+                r.size
+            });
+            if self.navigator_texture_dirty
+                || self
+                    .navigator_texture
+                    .as_ref()
+                    .is_none_or(|t| t.size() != size)
+            {
+                let image = if let Some(region) = region {
+                    self.display_region(region)
+                } else {
+                    let merged = efude_canvas::composite_display(&self.doc, self.display_checker());
+                    egui::ColorImage::from_rgba_unmultiplied(size, &merged)
+                };
                 if let Some(tex) = &mut self.navigator_texture {
                     tex.set(image, egui::TextureOptions::LINEAR);
                 } else {
@@ -734,9 +815,8 @@ impl EfudeApp {
                 self.navigator_texture_dirty = false;
             }
             if let Some(tex) = &self.navigator_texture {
-                let ratio = self.doc.width as f32 / self.doc.height as f32;
-                let size = Vec2::new(ui.available_width(), ui.available_width() / ratio);
-                let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
+                let (response, painter) =
+                    ui.allocate_painter(display_size, egui::Sense::click_and_drag());
                 let r = response.rect;
                 painter.image(
                     tex.id(),
@@ -1285,7 +1365,13 @@ impl EfudeApp {
                 if ui.button(self.text("切り取り", "Cut")).clicked() {
                     self.copy_selection(true);
                 }
-                if ui.button(self.text("貼り付け", "Paste")).clicked() {
+                if ui
+                    .add_enabled(
+                        !self.editing_mask,
+                        egui::Button::new(self.text("貼り付け", "Paste")),
+                    )
+                    .clicked()
+                {
                     self.paste_clipboard(ctx);
                 }
             });
@@ -1435,239 +1521,6 @@ impl EfudeApp {
     }
 
     /// Colour wheel, sliders and palette.
-    pub(crate) fn color_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let color_before = self.color;
-        self.color_ui_contents(ui, ctx);
-        // Picking any colour leaves the transparent colour.
-        if self.color != color_before {
-            self.transparent_color = false;
-        }
-    }
-
-    /// The "transparent colour" switch: a checkerboard swatch. While it is
-    /// on, brushes and fills erase.
-    fn transparent_color_button(&mut self, ui: &mut egui::Ui) {
-        let label = self.text("透明色", "Transparent");
-        let hint = self.text(
-            "透明色で描く：ブラシや塗りつぶしが、その形のまま消します。色を選ぶと戻ります",
-            "Paint with transparency: brushes and fills erase in their own shape. Picking a colour turns it off",
-        );
-        ui.horizontal(|ui| {
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(40.0, 20.0), egui::Sense::click());
-            let painter = ui.painter();
-            let cell = 5.0;
-            for row in 0..4 {
-                for column in 0..8 {
-                    let grey = if (row + column) % 2 == 0 { 255 } else { 190 };
-                    painter.rect_filled(
-                        Rect::from_min_size(
-                            rect.min + Vec2::new(column as f32 * cell, row as f32 * cell),
-                            Vec2::splat(cell),
-                        ),
-                        0.0,
-                        Color32::from_gray(grey),
-                    );
-                }
-            }
-            let stroke = if self.transparent_color {
-                Stroke::new(2.5, crate::layout::ACCENT)
-            } else {
-                Stroke::new(1.0, Color32::from_gray(90))
-            };
-            painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Outside);
-            let clicked = response.on_hover_text(hint).clicked();
-            let toggled = ui
-                .selectable_label(self.transparent_color, label)
-                .on_hover_text(hint)
-                .clicked();
-            if clicked || toggled {
-                self.transparent_color = !self.transparent_color;
-            }
-        });
-    }
-
-    #[allow(unused_variables)]
-    fn color_ui_contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let english = self.language_english;
-        if self.color_wheel.is_none() {
-            let side = 192usize;
-            let radius = side as f32 * 0.5;
-            let pixels = (0..side * side)
-                .map(|i| {
-                    let x = i % side;
-                    let y = i / side;
-                    let dx = (x as f32 + 0.5 - radius) / radius;
-                    let dy = (y as f32 + 0.5 - radius) / radius;
-                    let saturation = (dx * dx + dy * dy).sqrt();
-                    if saturation > 1.0 {
-                        Color32::TRANSPARENT
-                    } else {
-                        let hue = (dy.atan2(dx) / std::f32::consts::TAU).rem_euclid(1.0);
-                        egui::ecolor::Hsva::new(hue, saturation, 1.0, 1.0).into()
-                    }
-                })
-                .collect();
-            self.color_wheel = Some(ctx.load_texture(
-                "color-wheel",
-                egui::ColorImage {
-                    size: [side, side],
-                    pixels,
-                },
-                egui::TextureOptions::LINEAR,
-            ));
-        }
-        let wheel_side = 176.0;
-        let (wheel_rect, wheel_response) =
-            ui.allocate_exact_size(Vec2::splat(wheel_side), egui::Sense::click_and_drag());
-        if let Some(wheel) = &self.color_wheel {
-            ui.painter().image(
-                wheel.id(),
-                wheel_rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-            let hsv = egui::ecolor::Hsva::from(self.color);
-            let angle = hsv.h * std::f32::consts::TAU;
-            let marker = wheel_rect.center()
-                + Vec2::new(angle.cos(), angle.sin()) * hsv.s * wheel_side * 0.5;
-            ui.painter()
-                .circle_stroke(marker, 5.0, Stroke::new(1.5, Color32::WHITE));
-            ui.painter()
-                .circle_stroke(marker, 6.5, Stroke::new(1.0, Color32::BLACK));
-            if (wheel_response.dragged() || wheel_response.clicked())
-                && let Some(pointer) = wheel_response.interact_pointer_pos()
-            {
-                let delta = pointer - wheel_rect.center();
-                let hsv = egui::ecolor::Hsva::from(self.color);
-                let hue = (delta.y.atan2(delta.x) / std::f32::consts::TAU).rem_euclid(1.0);
-                let saturation = (delta.length() / (wheel_side * 0.5)).clamp(0.0, 1.0);
-                self.color = egui::ecolor::Hsva::new(hue, saturation, hsv.v, hsv.a).into();
-            }
-        }
-        ui.color_edit_button_srgba(&mut self.color);
-        self.transparent_color_button(ui);
-        let mut rgb = [self.color.r(), self.color.g(), self.color.b()];
-        let mut rgb_changed = false;
-        for (channel, label) in rgb.iter_mut().zip(["R", "G", "B"]) {
-            rgb_changed |= ui
-                .add(egui::Slider::new(channel, 0..=255).text(label))
-                .changed();
-        }
-        if rgb_changed {
-            self.color = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], self.color.a());
-        }
-        let mut alpha = self.color.a();
-        if ui
-            .add(egui::Slider::new(&mut alpha, 0..=255).text(self.text("不透明度", "Alpha")))
-            .changed()
-        {
-            self.color = Color32::from_rgba_unmultiplied(
-                self.color.r(),
-                self.color.g(),
-                self.color.b(),
-                alpha,
-            );
-        }
-        ui.horizontal(|ui| {
-            ui.label(self.text("中間色の色2", "Intermediate Color 2"));
-            ui.color_edit_button_srgba(&mut self.secondary_color);
-        });
-        ui.add(
-            egui::Slider::new(&mut self.intermediate_mix, 0.0..=1.0).text(
-                if self.language_english {
-                    "Intermediate Color Ratio"
-                } else {
-                    "中間色の割合"
-                },
-            ),
-        );
-        let blend_channel =
-            |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * self.intermediate_mix).round() as u8;
-        let intermediate = Color32::from_rgba_unmultiplied(
-            blend_channel(self.color.r(), self.secondary_color.r()),
-            blend_channel(self.color.g(), self.secondary_color.g()),
-            blend_channel(self.color.b(), self.secondary_color.b()),
-            blend_channel(self.color.a(), self.secondary_color.a()),
-        );
-        ui.horizontal(|ui| {
-            ui.label(self.text("中間色", "Intermediate Color"));
-            let response = ui.add(
-                egui::Button::new(if self.language_english {
-                    "Set as Current Color"
-                } else {
-                    "現在色に設定"
-                })
-                .fill(intermediate)
-                .min_size(Vec2::new(96.0, 24.0)),
-            );
-            if response.clicked() {
-                self.color = intermediate;
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            let mut chosen = None;
-            let mut removed = None;
-            for (i, rgba) in self.palette.iter().enumerate() {
-                let swatch = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
-                let response = ui
-                    .add(
-                        egui::Button::new("")
-                            .fill(swatch)
-                            .min_size(Vec2::splat(24.)),
-                    )
-                    .on_hover_text(self.text(
-                        "クリックで選択 / 右クリックで削除",
-                        "Click to use, right-click to remove",
-                    ));
-                if response.clicked() {
-                    chosen = Some(i);
-                }
-                if response.secondary_clicked() {
-                    removed = Some(i);
-                }
-            }
-            if let Some(i) = chosen {
-                self.color = Color32::from_rgba_unmultiplied(
-                    self.palette[i][0],
-                    self.palette[i][1],
-                    self.palette[i][2],
-                    self.palette[i][3],
-                );
-            }
-            if let Some(i) = removed {
-                self.palette.remove(i);
-            }
-        });
-        if ui
-            .button(self.text("現在色をパレットに追加", "Add Current Color to Palette"))
-            .clicked()
-        {
-            self.palette.push([
-                self.color.r(),
-                self.color.g(),
-                self.color.b(),
-                self.color.a(),
-            ]);
-            if self.palette.len() > 32 {
-                self.palette.remove(0);
-            }
-        }
-        ui.horizontal(|ui| {
-            ui.label(format!(
-                "{}: {}",
-                self.text("パレット", "Palette"),
-                self.palette.len()
-            ));
-            if ui
-                .button(self.text("すべて消去", "Clear Palette"))
-                .clicked()
-            {
-                self.palette.clear();
-            }
-        });
-    }
-
     /// The selected brush's settings in their own window, with the 書き味
     /// (stroke feel) options on top.
     pub(crate) fn brush_settings_window(&mut self, ctx: &egui::Context) {
@@ -1802,9 +1655,31 @@ impl EfudeApp {
     /// Every setting of the selected brush.
     #[allow(unused_variables)]
     pub(crate) fn brush_settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let english = self.language_english;
-        let english = self.language_english;
         let brush = &mut self.brushes[self.selected_brush];
+        let english = self.language_english;
+        for (value, ja, en) in [
+            (&mut brush.hue_jitter, "色相ジッター", "Hue jitter"),
+            (
+                &mut brush.saturation_jitter,
+                "彩度ジッター",
+                "Saturation jitter",
+            ),
+            (
+                &mut brush.brightness_jitter,
+                "明度ジッター",
+                "Brightness jitter",
+            ),
+        ] {
+            ui.add(egui::Slider::new(value, 0.0..=1.0).text(if english { en } else { ja }));
+        }
+        ui.checkbox(
+            &mut brush.follow_stroke_direction,
+            if english {
+                "Follow stroke direction"
+            } else {
+                "ストロークの向きに追従"
+            },
+        );
         brush.size = self.size;
         ui.add(
             egui::Slider::new(&mut brush.opacity, 0.01..=1.).text(if english {
@@ -2520,12 +2395,7 @@ impl EfudeApp {
                 }
             }
         });
-        brush.color = [
-            self.color.r(),
-            self.color.g(),
-            self.color.b(),
-            self.color.a(),
-        ];
+        brush.color = self.color;
     }
 
     /// The view's zoom in percent (100% = one document pixel per screen
@@ -2542,16 +2412,20 @@ impl EfudeApp {
 
     /// The zoom in the bottom-left corner of the canvas, with the common
     /// zoom levels to pick from.
+    pub(super) fn hud_bounds(&self) -> Rect {
+        let area = self.canvas_viewport.0;
+        Rect::from_min_size(
+            area.left_bottom() + Vec2::new(8., -34.),
+            Vec2::new((area.width() - 16.).clamp(0., 420.), 28.),
+        )
+    }
     pub(crate) fn zoom_indicator(&mut self, ui: &mut egui::Ui) {
         let area = self.canvas_viewport.0;
         if !area.is_positive() {
             return;
         }
         let english = self.language_english;
-        let place = Rect::from_min_size(
-            area.left_bottom() + Vec2::new(8.0, -34.0),
-            Vec2::new(150.0, 28.0),
-        );
+        let place = self.hud_bounds();
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(place));
         // Takes presses and drags here, so they never start a stroke on the
         // canvas underneath.
@@ -2563,48 +2437,78 @@ impl EfudeApp {
         egui::Frame::popup(child.style())
             .inner_margin(egui::Margin::symmetric(6, 2))
             .show(&mut child, |ui| {
-                let percent = self.zoom_percent();
-                let label = if (percent - percent.round()).abs() < 0.05 {
-                    format!("{percent:.0}%")
-                } else {
-                    format!("{percent:.1}%")
-                };
-                egui::ComboBox::from_id_salt("zoom-indicator")
-                    .selected_text(label)
-                    .width(80.0)
-                    .height(420.0)
-                    .show_ui(ui, |ui| {
-                        for level in ZOOM_LEVELS {
-                            let text = if level.fract() == 0.0 {
-                                format!("{level:.0}%")
-                            } else {
-                                format!("{level}%")
-                            };
+                ui.horizontal(|ui| {
+                    let percent = self.zoom_percent();
+                    let label = if (percent - percent.round()).abs() < 0.05 {
+                        format!("{percent:.0}%")
+                    } else {
+                        format!("{percent:.1}%")
+                    };
+                    egui::ComboBox::from_id_salt("zoom-indicator")
+                        .selected_text(label)
+                        .width(80.0)
+                        .height(420.0)
+                        .show_ui(ui, |ui| {
+                            for level in ZOOM_LEVELS {
+                                let text = if level.fract() == 0.0 {
+                                    format!("{level:.0}%")
+                                } else {
+                                    format!("{level}%")
+                                };
+                                if ui
+                                    .selectable_label((percent - level).abs() < 0.05, text)
+                                    .clicked()
+                                {
+                                    self.set_zoom_percent(level);
+                                }
+                            }
+                            ui.separator();
                             if ui
-                                .selectable_label((percent - level).abs() < 0.05, text)
+                                .selectable_label(false, if english { "Fit" } else { "全体" })
                                 .clicked()
                             {
-                                self.set_zoom_percent(level);
+                                self.zoom = 1.0;
+                                self.navigator_center = Vec2::new(
+                                    self.doc.width as f32 / 2.0,
+                                    self.doc.height as f32 / 2.0,
+                                );
                             }
-                        }
-                        ui.separator();
-                        if ui
-                            .selectable_label(false, if english { "Fit" } else { "全体" })
-                            .clicked()
+                        })
+                        .response
+                        .on_hover_text(if english {
+                            "Zoom (Ctrl + / Ctrl − / Ctrl 0)"
+                        } else {
+                            "表示倍率（Ctrl＋＋／Ctrl＋−／Ctrl＋0）"
+                        });
+
+                    if ui
+                        .small_button(format!("{:.0}°", self.view_rotation))
+                        .clicked()
+                    {
+                        self.view_rotation = 0.;
+                    }
+                    if ui
+                        .selectable_label(self.flip_x, "↔")
+                        .on_hover_text(self.text("左右反転 (H)", "Flip view (H)"))
+                        .clicked()
+                    {
+                        self.flip_x = !self.flip_x;
+                    }
+                    ui.label(format!("{}×{}", self.doc.width, self.doc.height));
+                    if let (Some(pos), Some((rect, scale))) =
+                        (ui.ctx().pointer_hover_pos(), self.canvas_screen)
+                    {
+                        let p = self.document_position_unsnapped(pos, rect, scale);
+                        if p.x >= 0.
+                            && p.y >= 0.
+                            && p.x < self.doc.width as f32
+                            && p.y < self.doc.height as f32
                         {
-                            self.zoom = 1.0;
-                            self.navigator_center = Vec2::new(
-                                self.doc.width as f32 / 2.0,
-                                self.doc.height as f32 / 2.0,
-                            );
+                            ui.label(format!("({}, {})", p.x as i32, p.y as i32));
                         }
-                    })
-                    .response
-                    .on_hover_text(if english {
-                        "Zoom (Ctrl + / Ctrl − / Ctrl 0)"
-                    } else {
-                        "表示倍率（Ctrl＋＋／Ctrl＋−／Ctrl＋0）"
-                    });
+                    }
+                    ui.add(egui::Label::new(&self.doc.layers[self.selected_layer].name).truncate());
+                });
             });
     }
 
@@ -3087,7 +2991,6 @@ impl EfudeApp {
     #[allow(unused_variables)]
     pub(crate) fn canvas_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let english = self.language_english;
-        let english = self.language_english;
         ui.heading(self.text("キャンバス", "Canvas"));
         ui.label(format!("{} × {} px", self.doc.width, self.doc.height));
         ui.horizontal(|ui| {
@@ -3229,750 +3132,15 @@ impl EfudeApp {
 
     /// Layer list and layer operations.
     #[allow(unused_variables)]
-    pub(crate) fn layers_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let english = self.language_english;
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button(self.text("表示レイヤーを統合", "Merge Visible Layers"))
-                .clicked()
-            {
-                self.merge_visible_layers();
-            }
-            if ui
-                .button(self.text("＋ラスター", "+ Raster Layer"))
-                .on_hover_text("Ctrl+Shift+N")
-                .clicked()
-            {
-                self.add_raster_layer();
-            }
-            if ui
-                .button(self.text("＋ベクター", "+ Vector Layer"))
-                .on_hover_text(self.text(
-                    "線をあとから消したり動かしたりできるレイヤー",
-                    "A layer whose lines can be erased and moved later",
-                ))
-                .clicked()
-            {
-                self.add_vector_layer();
-            }
-            if ui
-                .button(self.text("＋子レイヤー", "+ Child Layer"))
-                .clicked()
-                && {
-                    self.finish_pending_canvas_gesture();
-                    self.can_add_layers(1)
-                }
-            {
-                let parent = if self.doc.layers[self.selected_layer].kind == LayerKind::Folder {
-                    Some(self.doc.layers[self.selected_layer].id)
-                } else {
-                    self.doc.layers[self.selected_layer].parent_id
-                };
-                let id = self.next_layer_id();
-                let mut child = efude_canvas::Layer::new(
-                    id,
-                    if english {
-                        format!("Layer {id}")
-                    } else {
-                        format!("レイヤー {id}")
-                    },
-                    self.doc.width,
-                    self.doc.height,
-                );
-                child.parent_id = parent;
-                let at = self.doc.layers.len();
-                self.history.insert_layer(&mut self.doc.layers, at, child);
-                self.selected_layer = at;
-            }
-            if ui.button(self.text("＋フォルダ", "+ Folder")).clicked() && {
-                self.finish_pending_canvas_gesture();
-                self.can_add_layers(1)
-            } {
-                let id = self.next_layer_id();
-                let mut folder = efude_canvas::Layer::new(
-                    id,
-                    if english {
-                        format!("Folder {id}")
-                    } else {
-                        format!("フォルダ {id}")
-                    },
-                    self.doc.width,
-                    self.doc.height,
-                );
-                folder.kind = LayerKind::Folder;
-                folder.parent_id = if self.doc.layers[self.selected_layer].kind == LayerKind::Folder
-                {
-                    Some(self.doc.layers[self.selected_layer].id)
-                } else {
-                    self.doc.layers[self.selected_layer].parent_id
-                };
-                let at = self.doc.layers.len();
-                self.history.insert_layer(&mut self.doc.layers, at, folder);
-                self.selected_layer = self.doc.layers.len() - 1;
-            }
-            if ui
-                .button(self.text("複製", "Duplicate"))
-                .on_hover_text("Ctrl+J")
-                .clicked()
-            {
-                self.duplicate_layer_subtree();
-            }
-            if ui.button(self.text("削除", "Delete")).clicked() && self.doc.layers.len() > 1 {
-                self.delete_document_layer(self.selected_layer);
-            }
-        });
-        let layer_count = self.doc.layers.len();
-        // Dragging a row: where it would land (layer id and placement).
-        let dragging = self.layer_drag;
-        let pointer = ui.ctx().pointer_latest_pos();
-        let mut drop_target: Option<(u64, efude_canvas::LayerPlacement)> = None;
-        let dragged_subtree = dragging
-            .map(|id| efude_canvas::subtree_ids(&self.doc.layers, id))
-            .unwrap_or_default();
-        let mut rasterize = None;
-        self.layer_rows.clear();
-        for i in (0..layer_count).rev() {
-            let mut parent = self.doc.layers[i].parent_id;
-            let mut depth = 0usize;
-            let mut hidden = false;
-            let mut traversed = 0;
-            while let Some(pid) = parent {
-                traversed += 1;
-                if traversed > self.doc.layers.len() {
-                    break;
-                }
-                if let Some((pi, p)) = self
-                    .doc
-                    .layers
-                    .iter()
-                    .enumerate()
-                    .find(|(_, l)| l.id == pid)
-                {
-                    depth += 1;
-                    if !p.expanded {
-                        hidden = true;
-                    }
-                    parent = p.parent_id;
-                    if pi == i {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if hidden {
-                continue;
-            }
-            let has_children = self
-                .doc
-                .layers
-                .iter()
-                .any(|child| child.parent_id == Some(self.doc.layers[i].id));
-            let layer_id = self.doc.layers[i].id;
-            let property_before = self.doc.layers[i].property_state();
-            let macro_before = if self.macro_recording.is_some() {
-                let layer = &self.doc.layers[i];
-                Some((
-                    layer.name.clone(),
-                    layer.opacity,
-                    layer.visible,
-                    layer.blend,
-                ))
-            } else {
-                None
-            };
-            let parent_id = self.doc.layers[i].parent_id;
-            let mut descendants = vec![layer_id];
-            let mut descendant_cursor = 0;
-            while descendant_cursor < descendants.len() {
-                let ancestor = descendants[descendant_cursor];
-                let children = self
-                    .doc
-                    .layers
-                    .iter()
-                    .filter(|candidate| candidate.parent_id == Some(ancestor))
-                    .map(|candidate| candidate.id)
-                    .filter(|child| !descendants.contains(child))
-                    .collect::<Vec<_>>();
-                descendants.extend(children);
-                descendant_cursor += 1;
-            }
-            let parent_name = parent_id
-                .and_then(|id| {
-                    self.doc
-                        .layers
-                        .iter()
-                        .find(|layer| layer.id == id)
-                        .map(|layer| layer.name.clone())
-                })
-                .unwrap_or_else(|| {
-                    if english {
-                        "Top Level".into()
-                    } else {
-                        "最上位".into()
-                    }
-                });
-            let folder_options = self
-                .doc
-                .layers
-                .iter()
-                .filter(|candidate| {
-                    candidate.kind == LayerKind::Folder && !descendants.contains(&candidate.id)
-                })
-                .map(|candidate| (candidate.id, candidate.name.clone()))
-                .collect::<Vec<_>>();
-            let siblings = self
-                .doc
-                .layers
-                .iter()
-                .enumerate()
-                .filter_map(|(index, layer)| (layer.parent_id == parent_id).then_some(index))
-                .collect::<Vec<_>>();
-            let move_up_target = siblings.iter().copied().find(|index| *index > i);
-            let move_down_target = siblings.iter().copied().rev().find(|index| *index < i);
-            let mut move_to = None;
-            let mut select_layer = false;
-            let mut change_mask = None;
-            let mut mask_action = None;
-            let mut change_parent = None;
-            {
-                let l = &mut self.doc.layers[i];
-                let selected = i == self.selected_layer;
-                let (row, response) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 32.0),
-                    egui::Sense::click_and_drag(),
-                );
-                if response.drag_started() {
-                    self.layer_drag = Some(layer_id);
-                }
-                self.layer_rows.push((layer_id, row));
-                let painter = ui.painter().clone();
-                if selected {
-                    painter.rect_filled(row, 7.0, crate::layout::ACCENT.gamma_multiply(0.30));
-                    painter.rect_stroke(
-                        row,
-                        7.0,
-                        Stroke::new(1.2, crate::layout::ACCENT),
-                        egui::StrokeKind::Inside,
-                    );
-                } else if response.hovered() {
-                    painter.rect_filled(row, 7.0, Color32::from_rgb(40, 41, 50));
-                }
-                let text_color = if l.visible {
-                    Color32::from_rgb(225, 225, 235)
-                } else {
-                    Color32::from_gray(150)
-                };
-                let mut x = row.left() + 6.0 + depth as f32 * 14.0;
-                let mut clicked_control = false;
-                // Folder expander.
-                if l.kind == LayerKind::Folder && has_children {
-                    let r = Rect::from_center_size(
-                        Pos2::new(x + 7.0, row.center().y),
-                        Vec2::splat(14.0),
-                    );
-                    if ui
-                        .interact(
-                            r,
-                            ui.id().with(("layer-expand", layer_id)),
-                            egui::Sense::click(),
-                        )
-                        .clicked()
-                    {
-                        l.expanded = !l.expanded;
-                        clicked_control = true;
-                    }
-                    let c = r.center();
-                    let points = if l.expanded {
-                        vec![
-                            c + Vec2::new(-4.0, -2.0),
-                            c + Vec2::new(4.0, -2.0),
-                            c + Vec2::new(0.0, 3.0),
-                        ]
-                    } else {
-                        vec![
-                            c + Vec2::new(-2.0, -4.0),
-                            c + Vec2::new(3.0, 0.0),
-                            c + Vec2::new(-2.0, 4.0),
-                        ]
-                    };
-                    painter.add(egui::Shape::convex_polygon(
-                        points,
-                        text_color,
-                        Stroke::NONE,
-                    ));
-                }
-                x += 16.0;
-                // Visibility (eye).
-                let eye = Rect::from_center_size(
-                    Pos2::new(x + 9.0, row.center().y),
-                    Vec2::new(18.0, 14.0),
-                );
-                let eye_response = ui
-                    .interact(
-                        eye,
-                        ui.id().with(("layer-eye", layer_id)),
-                        egui::Sense::click(),
-                    )
-                    .on_hover_text(if english {
-                        "Show / hide"
-                    } else {
-                        "表示 / 非表示"
-                    });
-                if eye_response.clicked() {
-                    l.visible = !l.visible;
-                    clicked_control = true;
-                }
-                let eye_color = if l.visible {
-                    Color32::from_rgb(210, 210, 222)
-                } else {
-                    Color32::from_gray(130)
-                };
-                let lens: Vec<Pos2> = (0..=16)
-                    .map(|k| {
-                        let a = k as f32 / 16.0 * std::f32::consts::TAU;
-                        eye.center() + Vec2::new(8.0 * a.cos(), 4.5 * a.sin())
-                    })
-                    .collect();
-                painter.add(egui::Shape::closed_line(lens, Stroke::new(1.3, eye_color)));
-                if l.visible {
-                    painter.circle_filled(eye.center(), 2.4, eye_color);
-                } else {
-                    painter.line_segment(
-                        [eye.left_bottom(), eye.right_top()],
-                        Stroke::new(1.3, eye_color),
-                    );
-                }
-                x += 26.0;
-                // Folder marker, name, and move buttons on the right.
-                if l.kind == LayerKind::Folder {
-                    let f = Rect::from_min_size(
-                        Pos2::new(x, row.center().y - 6.0),
-                        Vec2::new(16.0, 12.0),
-                    );
-                    painter.rect_stroke(
-                        f,
-                        2.0,
-                        Stroke::new(1.2, text_color),
-                        egui::StrokeKind::Inside,
-                    );
-                    painter.line_segment(
-                        [
-                            f.left_top() + Vec2::new(0.0, 3.0),
-                            f.right_top() + Vec2::new(0.0, 3.0),
-                        ],
-                        Stroke::new(1.0, text_color),
-                    );
-                    x += 22.0;
-                } else if l.is_vector() {
-                    // A curve between two anchor points.
-                    let c = Pos2::new(x + 8.0, row.center().y);
-                    let curve = egui::epaint::CubicBezierShape::from_points_stroke(
-                        [
-                            c + Vec2::new(-7.0, 5.0),
-                            c + Vec2::new(-3.0, -9.0),
-                            c + Vec2::new(3.0, 9.0),
-                            c + Vec2::new(7.0, -5.0),
-                        ],
-                        false,
-                        Color32::TRANSPARENT,
-                        Stroke::new(1.3, text_color),
-                    );
-                    painter.add(curve);
-                    for end in [c + Vec2::new(-7.0, 5.0), c + Vec2::new(7.0, -5.0)] {
-                        painter.rect_filled(
-                            Rect::from_center_size(end, Vec2::splat(3.5)),
-                            0.0,
-                            text_color,
-                        );
-                    }
-                    x += 22.0;
-                }
-                painter.text(
-                    Pos2::new(x, row.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &l.name,
-                    egui::FontId::proportional(14.0),
-                    text_color,
-                );
-                for (offset, up) in [(46.0, true), (24.0, false)] {
-                    let r = Rect::from_center_size(
-                        Pos2::new(row.right() - offset + 10.0, row.center().y),
-                        Vec2::splat(18.0),
-                    );
-                    let arrow = ui
-                        .interact(
-                            r,
-                            ui.id().with(("layer-move", layer_id, up)),
-                            egui::Sense::click(),
-                        )
-                        .on_hover_text(if up {
-                            if english { "Move up" } else { "上へ" }
-                        } else if english {
-                            "Move down"
-                        } else {
-                            "下へ"
-                        });
-                    if arrow.hovered() {
-                        painter.rect_filled(r, 4.0, Color32::from_rgb(56, 57, 68));
-                    }
-                    let c = r.center();
-                    let points = if up {
-                        vec![
-                            c + Vec2::new(-4.5, 2.5),
-                            c + Vec2::new(4.5, 2.5),
-                            c + Vec2::new(0.0, -3.5),
-                        ]
-                    } else {
-                        vec![
-                            c + Vec2::new(-4.5, -2.5),
-                            c + Vec2::new(4.5, -2.5),
-                            c + Vec2::new(0.0, 3.5),
-                        ]
-                    };
-                    painter.add(egui::Shape::convex_polygon(
-                        points,
-                        Color32::from_gray(170),
-                        Stroke::NONE,
-                    ));
-                    if arrow.clicked() {
-                        move_to = if up { move_up_target } else { move_down_target };
-                        clicked_control = true;
-                    }
-                }
-                if response.clicked() && !clicked_control {
-                    select_layer = true;
-                }
-                // Where a dragged layer would land on this row: above or
-                // below it, or into a folder (the middle of its row, or
-                // its lower part when it is open).
-                if dragging.is_some()
-                    && !dragged_subtree.contains(&layer_id)
-                    && let Some(pointer) = pointer.filter(|p| row.contains(*p))
-                {
-                    use efude_canvas::LayerPlacement;
-                    let fraction = (pointer.y - row.top()) / row.height();
-                    let placement = if l.kind == LayerKind::Folder {
-                        if fraction < 0.3 {
-                            LayerPlacement::Above
-                        } else if fraction > 0.7 && !(l.expanded && has_children) {
-                            LayerPlacement::Below
-                        } else {
-                            LayerPlacement::Into
-                        }
-                    } else if fraction < 0.5 {
-                        LayerPlacement::Above
-                    } else {
-                        LayerPlacement::Below
-                    };
-                    let accent = Stroke::new(2.5, crate::layout::ACCENT);
-                    match placement {
-                        LayerPlacement::Above => {
-                            painter.line_segment([row.left_top(), row.right_top()], accent);
-                        }
-                        LayerPlacement::Below => {
-                            painter.line_segment([row.left_bottom(), row.right_bottom()], accent);
-                        }
-                        LayerPlacement::Into => {
-                            painter.rect_stroke(row, 7.0, accent, egui::StrokeKind::Inside);
-                        }
-                    }
-                    drop_target = Some((layer_id, placement));
-                }
-                if i == self.selected_layer {
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(34, 35, 42))
-                        .corner_radius(7.0)
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(if english { "Name" } else { "名前" });
-                                ui.text_edit_singleline(&mut l.name);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label(if english { "Opacity" } else { "不透明度" });
-                                ui.add(egui::Slider::new(&mut l.opacity, 0.0..=1.0));
-                            });
-                            egui::ComboBox::from_label(if english {
-                                "Parent Folder"
-                            } else {
-                                "親フォルダー"
-                            })
-                            .selected_text(parent_name)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(
-                                        l.parent_id.is_none(),
-                                        if english { "Top Level" } else { "最上位" },
-                                    )
-                                    .clicked()
-                                {
-                                    change_parent = Some(None);
-                                }
-                                for (folder_id, folder_name) in &folder_options {
-                                    if ui
-                                        .selectable_label(
-                                            l.parent_id == Some(*folder_id),
-                                            folder_name,
-                                        )
-                                        .clicked()
-                                    {
-                                        change_parent = Some(Some(*folder_id));
-                                    }
-                                }
-                            });
-                            egui::ComboBox::from_label(if english {
-                                "Blend Mode"
-                            } else {
-                                "合成"
-                            })
-                            .selected_text(blend_mode_name(l.blend, english))
-                            .show_ui(ui, |ui| {
-                                for (mode, japanese, english_name) in [
-                                    (BlendMode::Normal, "通常", "Normal"),
-                                    (BlendMode::Multiply, "乗算", "Multiply"),
-                                    (BlendMode::Screen, "スクリーン", "Screen"),
-                                    (BlendMode::Overlay, "オーバーレイ", "Overlay"),
-                                    (BlendMode::Darken, "比較（暗）", "Darken"),
-                                    (BlendMode::Lighten, "比較（明）", "Lighten"),
-                                    (BlendMode::ColorDodge, "覆い焼きカラー", "Color Dodge"),
-                                    (BlendMode::ColorBurn, "焼き込みカラー", "Color Burn"),
-                                    (BlendMode::HardLight, "ハードライト", "Hard Light"),
-                                    (BlendMode::SoftLight, "ソフトライト", "Soft Light"),
-                                    (BlendMode::Difference, "差の絶対値", "Difference"),
-                                    (BlendMode::Exclusion, "除外", "Exclusion"),
-                                    (BlendMode::Add, "加算", "Add"),
-                                    (BlendMode::Subtract, "減算", "Subtract"),
-                                ] {
-                                    ui.selectable_value(
-                                        &mut l.blend,
-                                        mode,
-                                        if english { english_name } else { japanese },
-                                    );
-                                }
-                            });
-                            ui.checkbox(
-                                &mut l.linear_blend,
-                                if english {
-                                    "Blend in Linear Space"
-                                } else {
-                                    "リニア空間で合成"
-                                },
-                            );
-                            ui.checkbox(&mut l.locked, if english { "Locked" } else { "ロック" });
-                            ui.checkbox(
-                                &mut l.clipping,
-                                if english {
-                                    "Clipping"
-                                } else {
-                                    "クリッピング"
-                                },
-                            );
-                            ui.checkbox(
-                                &mut l.sketch,
-                                if english { "Sketch Layer" } else { "下描き" },
-                            );
-                            ui.checkbox(
-                                &mut l.reference,
-                                if english {
-                                    "Reference Layer"
-                                } else {
-                                    "参照レイヤー"
-                                },
-                            );
-                            if l.is_vector()
-                                && ui
-                                    .button(if english {
-                                        "Rasterize"
-                                    } else {
-                                        "ラスタライズ"
-                                    })
-                                    .on_hover_text(if english {
-                                        "Turn the lines into pixels (a raster layer)"
-                                    } else {
-                                        "線を画素にして、ラスターレイヤーにします"
-                                    })
-                                    .clicked()
-                            {
-                                rasterize = Some(i);
-                            }
-                            if let Some(tone) = l.tone.as_mut() {
-                                ui.separator();
-                                ui.label(
-                                    egui::RichText::new(if english { "Tone" } else { "トーン" })
-                                        .strong(),
-                                );
-                                super::comic::tone_settings_ui(ui, tone, english);
-                            }
-                            if l.mask.is_none() {
-                                if ui
-                                    .button(if english {
-                                        "+ Layer Mask"
-                                    } else {
-                                        "＋ レイヤーマスク"
-                                    })
-                                    .clicked()
-                                {
-                                    change_mask = Some(true);
-                                }
-                            } else {
-                                ui.checkbox(
-                                    &mut self.editing_mask,
-                                    if english {
-                                        "Edit Mask"
-                                    } else {
-                                        "マスクを編集"
-                                    },
-                                );
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button(if english {
-                                            "Invert Mask"
-                                        } else {
-                                            "マスク反転"
-                                        })
-                                        .clicked()
-                                    {
-                                        mask_action = Some(0u8);
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.selection.active,
-                                            egui::Button::new(if english {
-                                                "From Selection"
-                                            } else {
-                                                "選択範囲から"
-                                            }),
-                                        )
-                                        .clicked()
-                                    {
-                                        mask_action = Some(1u8);
-                                    }
-                                });
-                                if ui
-                                    .button(if english {
-                                        "Remove Mask"
-                                    } else {
-                                        "マスクを削除"
-                                    })
-                                    .clicked()
-                                {
-                                    change_mask = Some(false);
-                                }
-                            }
-                        });
-                }
-            }
-            if select_layer {
-                self.select_layer(i);
-            }
-            if let Some(add_mask) = change_mask {
-                let mask = add_mask
-                    .then(|| efude_canvas::TilePixels::new(self.doc.width, self.doc.height));
-                self.history.set_layer_mask(&mut self.doc.layers, i, mask);
-                if !add_mask {
-                    self.editing_mask = false;
-                }
-            }
-            if let Some(action) = mask_action {
-                self.apply_layer_mask_action(i, action);
-            }
-            if let Some(new_parent) = change_parent {
-                self.doc.layers[i].parent_id = new_parent;
-            }
-            let property_after = self.doc.layers[i].property_state();
-            self.history
-                .record_layer_properties(layer_id, property_before, property_after);
-            if let Some((name, opacity, visible, blend)) = macro_before {
-                let layer = &self.doc.layers[i];
-                let mut steps = Vec::new();
-                if name != layer.name {
-                    steps.push(macros::Step::SetName {
-                        name: layer.name.clone(),
-                    });
-                }
-                if opacity != layer.opacity {
-                    steps.push(macros::Step::SetOpacity {
-                        value: layer.opacity,
-                    });
-                }
-                if visible != layer.visible {
-                    steps.push(macros::Step::SetVisibility {
-                        visible: layer.visible,
-                    });
-                }
-                if blend != layer.blend {
-                    steps.push(macros::Step::SetBlend { mode: layer.blend });
-                }
-                for step in steps {
-                    self.record_macro_step(step, layer_id);
-                }
-            }
-            if let Some(j) = move_to {
-                let selected_id = self.doc.layers[self.selected_layer].id;
-                if let Some(new_index) = self.history.move_layer_subtree(&mut self.doc.layers, i, j)
-                {
-                    self.selected_layer = if selected_id == layer_id {
-                        new_index
-                    } else {
-                        self.doc
-                            .layers
-                            .iter()
-                            .position(|layer| layer.id == selected_id)
-                            .unwrap_or(new_index)
-                    };
-                }
-            }
-        }
-        if let Some(index) = rasterize {
-            self.rasterize_layer(index);
-        }
-        if let Some(id) = dragging {
-            let ctx = ui.ctx().clone();
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            if let (Some(pointer), Some(layer)) =
-                (pointer, self.doc.layers.iter().find(|layer| layer.id == id))
-            {
-                let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Tooltip,
-                    egui::Id::new("layer-drag"),
-                ));
-                let text = painter.layout_no_wrap(
-                    layer.name.clone(),
-                    egui::FontId::proportional(14.0),
-                    Color32::from_rgb(235, 235, 245),
-                );
-                let rect = Rect::from_min_size(
-                    pointer + Vec2::new(14.0, 6.0),
-                    text.size() + Vec2::new(16.0, 8.0),
-                );
-                painter.rect_filled(rect, 6.0, Color32::from_rgba_unmultiplied(40, 42, 54, 230));
-                painter.galley(rect.min + Vec2::new(8.0, 4.0), text, Color32::WHITE);
-            }
-            if ctx.input(|input| input.pointer.any_released() || !input.pointer.any_down()) {
-                self.layer_drag = None;
-                if let Some((target, placement)) = drop_target {
-                    let selected = self.doc.layers.get(self.selected_layer).map(|l| l.id);
-                    if self
-                        .history
-                        .place_layer(&mut self.doc.layers, id, target, placement)
-                    {
-                        if let Some(index) =
-                            selected.and_then(|s| self.doc.layers.iter().position(|l| l.id == s))
-                        {
-                            self.selected_layer = index;
-                        }
-                        self.canvas_texture_dirty = true;
-                    }
-                }
-            }
-        }
-    }
-
     /// Replaces the document with a blank canvas of the size in the canvas
     /// inputs (the caller has confirmed discarding unsaved changes). Returns
     /// false if the size is invalid.
     pub(crate) fn new_document(&mut self) -> bool {
+        self.pending_merge = None;
+        self.confirm_layer_clear = false;
+        self.cancel_studio_session();
+        self.thumbnails.clear();
+        self.studio.last_brush_point = None;
         if !efude_canvas::valid_document_dimensions(
             self.canvas_width_input,
             self.canvas_height_input,

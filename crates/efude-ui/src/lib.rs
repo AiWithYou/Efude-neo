@@ -245,6 +245,7 @@ fn run_filter(
     operation: FilterOperation,
     origin: (i64, i64),
 ) {
+    let original = layer.alpha_lock.then(|| layer.pixels.clone());
     match operation {
         FilterOperation::AutoLevels => efude_canvas::auto_levels(layer),
         FilterOperation::Levels {
@@ -279,6 +280,9 @@ fn run_filter(
             filter.apply(&mut dense, width as usize, height as usize, origin);
             layer.pixels = efude_canvas::TilePixels::from_dense(width, height, &dense);
         }
+    }
+    if let Some(original) = original {
+        efude_canvas::filters::restore_locked_alpha(&mut layer.pixels, &original);
     }
 }
 
@@ -613,6 +617,23 @@ fn dynamic_source_name(source: DynamicSource, english: bool) -> &'static str {
         }
     }
 }
+const BLEND_MODES: [BlendMode; 14] = [
+    BlendMode::Normal,
+    BlendMode::Multiply,
+    BlendMode::Screen,
+    BlendMode::Overlay,
+    BlendMode::Darken,
+    BlendMode::Lighten,
+    BlendMode::ColorDodge,
+    BlendMode::ColorBurn,
+    BlendMode::HardLight,
+    BlendMode::SoftLight,
+    BlendMode::Difference,
+    BlendMode::Exclusion,
+    BlendMode::Add,
+    BlendMode::Subtract,
+];
+
 fn blend_mode_name(mode: BlendMode, english: bool) -> &'static str {
     let names = match mode {
         BlendMode::Normal => ("通常", "Normal"),
@@ -637,6 +658,12 @@ fn localize_io_warning(warning: &str, english: bool) -> String {
         return warning.to_owned();
     }
     match warning {
+        "透明ピクセルのロック設定はPSDに保存されません" => {
+            "PSD does not preserve transparent pixel locks.".into()
+        }
+        "レイヤーカラーを画素に焼き込みました" => {
+            "Layer colors were baked into the pixels.".into()
+        }
         "リニア合成設定はPSDに保存されません" => {
             "Linear-light blending is not preserved in PSD.".into()
         }
@@ -861,6 +888,9 @@ struct ShortcutSettings {
     perspective_ruler_tool: String,
     selection_brush_tool: String,
     quick_mask_tool: String,
+    gradient_tool: String,
+    shape_tool: String,
+    crop_tool: String,
 }
 impl Default for ShortcutSettings {
     fn default() -> Self {
@@ -885,14 +915,17 @@ impl Default for ShortcutSettings {
             ellipse_tool: "9".into(),
             lasso_tool: "Q".into(),
             polygon_tool: "W".into(),
-            magic_wand_tool: "R".into(),
+            magic_wand_tool: "M".into(),
             color_range_tool: "T".into(),
             line_ruler_tool: "Y".into(),
             ellipse_ruler_tool: "U".into(),
             bezier_ruler_tool: "I".into(),
             perspective_ruler_tool: "O".into(),
             selection_brush_tool: "G".into(),
-            quick_mask_tool: "H".into(),
+            quick_mask_tool: "K".into(),
+            gradient_tool: "F".into(),
+            shape_tool: "S".into(),
+            crop_tool: "C".into(),
         }
     }
 }
@@ -921,6 +954,9 @@ enum Tool {
     SelectionBrush,
     QuickMask,
     Eraser,
+    Gradient,
+    Shape,
+    Crop,
     /// Edits the Bézier curves of vector lines.
     VectorEdit,
 }
@@ -1084,8 +1120,8 @@ pub struct EfudeApp {
     selected_brush: usize,
     selected_layer: usize,
     editing_mask: bool,
-    color: Color32,
-    secondary_color: Color32,
+    color: [u8; 4],
+    secondary_color: [u8; 4],
     intermediate_mix: f32,
     palette: Vec<[u8; 4]>,
     show_tools_panel: bool,
@@ -1202,6 +1238,7 @@ pub struct EfudeApp {
     navigator_center: Vec2,
     navigator_texture: Option<egui::TextureHandle>,
     canvas_texture: Option<egui::TextureHandle>,
+    canvas_region: Option<shape_gradient::PreviewRegion>,
     cpu_mips: display::CpuMips,
     /// Last canvas view: its screen area, the fit scale and points per pixel.
     canvas_viewport: (Rect, f32, f32),
@@ -1266,6 +1303,27 @@ pub struct EfudeApp {
     recording_stroke: bool,
     status: String,
     logo: Option<egui::TextureHandle>,
+    hue_cache: f32,
+    saturation_cache: f32,
+    sv_texture: Option<(f32, egui::TextureHandle)>,
+    hsv_sliders: bool,
+    hex_edit: String,
+    hex_focused: bool,
+    recent_colors: Vec<[u8; 4]>,
+    brush_search: String,
+    brush_category: usize,
+    thumbnails: std::collections::HashMap<
+        u64,
+        (
+            u64,
+            Option<egui::TextureHandle>,
+            Option<egui::TextureHandle>,
+        ),
+    >,
+    pending_merge: Option<(bool, u64, u64, efude_canvas::MergeAppearanceReason)>,
+    confirm_layer_clear: bool,
+    studio: shape_gradient::DrawingTools,
+    transform_session: Option<transform::TransformSession>,
     color_wheel: Option<egui::TextureHandle>,
     reference_image: Option<egui::TextureHandle>,
     reference_image_path: Option<std::path::PathBuf>,
@@ -1577,6 +1635,9 @@ impl Default for EfudeApp {
                                             continue;
                                         }
                                         let old = before.pixel(x, y);
+                                        if layer.alpha_lock && old[3] == 0 {
+                                            continue;
+                                        }
                                         let filtered = pixels.pixel(x, y);
                                         let result = blend_selection_pixel(old, filtered, coverage);
                                         pixels.set_pixel(x, y, result);
@@ -1603,8 +1664,8 @@ impl Default for EfudeApp {
             selected_brush: 0,
             selected_layer: 0,
             editing_mask: false,
-            color: Color32::from_rgb(35, 35, 42),
-            secondary_color: Color32::WHITE,
+            color: [35, 35, 42, 255],
+            secondary_color: [255; 4],
             intermediate_mix: 0.5,
             palette: vec![
                 [35, 35, 42, 255],
@@ -1704,6 +1765,7 @@ impl Default for EfudeApp {
             navigator_center: Vec2::new(600., 450.),
             navigator_texture: None,
             canvas_texture: None,
+            canvas_region: None,
             cpu_mips: display::CpuMips::default(),
             canvas_viewport: (Rect::NOTHING, 1.0, 1.0),
             window_checked: false,
@@ -1765,6 +1827,20 @@ impl Default for EfudeApp {
             recording_stroke: false,
             status: "新しいキャンバス".into(),
             logo: None,
+            hue_cache: 0.,
+            saturation_cache: 0.,
+            sv_texture: None,
+            hsv_sliders: false,
+            hex_edit: String::new(),
+            hex_focused: false,
+            recent_colors: Vec::new(),
+            brush_search: String::new(),
+            brush_category: 0,
+            pending_merge: None,
+            confirm_layer_clear: false,
+            thumbnails: Default::default(),
+            studio: Default::default(),
+            transform_session: None,
             color_wheel: None,
             reference_image: None,
             reference_image_path: None,
@@ -1872,6 +1948,10 @@ impl EfudeApp {
         }
     }
     fn select_layer(&mut self, index: usize) {
+        if index != self.selected_layer {
+            self.cancel_studio_session();
+            self.studio.last_brush_point = None;
+        }
         self.finish_pending_canvas_gesture();
         self.selected_layer = index.min(self.doc.layers.len().saturating_sub(1));
         self.editing_mask = false;
@@ -1993,6 +2073,7 @@ impl EfudeApp {
                 linear_blend: false,
                 clipping: false,
                 background: true,
+                layer_color: None,
             });
         }
         for layer in self
@@ -2059,7 +2140,7 @@ impl EfudeApp {
                 BlendMode::Subtract => 13,
             };
             gpu_layers.push(efude_gpu::GpuCompositeLayer {
-                pixels: efude_canvas::display_tile(
+                pixels: efude_canvas::tone_display_tile(
                     layer,
                     self.doc.dpi,
                     tile_x,
@@ -2074,6 +2155,7 @@ impl EfudeApp {
                 linear_blend: layer.linear_blend,
                 clipping: layer.clipping,
                 background: false,
+                layer_color: layer.layer_color,
             });
         }
         if gpu_layers.len() > 200 {
@@ -2424,9 +2506,17 @@ impl EfudeApp {
         format!("{}.efude", if safe.is_empty() { "Artwork" } else { safe })
     }
     fn request_native_save(&mut self, ctx: &egui::Context) -> Result<bool, String> {
-        let Some(path) = self.choose_native_save_path() else {
+        self.save_to_chosen_path(self.choose_native_save_path(), ctx)
+    }
+    fn save_to_chosen_path(
+        &mut self,
+        path: Option<std::path::PathBuf>,
+        ctx: &egui::Context,
+    ) -> Result<bool, String> {
+        let Some(path) = path else {
             return Ok(false);
         };
+        self.cancel_studio_session();
         self.finish_pending_canvas_gesture();
         self.commit_pending_guide_edit();
         self.queue_document_save(path, false, ctx)?;
@@ -2520,6 +2610,11 @@ impl EfudeApp {
     }
     /// Puts `document` in the active tab, discarding what was there.
     fn replace_document(&mut self, document: Document, path: Option<std::path::PathBuf>) {
+        self.pending_merge = None;
+        self.confirm_layer_clear = false;
+        self.cancel_studio_session();
+        self.thumbnails.clear();
+        self.studio.last_brush_point = None;
         if let Some(slot) = self.tabs.slots.get_mut(self.tabs.active) {
             slot.recovered_title = None;
         }
@@ -2804,18 +2899,8 @@ impl EfudeApp {
             // Start with the tool that draws with the remembered brush.
             app.tool = tool_for_brush(app.brushes[app.selected_brush].kind);
             app.last_tool = app.tool;
-            app.color = Color32::from_rgba_unmultiplied(
-                settings.color[0],
-                settings.color[1],
-                settings.color[2],
-                settings.color[3],
-            );
-            app.secondary_color = Color32::from_rgba_unmultiplied(
-                settings.secondary_color[0],
-                settings.secondary_color[1],
-                settings.secondary_color[2],
-                settings.secondary_color[3],
-            );
+            app.color = settings.color;
+            app.secondary_color = settings.secondary_color;
             app.intermediate_mix =
                 finite_clamp(settings.intermediate_mix, 0.0, 1.0, app.intermediate_mix);
             if !settings.palette.is_empty() {
@@ -3175,7 +3260,7 @@ impl EfudeApp {
     /// Starts the grain of a stroke at `origin`; brushes whose canvas grain
     /// turns with every stroke get a new random angle.
     fn begin_grain(&mut self, origin: glam::Vec2) {
-        self.raster.grain_origin = origin;
+        self.raster.set_grain_origin(origin);
         let brush = &self.brushes[self.selected_brush];
         self.raster.grain_rotation = if brush.grain_fixed && brush.grain_random_rotation {
             // xorshift64*: a new angle for every stroke.
@@ -3199,6 +3284,7 @@ impl EfudeApp {
         if self.tool == self.last_tool {
             return;
         }
+        self.cancel_studio_session();
         let previous = self.last_tool;
         self.last_tool = self.tool;
         if let Some(brush) = self.brushes.get_mut(self.selected_brush) {
@@ -3243,6 +3329,9 @@ impl EfudeApp {
 
     /// Starts a move of the selected pixels (or the whole layer).
     fn begin_move(&mut self, start: (i32, i32)) {
+        if self.refuse_mask_edit() || self.refuse_alpha_edit() {
+            return;
+        }
         let index = self.selected_layer;
         let layer = &self.doc.layers[index];
         if layer.locked || self.is_reference_layer(index) || layer.kind != LayerKind::Raster {
@@ -3472,31 +3561,8 @@ impl EfudeApp {
         self.last_tool = tool;
     }
 
-    fn quick_brush_controls(&mut self, ui: &mut egui::Ui) {
+    fn input_diagnostics_ui(&self, ui: &mut egui::Ui) {
         let english = self.language_english;
-        let name = self.brushes[self.selected_brush].name.clone();
-        ui.label(egui::RichText::new(name).strong());
-        ui.add(
-            egui::Slider::new(&mut self.size, 1.0..=MAX_BRUSH_SIZE)
-                .logarithmic(true)
-                .text(if english { "Size" } else { "サイズ" }),
-        );
-        let brush = &mut self.brushes[self.selected_brush];
-        brush.size = self.size;
-        ui.add(
-            egui::Slider::new(&mut brush.opacity, 0.01..=1.0).text(if english {
-                "Opacity"
-            } else {
-                "不透明度"
-            }),
-        );
-        ui.add(
-            egui::Slider::new(&mut brush.stabilization, 0..=15).text(if english {
-                "Stabilization"
-            } else {
-                "手ブレ補正"
-            }),
-        );
         let d = self.input_diagnostics;
         let source = if self.use_wintab {
             "WinTab"
@@ -3779,91 +3845,40 @@ impl EfudeApp {
         }
         self.tool = tool;
     }
+    fn tool_bindings(&self) -> [(egui::Key, Tool); 23] {
+        use egui::Key;
+        let keys = &self.shortcuts;
+        [
+            (&keys.crop_tool, Key::C, Tool::Crop),
+            (&keys.shape_tool, Key::S, Tool::Shape),
+            (&keys.gradient_tool, Key::F, Tool::Gradient),
+            (&keys.brush_tool, Key::Num1, Tool::Brush),
+            (&keys.rectangle_tool, Key::Num2, Tool::RectangleSelect),
+            (&keys.fill_tool, Key::Num3, Tool::Fill),
+            (&keys.eyedropper_tool, Key::Num4, Tool::Eyedropper),
+            (&keys.move_tool, Key::Num5, Tool::Move),
+            (&keys.pan_tool, Key::Num6, Tool::Pan),
+            (&keys.blur_tool, Key::Num7, Tool::Blur),
+            (&keys.smudge_tool, Key::Num8, Tool::Smudge),
+            (&keys.ellipse_tool, Key::Num9, Tool::EllipseSelect),
+            (&keys.lasso_tool, Key::Q, Tool::LassoSelect),
+            (&keys.polygon_tool, Key::W, Tool::PolygonSelect),
+            (&keys.magic_wand_tool, Key::M, Tool::MagicWand),
+            (&keys.color_range_tool, Key::T, Tool::ColorRange),
+            (&keys.line_ruler_tool, Key::Y, Tool::Line),
+            (&keys.ellipse_ruler_tool, Key::U, Tool::EllipseRuler),
+            (&keys.bezier_ruler_tool, Key::I, Tool::BezierRuler),
+            (&keys.perspective_ruler_tool, Key::O, Tool::PerspectiveRuler),
+            (&keys.selection_brush_tool, Key::G, Tool::SelectionBrush),
+            (&keys.quick_mask_tool, Key::K, Tool::QuickMask),
+            (&keys.eraser, Key::E, Tool::Eraser),
+        ]
+        .map(|(setting, fallback, tool)| (Self::configured_key(setting, fallback), tool))
+    }
+
     fn conflicting_tool_keys(&self) -> std::collections::HashSet<egui::Key> {
-        let bindings = [
-            (
-                Self::configured_key(&self.shortcuts.eraser, egui::Key::E),
-                "eraser",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.brush_tool, egui::Key::Num1),
-                "brush",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.rectangle_tool, egui::Key::Num2),
-                "rectangle",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.fill_tool, egui::Key::Num3),
-                "fill",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.eyedropper_tool, egui::Key::Num4),
-                "eyedropper",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.move_tool, egui::Key::Num5),
-                "move",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.pan_tool, egui::Key::Num6),
-                "pan",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.blur_tool, egui::Key::Num7),
-                "blur",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.smudge_tool, egui::Key::Num8),
-                "smudge",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.ellipse_tool, egui::Key::Num9),
-                "ellipse",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.lasso_tool, egui::Key::Q),
-                "lasso",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.polygon_tool, egui::Key::W),
-                "polygon",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.magic_wand_tool, egui::Key::R),
-                "wand",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.color_range_tool, egui::Key::T),
-                "color range",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.line_ruler_tool, egui::Key::Y),
-                "line ruler",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.ellipse_ruler_tool, egui::Key::U),
-                "ellipse ruler",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.bezier_ruler_tool, egui::Key::I),
-                "bezier ruler",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.perspective_ruler_tool, egui::Key::O),
-                "perspective ruler",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.selection_brush_tool, egui::Key::G),
-                "selection brush",
-            ),
-            (
-                Self::configured_key(&self.shortcuts.quick_mask_tool, egui::Key::H),
-                "quick mask",
-            ),
-        ];
         let mut counts = std::collections::HashMap::new();
-        for (key, _) in bindings {
+        for (key, _) in self.tool_bindings() {
             *counts.entry(key).or_insert(0usize) += 1;
         }
         counts
@@ -3935,6 +3950,26 @@ impl EfudeApp {
         }
         points
     }
+    fn symmetric_paint_dabs(
+        &self,
+        mut point: InkPoint,
+        dynamics: efude_brush::engine::Dynamics,
+    ) -> impl Iterator<Item = (InkPoint, efude_brush::engine::Dynamics)> + use<> {
+        let follow =
+            !self.editing_mask && self.brushes[self.selected_brush].follow_stroke_direction;
+        // Reflect or rotate the tangent with the same transform as its point.
+        if follow {
+            point.rotation = self.raster.direction_angle(&point).unwrap_or(0.);
+        }
+        self.symmetric_points(point).into_iter().map(move |p| {
+            let mut d = dynamics;
+            if follow {
+                d.direction_angle = Some(p.rotation);
+            }
+            (p, d)
+        })
+    }
+
     fn apply_selection_symmetry(&mut self) {
         if !self.selection.active
             || (!self.symmetry_x && !self.symmetry_y && self.symmetry_count <= 1)
@@ -4077,6 +4112,7 @@ impl EfudeApp {
         );
     }
     fn change_selection(&mut self, change: impl FnOnce(&mut Selection, u32, u32)) {
+        self.cancel_studio_session();
         self.finish_pending_canvas_gesture();
         let before_active = self.selection.active;
         let before = self.selection.mask.clone();
@@ -4119,12 +4155,7 @@ impl EfudeApp {
             eraser: self.tool == Tool::Eraser
                 || matches!(kind, BrushKind::Eraser)
                 || self.erases_with_transparent_color(kind),
-            color: [
-                self.color.r(),
-                self.color.g(),
-                self.color.b(),
-                self.color.a(),
-            ],
+            color: self.color,
             size: self.size,
         };
         if !paintable || !efude_brush::engine::accelerator_can_paint(style) {
@@ -4144,8 +4175,11 @@ impl EfudeApp {
                 self.raster.last_dab,
                 self.view_scale,
             );
-            for mirrored in self.symmetric_points(p) {
-                stamps.push((mirrored, dynamics));
+            for (mirrored, dynamics) in self.symmetric_paint_dabs(p, dynamics) {
+                stamps.push((
+                    mirrored,
+                    self.raster.prepare_dynamics(style, &mirrored, dynamics),
+                ));
             }
             self.raster.finish_dab(style, p);
         }
@@ -4213,7 +4247,7 @@ impl EfudeApp {
             self.raster.last_dab = Some(p);
             return;
         }
-        for point in self.symmetric_points(p) {
+        for (point, dynamics) in self.symmetric_paint_dabs(p, dynamics) {
             self.dab_one(point, &dynamics);
         }
         let brush = &self.brushes[self.selected_brush];
@@ -4498,12 +4532,7 @@ impl EfudeApp {
             eraser: self.tool == Tool::Eraser
                 || matches!(kind, BrushKind::Eraser)
                 || self.erases_with_transparent_color(kind),
-            color: [
-                self.color.r(),
-                self.color.g(),
-                self.color.b(),
-                self.color.a(),
-            ],
+            color: self.color,
             size: self.size,
         };
         let mut target = efude_brush::engine::DabTarget {
@@ -4549,7 +4578,7 @@ impl EfudeApp {
         let target = if eraser {
             0.0
         } else {
-            ((self.color.r() as u16 + self.color.g() as u16 + self.color.b() as u16) / 3) as f32
+            ((self.color[0] as u16 + self.color[1] as u16 + self.color[2] as u16) / 3) as f32
         };
         for y in top..=bottom {
             for x in left..=right {
@@ -4636,6 +4665,19 @@ impl EfudeApp {
         }
     }
     fn apply_transform(&mut self, sx: f32, sy: f32, angle: f32) {
+        let Some(params) = efude_canvas::AffineTransform::validated(
+            [sx, sy],
+            angle,
+            [0.; 2],
+            &self.doc.layers[self.selected_layer],
+        ) else {
+            self.invalid_transform_status();
+            return;
+        };
+        let ([sx, sy], angle, _) = params.components();
+        if self.refuse_mask_edit() || self.refuse_alpha_edit() {
+            return;
+        }
         self.finish_pending_canvas_gesture();
         if self.doc.layers[self.selected_layer].locked
             || self.is_reference_layer(self.selected_layer)
@@ -4669,6 +4711,9 @@ impl EfudeApp {
         self.history.commit();
     }
     fn apply_mesh_warp(&mut self) {
+        if self.refuse_mask_edit() || self.refuse_alpha_edit() {
+            return;
+        }
         self.finish_pending_canvas_gesture();
         if self.refuse_on_vector_layer() {
             return;
@@ -4809,6 +4854,9 @@ impl EfudeApp {
         self.canvas_texture_dirty = true;
     }
     fn clear_pixels(&mut self, bounds: (i32, i32, i32, i32), cw: u32, ch: u32) {
+        if self.refuse_mask_edit() || self.refuse_alpha_edit() {
+            return;
+        }
         let w = self.doc.width;
         {
             self.history.begin();
@@ -4842,7 +4890,34 @@ impl EfudeApp {
             self.history.commit();
         }
     }
+    fn refuse_mask_edit(&mut self) -> bool {
+        if self.editing_mask {
+            self.status = self
+                .text(
+                    "絵のサムネイルを選択してください",
+                    "Select the paint thumbnail to use this operation",
+                )
+                .into();
+        }
+        self.editing_mask
+    }
+    fn refuse_alpha_edit(&mut self) -> bool {
+        let locked = self.doc.layers[self.selected_layer].alpha_lock
+            && !self.doc.layers[self.selected_layer].is_vector();
+        if locked {
+            self.status = self
+                .text(
+                    "透明ピクセルのロックを解除してください",
+                    "Unlock transparent pixels to use this operation",
+                )
+                .into();
+        }
+        locked
+    }
     fn paste_clipboard(&mut self, ctx: &egui::Context) {
+        if self.refuse_mask_edit() {
+            return;
+        }
         if self.refuse_on_vector_layer() {
             return;
         }
@@ -4883,19 +4958,38 @@ impl EfudeApp {
         if self.selection.active {
             self.change_selection(|selection, _, _| selection.clear());
         }
-        self.paste_preview = Some((w, h, pixels, Vec2::new(ox as f32, oy as f32)));
-        if let Some((w, h, pixels, _)) = &self.paste_preview {
-            let mut rgba = vec![0u8; pixels.len()];
-            for (source, target) in pixels.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
-                target.copy_from_slice(source);
-                target[3] = (target[3] as f32 * 0.7) as u8;
+        let region = shape_gradient::PreviewRegion::new(
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32)),
+            1.,
+            self.max_texture_side(ctx).min(2048),
+        );
+        let [pw, ph] = region.size;
+        let mut samples = Vec::with_capacity(pw * ph);
+        for y in 0..ph {
+            let sy = ((2 * y + 1) as u64 * u64::from(h) / (2 * ph) as u64) as usize;
+            for x in 0..pw {
+                let sx = ((2 * x + 1) as u64 * u64::from(w) / (2 * pw) as u64) as usize;
+                let i = 4 * (sy * w as usize + sx);
+                samples.push(Color32::from_rgba_unmultiplied(
+                    pixels[i],
+                    pixels[i + 1],
+                    pixels[i + 2],
+                    (f32::from(pixels[i + 3]) * 0.7) as u8,
+                ));
             }
-            let image = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], &rgba);
-            self.paste_texture =
-                Some(ctx.load_texture("paste-preview", image, egui::TextureOptions::LINEAR));
         }
+        let image = egui::ColorImage {
+            size: region.size,
+            pixels: samples,
+        };
+        self.paste_texture =
+            Some(ctx.load_texture("paste-preview", image, egui::TextureOptions::LINEAR));
+        self.paste_preview = Some((w, h, pixels, Vec2::new(ox as f32, oy as f32)));
     }
     fn commit_paste_preview(&mut self) {
+        if self.refuse_mask_edit() {
+            return;
+        }
         if self.paste_preview.is_none() {
             return;
         }
@@ -4951,28 +5045,15 @@ impl EfudeApp {
                 } else {
                     1.0
                 };
-                let source_alpha = pixels[si + 3] as f32 / 255.0 * selection_coverage;
-                if source_alpha <= 0.0 {
+                let layer = &self.doc.layers[self.selected_layer];
+                let base = layer.pixels.pixel(x_doc, y_doc);
+                let src = pixels[si..si + 4].try_into().unwrap();
+                let output =
+                    efude_canvas::paint_over(base, src, selection_coverage, layer.alpha_lock);
+                if output == base {
                     continue;
                 }
-                let l = &self.doc.layers[self.selected_layer];
-                for c in 0..4 {
-                    self.history.record_pixel(l, i + c);
-                }
-                let destination = self.doc.layers[self.selected_layer]
-                    .pixels
-                    .pixel(x_doc, y_doc);
-                let destination_alpha = destination[3] as f32 / 255.0;
-                let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
-                let mut output = [0u8; 4];
-                for channel in 0..3 {
-                    output[channel] = ((pixels[si + channel] as f32 * source_alpha
-                        + destination[channel] as f32 * destination_alpha * (1.0 - source_alpha))
-                        / output_alpha)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                }
-                output[3] = (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+                self.history.record_pixel(layer, i);
                 self.doc.layers[self.selected_layer]
                     .pixels
                     .set_pixel(x_doc, y_doc, output);
@@ -4982,6 +5063,14 @@ impl EfudeApp {
     }
     fn finish_stroke(&mut self) {
         let points = std::mem::take(&mut self.active);
+        if matches!(self.tool, Tool::Brush | Tool::Eraser)
+            && let Some(last) = points.last()
+        {
+            self.studio.last_brush_point = Some((
+                self.doc.layers[self.selected_layer].id,
+                Vec2::new(last.position.x, last.position.y),
+            ));
+        }
         self.stabilized_cursor = None;
         self.preview_cursor_estimate = None;
         if let Some(mut builder) = self.stroke_builder.take() {
@@ -4993,7 +5082,7 @@ impl EfudeApp {
             if points.is_empty() {
                 self.rollback_vector_stroke();
                 self.vector_live = None;
-                self.history.commit();
+                self.commit_brush_history();
                 self.reset_stroke_buffers();
                 return;
             }
@@ -5010,14 +5099,14 @@ impl EfudeApp {
             self.doc.layers[self.selected_layer]
                 .pixels
                 .prune_empty_tiles();
-            self.history.commit();
+            self.commit_brush_history();
             self.reset_stroke_buffers();
             self.status = self.text("描画しました", "Painted").into();
             self.fall_back_to_wintab_if_ink_is_silent();
             return;
         }
         if points.is_empty() {
-            self.history.commit();
+            self.commit_brush_history();
             self.reset_stroke_buffers();
             return;
         }
@@ -5030,9 +5119,9 @@ impl EfudeApp {
         let spaced = self.offline_stroke_dabs(&points);
         self.raster.last_dab = None;
         self.raster.previous_mix_color = [
-            self.color.r() as f32 / 255.,
-            self.color.g() as f32 / 255.,
-            self.color.b() as f32 / 255.,
+            self.color[0] as f32 / 255.,
+            self.color[1] as f32 / 255.,
+            self.color[2] as f32 / 255.,
         ];
         self.raster.remaining_charge = self.brushes[self.selected_brush].mix.charge;
         self.dab_many(&spaced);
@@ -5041,7 +5130,7 @@ impl EfudeApp {
         self.doc.layers[self.selected_layer]
             .pixels
             .prune_empty_tiles();
-        self.history.commit();
+        self.commit_brush_history();
         self.reset_stroke_buffers();
         self.status = self.text("描画しました", "Painted").into();
     }
@@ -5079,9 +5168,9 @@ impl EfudeApp {
         self.active.clear();
         self.history.begin();
         self.raster.previous_mix_color = [
-            self.color.r() as f32 / 255.,
-            self.color.g() as f32 / 255.,
-            self.color.b() as f32 / 255.,
+            self.color[0] as f32 / 255.,
+            self.color[1] as f32 / 255.,
+            self.color[2] as f32 / 255.,
         ];
         self.raster.last_dab = None;
         self.raster.remaining_charge = self.brushes[self.selected_brush].mix.charge;
@@ -5108,15 +5197,12 @@ impl EfudeApp {
     fn canvas_position(&self, pos: Pos2, rect: Rect, scale: f32) -> Vec2 {
         self.document_position(pos, rect, scale)
     }
-    fn sample_eyedropper(&self, x: i32, y: i32) -> Option<Color32> {
+    fn sample_eyedropper(&self, x: i32, y: i32) -> Option<[u8; 4]> {
         if x < 0 || y < 0 || x >= self.doc.width as i32 || y >= self.doc.height as i32 {
             return None;
         }
-        let pixels = if self.eyedropper_composite {
-            efude_canvas::composite_transparent(&self.doc)
-        } else {
-            self.doc.layers[self.selected_layer].pixels.to_dense()
-        };
+        let mut tiles = std::collections::HashMap::new();
+        let layer = &self.doc.layers[self.selected_layer];
         let radius = self.eyedropper_radius as i32;
         let mut rgb = [0u64; 3];
         let mut alpha = 0u64;
@@ -5124,10 +5210,23 @@ impl EfudeApp {
         let mut rgb_weight = 0u64;
         for sy in (y - radius).max(0)..=(y + radius).min(self.doc.height as i32 - 1) {
             for sx in (x - radius).max(0)..=(x + radius).min(self.doc.width as i32 - 1) {
-                let i = ((sy as u32 * self.doc.width + sx as u32) * 4) as usize;
-                let a = pixels[i + 3] as u64;
+                let (sx, sy) = (sx as u32, sy as u32);
+                let pixel = if self.eyedropper_composite {
+                    let side = efude_canvas::TILE_SIZE;
+                    let tile = tiles
+                        .entry((sx / side, sy / side))
+                        .or_insert_with_key(|&(x, y)| {
+                            efude_canvas::composite_tile_transparent(&self.doc, x, y)
+                        });
+                    let (w, _, rgba) = tile.as_ref()?;
+                    let i = (((sy % side) * w + sx % side) * 4) as usize;
+                    rgba[i..i + 4].try_into().ok()?
+                } else {
+                    layer.pixels.pixel(sx, sy)
+                };
+                let a = u64::from(pixel[3]);
                 for c in 0..3 {
-                    rgb[c] += pixels[i + c] as u64 * a;
+                    rgb[c] += u64::from(pixel[c]) * a;
                 }
                 rgb_weight += a;
                 alpha += a;
@@ -5137,12 +5236,12 @@ impl EfudeApp {
         if samples == 0 {
             return None;
         }
-        Some(Color32::from_rgba_unmultiplied(
+        Some([
             rgb[0].checked_div(rgb_weight).unwrap_or(0) as u8,
             rgb[1].checked_div(rgb_weight).unwrap_or(0) as u8,
             rgb[2].checked_div(rgb_weight).unwrap_or(0) as u8,
             (alpha / samples) as u8,
-        ))
+        ])
     }
     fn render_replay(&mut self, points: &[InkPoint]) {
         self.reset_stroke_buffers();
@@ -5151,9 +5250,9 @@ impl EfudeApp {
         }
         let replay = self.offline_stroke_dabs(points);
         self.raster.previous_mix_color = [
-            self.color.r() as f32 / 255.0,
-            self.color.g() as f32 / 255.0,
-            self.color.b() as f32 / 255.0,
+            self.color[0] as f32 / 255.0,
+            self.color[1] as f32 / 255.0,
+            self.color[2] as f32 / 255.0,
         ];
         self.raster.remaining_charge = self.brushes[self.selected_brush].mix.charge;
         self.raster.last_dab = None;
@@ -5220,12 +5319,7 @@ impl EfudeApp {
         let replacement = if self.transparent_color {
             [0; 4]
         } else {
-            [
-                self.color.r(),
-                self.color.g(),
-                self.color.b(),
-                self.color.a(),
-            ]
+            self.color
         };
         if self.fill_reference_mode == 0 && seed == replacement {
             return;
@@ -5288,7 +5382,7 @@ impl EfudeApp {
         }
         let seed_index = (y * w + x) as usize;
         if !inside[seed_index] {
-            self.history.commit();
+            self.commit_paint_history("塗りつぶし", "Fill");
             return;
         }
         let mut queue = std::collections::VecDeque::from([seed_index]);
@@ -5307,14 +5401,17 @@ impl EfudeApp {
                 continue;
             }
             let i = pi * 4;
-            for c in 0..4 {
-                self.history
-                    .record_pixel(&self.doc.layers[self.selected_layer], i + c);
+            let layer = &mut self.doc.layers[self.selected_layer];
+            let before = layer.pixels.pixel(pi as u32 % w, pi as u32 / w);
+            let mut output = blend_selection_pixel(before, replacement, coverage);
+            if layer.alpha_lock {
+                output[3] = before[3];
             }
-            let pixels = &mut self.doc.layers[self.selected_layer].pixels;
-            let before = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
-            let output = blend_selection_pixel(before, replacement, coverage);
-            pixels[i..i + 4].copy_from_slice(&output);
+            if !(layer.alpha_lock && (self.transparent_color || before[3] == 0)) && output != before
+            {
+                self.history.record_pixel(layer, i);
+                layer.pixels[i..i + 4].copy_from_slice(&output);
+            }
             let cx = pi % w as usize;
             let cy = pi / w as usize;
             if cx > 0 {
@@ -5330,9 +5427,12 @@ impl EfudeApp {
                 queue.push_back(pi + w as usize);
             }
         }
-        self.history.commit();
+        self.commit_paint_history("塗りつぶし", "Fill");
     }
     fn merge_visible_layers(&mut self) {
+        self.merge_visible(false);
+    }
+    fn merge_visible(&mut self, copy: bool) {
         self.finish_pending_canvas_gesture();
         if !self.can_add_layers(1) {
             return;
@@ -5349,7 +5449,7 @@ impl EfudeApp {
         }
         self.history.begin();
         for i in 0..self.doc.layers.len() {
-            if self.doc.layers[i].kind != LayerKind::Raster || !self.doc.layers[i].visible {
+            if copy || self.doc.layers[i].kind != LayerKind::Raster || !self.doc.layers[i].visible {
                 continue;
             }
             let mut parent = self.doc.layers[i].parent_id;
@@ -5376,14 +5476,19 @@ impl EfudeApp {
             }
         }
         let id = self.next_layer_id();
-        let mut merged =
-            efude_canvas::Layer::new(id, "統合レイヤー", self.doc.width, self.doc.height);
+        let mut merged = efude_canvas::Layer::new(
+            id,
+            self.text("統合レイヤー", "Merged layer"),
+            self.doc.width,
+            self.doc.height,
+        );
         merged.pixels =
             efude_canvas::TilePixels::from_dense(self.doc.width, self.doc.height, &merged_pixels);
         let index = self.doc.layers.len();
         self.history
             .insert_layer(&mut self.doc.layers, index, merged);
-        self.history.commit();
+        self.history
+            .commit_labeled(self.text("レイヤー結合", "Merge layers"));
         self.selected_layer = index;
         self.editing_mask = false;
         self.status = self
@@ -5394,6 +5499,9 @@ impl EfudeApp {
             .into();
     }
     fn queue_filter(&mut self, operation: FilterOperation, ctx: &egui::Context) {
+        if self.refuse_mask_edit() {
+            return;
+        }
         if self.filter_pending {
             return;
         }
@@ -5458,6 +5566,7 @@ impl EfudeApp {
     /// One frame of the whole UI (everything `eframe::App::update` does;
     /// tests drive it directly).
     pub(crate) fn update_ui(&mut self, ctx: &egui::Context) {
+        self.sync_mask_edit_mode();
         self.canvas_input_handled = false;
         self.frame_native_ends = 0;
         let history_state_at_frame_start = self.history.state_token();
@@ -5623,7 +5732,11 @@ impl EfudeApp {
             }
         }
         let view_transform_at_frame_start = (self.view_rotation, self.flip_x, self.flip_y);
-        if self.paste_preview.is_some() {
+        if self.paste_preview.is_some()
+            && !ctx.wants_keyboard_input()
+            && !self.confirm_layer_clear
+            && self.pending_merge.is_none()
+        {
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
                 self.paste_preview = None;
                 self.paste_texture = None;
@@ -6006,7 +6119,8 @@ impl EfudeApp {
                             self.doc.height,
                         );
                         self.doc.layers[index].pixels = pixels;
-                        self.history.commit();
+                        self.history
+                            .commit_labeled(self.text("フィルター", "Filter"));
                         self.canvas_texture_dirty = true;
                         self.navigator_texture_dirty = true;
                         true
@@ -6049,7 +6163,10 @@ impl EfudeApp {
         {
             ctx.request_repaint();
         }
-        let shortcuts_enabled = ctx.input(|input| input.focused) && !ctx.wants_keyboard_input();
+        let shortcuts_enabled = self.pending_merge.is_none()
+            && !self.confirm_layer_clear
+            && ctx.input(|input| input.focused)
+            && !ctx.wants_keyboard_input();
         if shortcuts_enabled {
             // [ and ] change the brush size, as in most painting software.
             let (smaller, larger) = ctx.input(|input| {
@@ -6072,84 +6189,72 @@ impl EfudeApp {
         let key_paste = Self::configured_key(&self.shortcuts.paste, egui::Key::V);
         let key_select_all = Self::configured_key(&self.shortcuts.select_all, egui::Key::A);
         let key_deselect = Self::configured_key(&self.shortcuts.deselect, egui::Key::D);
-        let key_eraser = Self::configured_key(&self.shortcuts.eraser, egui::Key::E);
-        let tool_shortcuts = [
-            (&self.shortcuts.brush_tool, egui::Key::Num1, Tool::Brush),
-            (
-                &self.shortcuts.rectangle_tool,
-                egui::Key::Num2,
-                Tool::RectangleSelect,
-            ),
-            (&self.shortcuts.fill_tool, egui::Key::Num3, Tool::Fill),
-            (
-                &self.shortcuts.eyedropper_tool,
-                egui::Key::Num4,
-                Tool::Eyedropper,
-            ),
-            (&self.shortcuts.move_tool, egui::Key::Num5, Tool::Move),
-            (&self.shortcuts.pan_tool, egui::Key::Num6, Tool::Pan),
-            (&self.shortcuts.blur_tool, egui::Key::Num7, Tool::Blur),
-            (&self.shortcuts.smudge_tool, egui::Key::Num8, Tool::Smudge),
-            (
-                &self.shortcuts.ellipse_tool,
-                egui::Key::Num9,
-                Tool::EllipseSelect,
-            ),
-            (&self.shortcuts.lasso_tool, egui::Key::Q, Tool::LassoSelect),
-            (
-                &self.shortcuts.polygon_tool,
-                egui::Key::W,
-                Tool::PolygonSelect,
-            ),
-            (
-                &self.shortcuts.magic_wand_tool,
-                egui::Key::R,
-                Tool::MagicWand,
-            ),
-            (
-                &self.shortcuts.color_range_tool,
-                egui::Key::T,
-                Tool::ColorRange,
-            ),
-            (&self.shortcuts.line_ruler_tool, egui::Key::Y, Tool::Line),
-            (
-                &self.shortcuts.ellipse_ruler_tool,
-                egui::Key::U,
-                Tool::EllipseRuler,
-            ),
-            (
-                &self.shortcuts.bezier_ruler_tool,
-                egui::Key::I,
-                Tool::BezierRuler,
-            ),
-            (
-                &self.shortcuts.perspective_ruler_tool,
-                egui::Key::O,
-                Tool::PerspectiveRuler,
-            ),
-            (
-                &self.shortcuts.selection_brush_tool,
-                egui::Key::G,
-                Tool::SelectionBrush,
-            ),
-            (
-                &self.shortcuts.quick_mask_tool,
-                egui::Key::H,
-                Tool::QuickMask,
-            ),
-        ];
+        if shortcuts_enabled {
+            self.command_shortcuts(
+                ctx,
+                [
+                    key_undo,
+                    key_redo,
+                    key_save,
+                    key_copy,
+                    key_cut,
+                    key_paste,
+                    key_select_all,
+                    key_deselect,
+                ],
+            );
+        }
+        let tool_bindings = self.tool_bindings();
         let conflicting_tool_keys = self.conflicting_tool_keys();
+        if shortcuts_enabled && self.paste_preview.is_none() {
+            let fresh = |key, command| {
+                ctx.input(|input| {
+                    input.events.iter().any(|event| {
+                        let egui::Event::Key {
+                            key: pressed,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } = event
+                        else {
+                            return false;
+                        };
+                        *pressed == key
+                            && if command {
+                                modifiers.matches_exact(egui::Modifiers::COMMAND)
+                            } else {
+                                modifiers.is_none()
+                                    && !tool_bindings.iter().any(|(bound, _)| *bound == key)
+                            }
+                    })
+                })
+            };
+            if fresh(egui::Key::X, false) {
+                self.swap_colors();
+            }
+            if fresh(egui::Key::D, false) {
+                self.reset_colors();
+            }
+            if fresh(egui::Key::H, false) {
+                self.flip_x = !self.flip_x;
+            }
+            if fresh(egui::Key::E, true) {
+                self.merge_selected(false);
+            }
+            if fresh(egui::Key::T, true) {
+                self.start_transform(false);
+            }
+            self.session_keys(ctx);
+        }
         // Tool keys: a tap switches tools; holding a key (or using the tool
         // while it is held) switches only until the key is released. Space
         // always works as a held hand tool.
-        let mut tool_keys: Vec<(egui::Key, Tool, bool)> = tool_shortcuts
+        let mut tool_keys: Vec<_> = tool_bindings
             .into_iter()
-            .map(|(shortcut, fallback, tool)| {
-                (Self::configured_key(shortcut, fallback), tool, false)
-            })
+            .filter(|(key, _)| !conflicting_tool_keys.contains(key))
+            .map(|(key, tool)| (key, tool, false))
             .collect();
-        tool_keys.push((key_eraser, Tool::Eraser, false));
-        tool_keys.retain(|(key, _, _)| !conflicting_tool_keys.contains(key));
         tool_keys.push((egui::Key::Space, Tool::Pan, true));
         self.update_held_tool_key(
             ctx,
@@ -6190,21 +6295,6 @@ impl EfudeApp {
             }
             self.last_backup = std::time::Instant::now();
         }
-        if shortcuts_enabled {
-            self.command_shortcuts(
-                ctx,
-                [
-                    key_undo,
-                    key_redo,
-                    key_save,
-                    key_copy,
-                    key_cut,
-                    key_paste,
-                    key_select_all,
-                    key_deselect,
-                ],
-            );
-        }
         if self.tool == Tool::PolygonSelect
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
         {
@@ -6241,9 +6331,9 @@ impl EfudeApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading(if english { "Start Drawing" } else { "描画を始める" });
-                    ui.label(if english { "Choose a tool from the left panel, then drag on the canvas. Change color and size in the tool panel." } else { "左のブラシ一覧からツールを選び、キャンバス上をドラッグして描きます。色とサイズはツールパネルで変更できます。" });
+                    ui.label(if english { "Choose a brush preset, set its size in Tool and its color in Color, then drag on the canvas." } else { "ブラシ一覧でプリセットを選び、ツールパネルでサイズ、カラーパネルで色を決めて描きます。" });
                     ui.label(if english { "Stabilization and pull-string modes show the input and corrected positions with cyan guides." } else { "手ブレ補正や紐引きを使うと、シアンのガイドで入力位置と補正位置のずれを確認できます。" });
-                    ui.label(if english { "Use the right layer panel to add layers, toggle visibility, adjust opacity, lock layers, and edit masks." } else { "右のレイヤーパネルからレイヤーの追加、表示切替、不透明度、ロック、マスクを操作します。" });
+                    ui.label(if english { "Use the Layers panel to add layers, toggle visibility, adjust opacity, lock layers, and edit masks." } else { "レイヤーパネルからレイヤーの追加、表示切替、不透明度、ロック、マスクを操作します。" });
                     ui.label(if english { "Selections limit painting, erasing, and filter operations to the selected area." } else { "選択ツールで範囲を作ると、その範囲に描画や消去、フィルターが適用されます。" });
                     ui.separator();
                     ui.heading(if english { "Saving and Exporting" } else { "保存と書き出し" });
@@ -6251,10 +6341,31 @@ impl EfudeApp {
                     ui.label(if english { "PNG preserves transparency. JPEG exports with a white background." } else { "PNGは透明部分を保持し、JPEGは白背景で書き出します。" });
                     ui.separator();
                     ui.heading(if english { "Shortcuts" } else { "ショートカット" });
+                    ui.label(if english {
+                        "X swaps colors. D resets to black and white. H flips the view horizontally. Hold R and drag to rotate."
+                    } else {
+                        "X で描画色と背景色を交換、D で黒と白に戻します。H で表示を左右反転、R を押しながらドラッグで回転します。"
+                    });
+                    ui.label(if english {
+                        "Ctrl+T starts free transform. Ctrl+E runs Layer → Merge down. Enter applies a transform or crop and Esc cancels it."
+                    } else {
+                        "Ctrl+T で自由変形、Ctrl+E で「レイヤー → 下のレイヤーと結合」を実行します。変形と切り抜きは Enter で確定、Esc で取り消します。"
+                    });
+                    ui.label(if english {
+                        "Hold Alt to sample a color. Ctrl+Alt and a horizontal drag changes brush size. Shift+click with a brush draws a line from the previous point."
+                    } else {
+                        "Alt を押すと一時スポイトになります。Ctrl+Alt＋左右ドラッグでブラシ径を変更し、ブラシで Shift+クリックすると前の点から直線を引きます。"
+                    });
+                    for bindings in tool_bindings.chunks(4) {
+                        let labels: Vec<_> = bindings.iter().map(|(key, tool)| {
+                            format!("{} {}", key.name(), layout::tool_name(*tool, english))
+                        }).collect();
+                        ui.label(labels.join(" · "));
+                    }
                     ui.label(if english { format!("Undo: Ctrl+{}    Redo: Ctrl+{}", self.shortcuts.undo, self.shortcuts.redo) } else { format!("元に戻す: Ctrl+{}　やり直す: Ctrl+{}", self.shortcuts.undo, self.shortcuts.redo) });
                     ui.label(if english { format!("Save: Ctrl+{}    Copy: Ctrl+{}    Cut: Ctrl+{}    Paste: Ctrl+{}", self.shortcuts.save, self.shortcuts.copy, self.shortcuts.cut, self.shortcuts.paste) } else { format!("保存: Ctrl+{}　コピー: Ctrl+{}　切り取り: Ctrl+{}　貼り付け: Ctrl+{}", self.shortcuts.save, self.shortcuts.copy, self.shortcuts.cut, self.shortcuts.paste) });
                     ui.label(if english { format!("Select all: Ctrl+{}    Deselect: Ctrl+{}    Invert selection: Ctrl+Shift+I", self.shortcuts.select_all, self.shortcuts.deselect) } else { format!("すべてを選択: Ctrl+{}　選択解除: Ctrl+{}　選択範囲を反転: Ctrl+Shift+I", self.shortcuts.select_all, self.shortcuts.deselect) });
-                    ui.label(if english { "New: Ctrl+N    Open: Ctrl+O    Save as: Ctrl+Shift+S    Close tab: Ctrl+W    Next tab: Ctrl+Tab" } else { "新規: Ctrl+N　開く: Ctrl+O　別名で保存: Ctrl+Shift+S　タブを閉じる: Ctrl+W　次のタブ: Ctrl+Tab" });
+                    ui.label(if english { "New: Ctrl+N    Open: Ctrl+O    Save as: Ctrl+Shift+S    Close tab: Ctrl+W    Next / previous tab: Ctrl+Tab / Ctrl+Shift+Tab" } else { "新規: Ctrl+N　開く: Ctrl+O　別名で保存: Ctrl+Shift+S　タブを閉じる: Ctrl+W　次／前のタブ: Ctrl+Tab／Ctrl+Shift+Tab" });
                     ui.label(if english { "New layer: Ctrl+Shift+N    Duplicate layer: Ctrl+J    Redo also: Ctrl+Shift+Z    Brush size: [ ]" } else { "新規レイヤー: Ctrl+Shift+N　レイヤーを複製: Ctrl+J　やり直しは Ctrl+Shift+Z でも　ブラシサイズ: [ ]" });
                     ui.label(if english { "Edit shortcuts under File → Preferences → Shortcut Settings." } else { "ショートカットは「ファイル → 環境設定 → ショートカット設定」で変更できます。" });
                     ui.separator();
@@ -6329,12 +6440,7 @@ impl eframe::App for EfudeApp {
                 selected_brush: self.selected_brush,
                 tool_brushes: self.tool_brushes,
                 preset_version: PRESET_VERSION,
-                color: [
-                    self.color.r(),
-                    self.color.g(),
-                    self.color.b(),
-                    self.color.a(),
-                ],
+                color: self.color,
                 palette: self.palette.clone(),
                 show_tools_panel: self.show_tools_panel,
                 show_layers_panel: self.show_layers_panel,
@@ -6342,12 +6448,7 @@ impl eframe::App for EfudeApp {
                 layout_version: layout::LAYOUT_VERSION,
                 tools_panel_width: self.tools_panel_width,
                 layers_panel_width: self.layers_panel_width,
-                secondary_color: [
-                    self.secondary_color.r(),
-                    self.secondary_color.g(),
-                    self.secondary_color.b(),
-                    self.secondary_color.a(),
-                ],
+                secondary_color: self.secondary_color,
                 intermediate_mix: self.intermediate_mix,
                 size: self.size,
                 zoom: self.zoom,
@@ -6466,18 +6567,22 @@ fn migrate_saved_brushes(mut brushes: Vec<efude_brush::Brush>) -> Vec<efude_brus
 mod balloons;
 mod book;
 mod canvas_view;
+mod color_panel;
 mod comic;
 mod display;
 mod filters_ui;
 mod icons;
 mod inspection;
+mod layer_panel;
 mod layout;
 mod macros;
 mod material_import;
 mod panels;
 mod recovery;
+mod shape_gradient;
 mod tabs;
 mod timelapse;
+mod transform;
 mod vector_edit;
 mod vector_tools;
 
@@ -6610,7 +6715,7 @@ mod stroke_tests {
         app.doc = Document::new(width, height);
         app.selected_layer = 0;
         app.tool = Tool::Brush;
-        app.color = Color32::from_rgb(0, 0, 0);
+        app.color = [0, 0, 0, 255];
         app
     }
 
@@ -6619,12 +6724,15 @@ mod stroke_tests {
         let ctx = egui::Context::default();
         app.reset_stroke_buffers();
         app.active.clear();
+        if let Some(first) = points.first() {
+            app.begin_grain(first.position);
+        }
         app.begin_brush_stroke();
         app.history.begin();
         app.raster.previous_mix_color = [
-            app.color.r() as f32 / 255.,
-            app.color.g() as f32 / 255.,
-            app.color.b() as f32 / 255.,
+            app.color[0] as f32 / 255.,
+            app.color[1] as f32 / 255.,
+            app.color[2] as f32 / 255.,
         ];
         app.raster.last_dab = None;
         app.raster.remaining_charge = app.brushes[app.selected_brush].mix.charge;
@@ -6719,7 +6827,7 @@ mod stroke_tests {
             app.brushes[2].stabilization = 3;
             app.brushes[2].taper_in_pixels = true;
             app.brushes[2].taper_end = 30.0;
-            app.color = Color32::from_rgba_unmultiplied(200, 60, 30, 220);
+            app.color = [200, 60, 30, 220];
         };
         let mut cpu = app(240, 120);
         setup(&mut cpu);
@@ -6758,6 +6866,33 @@ mod stroke_tests {
 
     #[test]
     fn live_stroke_matches_offline_replay() {
+        compare_live_replay(false);
+    }
+    #[test]
+    fn mirrored_nib_tracks_the_mirrored_stroke_tangent() {
+        let mut live = app(128, 64);
+        use_brush(&mut live, 0, 8.);
+        live.symmetry_center = Vec2::new(64., 32.);
+        live.symmetry_x = true;
+        let brush = &mut live.brushes[0];
+        brush.follow_stroke_direction = true;
+        brush.tip_aspect = 2.5;
+        draw(&mut live, &line((27., 14.), (27., 44.), 20));
+        let pixels = &live.doc.layers[0].pixels;
+        for y in 30..56 {
+            for x in 14..40 {
+                assert!(
+                    pixels.pixel(x, y)[3].abs_diff(pixels.pixel(127 - x, y)[3]) <= 1,
+                    "at {x},{y}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn live_jitter_and_direction_match_offline_replay() {
+        compare_live_replay(true);
+    }
+    fn compare_live_replay(variation: bool) {
         // What is drawn live must equal a clean re-render of the same input,
         // i.e. nothing changes when the pen lifts.
         let points: Vec<InkPoint> = (0..120)
@@ -6779,11 +6914,21 @@ mod stroke_tests {
         live.brushes[2].taper_in_pixels = true;
         live.brushes[2].taper_start = 15.0;
         live.brushes[2].taper_end = 25.0;
+        if variation {
+            live.color = [215, 110, 42, 255];
+            let brush = &mut live.brushes[2];
+            brush.hue_jitter = 0.9;
+            brush.saturation_jitter = 0.6;
+            brush.brightness_jitter = 0.45;
+            brush.tip_aspect = 1.9;
+            brush.follow_stroke_direction = true;
+        }
         draw(&mut live, &points);
 
         let mut offline = app(220, 90);
         use_brush(&mut offline, 2, 9.0);
         offline.brushes[2] = live.brushes[2].clone();
+        offline.color = live.color;
         offline.history.begin();
         offline.raster.previous_mix_color = [0.0; 3];
         offline.render_replay(&points);
@@ -6813,11 +6958,11 @@ mod stroke_tests {
         for index in [3, 8] {
             let setup = |app: &mut EfudeApp| {
                 use_brush(app, 0, 30.0);
-                app.color = Color32::from_rgb(200, 30, 30);
+                app.color = [200, 30, 30, 255];
                 draw(app, &line((20.0, 45.0), (90.0, 45.0), 30));
                 use_brush(app, index, 20.0);
                 app.brushes[index].stabilization = 3;
-                app.color = Color32::from_rgb(30, 60, 210);
+                app.color = [30, 60, 210, 255];
             };
             let mut live = app(220, 90);
             setup(&mut live);
@@ -6857,7 +7002,7 @@ mod stroke_tests {
         let mut app = app(200, 80);
         // A red vertical band.
         use_brush(&mut app, 0, 14.0);
-        app.color = Color32::from_rgb(220, 20, 20);
+        app.color = [220, 20, 20, 255];
         draw(&mut app, &line((60.0, 5.0), (60.0, 75.0), 40));
         eprintln!(
             "red band pixel {:?} kind {:?}",
@@ -6868,7 +7013,7 @@ mod stroke_tests {
         use_brush(&mut app, 3, 18.0);
         app.brushes[3].mix.blend = 0.5;
         app.brushes[3].mix.persistence = 0.8;
-        app.color = Color32::from_rgb(20, 20, 220);
+        app.color = [20, 20, 220, 255];
         draw(&mut app, &line((10.0, 40.0), (190.0, 40.0), 90));
         eprintln!(
             "{:?}",

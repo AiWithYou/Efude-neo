@@ -29,7 +29,7 @@ fn assert_stale_packets_are_discarded(lose_focus: bool) {
     app.navigator_center = Vec2::new(60.0, 40.0);
     app.use_windows_ink = true;
     app.use_wintab = false;
-    app.color = Color32::BLACK;
+    app.color = [0, 0, 0, 255];
     let ctx = egui::Context::default();
     layout::apply_theme(&ctx);
     let mut time = 0.0;
@@ -133,7 +133,7 @@ impl FocusHarness {
         app.navigator_center = Vec2::new(60.0, 40.0);
         app.use_windows_ink = false;
         app.use_wintab = false;
-        app.color = Color32::BLACK;
+        app.color = [0, 0, 0, 255];
         app.size = 6.0;
         app.brushes[app.selected_brush].settle = false;
         let ctx = egui::Context::default();
@@ -408,7 +408,7 @@ impl ViewInputHarness {
         app.zoom = zoom;
         app.use_windows_ink = false;
         app.use_wintab = false;
-        app.color = Color32::BLACK;
+        app.color = [0, 0, 0, 255];
         app.size = 6.0;
         app.brushes[app.selected_brush].settle = false;
         let ctx = egui::Context::default();
@@ -695,7 +695,7 @@ mod native_contact_tests {
             app.zoom = 6.0;
             app.use_windows_ink = false;
             app.use_wintab = false;
-            app.color = Color32::BLACK;
+            app.color = [0, 0, 0, 255];
             app.size = 4.0;
             app.workspace = egui_dock::DockState::new(vec![layout::Pane::Canvas]);
             let brush = &mut app.brushes[app.selected_brush];

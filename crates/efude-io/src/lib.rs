@@ -11,6 +11,7 @@ use std::{
     path::Path,
 };
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
+mod archive;
 pub mod timelapse;
 const MAX_EFUDE_TILE_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_EFUDE_LAYER_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -35,7 +36,7 @@ const MAX_PSD_TILE_MEMORY: u64 = 512 * 1024 * 1024;
 
 fn write_or_reuse_entry<W: Write + Seek>(
     writer: &mut ZipWriter<W>,
-    previous: &mut Option<ZipArchive<File>>,
+    previous: &mut Option<ZipArchive<archive::NativeArchiveReader>>,
     name: &str,
     options: SimpleFileOptions,
     data: &[u8],
@@ -70,7 +71,7 @@ fn write_or_reuse_entry<W: Write + Seek>(
 
 fn write_or_reuse_tile<W: Write + Seek>(
     writer: &mut ZipWriter<W>,
-    previous: &mut Option<ZipArchive<File>>,
+    previous: &mut Option<ZipArchive<archive::NativeArchiveReader>>,
     name: &str,
     options: SimpleFileOptions,
     pixels: &[u8],
@@ -107,7 +108,7 @@ fn write_or_reuse_tile<W: Write + Seek>(
 fn optional_entry<'a, R: Read + Seek>(
     archive: &'a mut ZipArchive<R>,
     name: &str,
-) -> Result<Option<zip::read::ZipFile<'a>>, zip::result::ZipError> {
+) -> Result<Option<zip::read::ZipFile<'a, R>>, zip::result::ZipError> {
     match archive.by_name(name) {
         Ok(entry) => Ok(Some(entry)),
         Err(zip::result::ZipError::FileNotFound) => Ok(None),
@@ -271,8 +272,7 @@ fn save_with_limits(
     }
     let mut previous_archive = File::open(path)
         .ok()
-        .and_then(|file| ZipArchive::new(file).ok())
-        .filter(|archive| archive.len() as u64 <= limits.archive_entries);
+        .and_then(|file| archive::open(file, limits.archive_entries).ok());
     let parent = path.parent().unwrap_or(Path::new("."));
     let temp = tempfile::NamedTempFile::new_in(parent)?;
     let f = temp.as_file().try_clone()?;
@@ -291,7 +291,7 @@ fn save_with_limits(
         &serde_json::json!({"format_version":"0.1","width":doc.width,"height":doc.height,"dpi":doc.dpi,"color_space":"sRGB","pixel_format":"RGBA8"}),
     )?;
     write_or_reuse_entry(&mut z, &mut previous_archive, "manifest.json", o, &manifest)?;
-    let layers = serde_json::to_vec_pretty(&doc.layers.iter().map(|l|serde_json::json!({"id":l.id,"name":l.name,"visible":l.visible,"opacity":l.opacity,"locked":l.locked,"clipping":l.clipping,"sketch":l.sketch,"reference":l.reference,"blend":l.blend,"linear_blend":l.linear_blend,"kind":l.kind,"parent_id":l.parent_id,"expanded":l.expanded,"has_mask":l.mask.is_some(),"tone":l.tone})).collect::<Vec<_>>())?;
+    let layers = serde_json::to_vec_pretty(&doc.layers.iter().map(|l|serde_json::json!({"id":l.id,"name":l.name,"visible":l.visible,"opacity":l.opacity,"locked":l.locked,"alpha_lock":l.alpha_lock,"layer_color":l.layer_color,"clipping":l.clipping,"sketch":l.sketch,"reference":l.reference,"blend":l.blend,"linear_blend":l.linear_blend,"kind":l.kind,"parent_id":l.parent_id,"expanded":l.expanded,"has_mask":l.mask.is_some(),"tone":l.tone})).collect::<Vec<_>>())?;
     validate_entry_size(
         layers.len() as u64,
         MAX_EFUDE_LAYER_METADATA_BYTES,
@@ -443,14 +443,11 @@ fn load_with_limits(
     limits: EfudeLimits,
 ) -> Result<Document, Box<dyn std::error::Error>> {
     use std::io::Read;
-    let f = File::open(path)?;
-    let mut z = zip::ZipArchive::new(f)?;
-    if z.len() as u64 > limits.archive_entries {
-        return Err(".efude archive contains too many entries".into());
-    }
+    let mut z = archive::open(File::open(path)?, limits.archive_entries)?;
     {
         let mut entry = z.by_index(0)?;
-        if entry.name() != "mimetype" || entry.compression() != zip::CompressionMethod::Stored {
+        if entry.name_raw() != b"mimetype" || entry.compression() != zip::CompressionMethod::Stored
+        {
             return Err(
                 "invalid .efude container: mimetype must be the first uncompressed entry".into(),
             );
@@ -537,6 +534,8 @@ fn load_with_limits(
         l.sketch = meta["sketch"].as_bool().unwrap_or(false);
         l.reference = meta["reference"].as_bool().unwrap_or(false);
         l.blend = serde_json::from_value(meta["blend"].clone()).unwrap_or(BlendMode::Normal);
+        l.alpha_lock = meta["alpha_lock"].as_bool().unwrap_or(false);
+        l.layer_color = serde_json::from_value(meta["layer_color"].clone())?;
         l.linear_blend = meta["linear_blend"].as_bool().unwrap_or(false);
         l.kind = serde_json::from_value(meta["kind"].clone()).unwrap_or(LayerKind::Raster);
         l.parent_id = meta["parent_id"].as_u64();
@@ -706,8 +705,7 @@ fn load_with_limits(
         entry.read_to_end(&mut bytes)?;
         metadata = serde_json::from_slice(&bytes)?;
     }
-    let has_guide = z.file_names().any(|name| name == "guide/settings.json");
-    let guide = if has_guide {
+    let guide = if z.index_for_name("guide/settings.json").is_some() {
         let mut settings_entry = z.by_name("guide/settings.json")?;
         if settings_entry.size() > 64 * 1024 {
             return Err(".efude guide settings exceed the size limit".into());
@@ -793,7 +791,7 @@ fn load_with_limits(
 /// straight-alpha RGBA, without loading the document.
 pub fn load_thumbnail(path: &Path) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut archive = ZipArchive::new(File::open(path)?)?;
+    let mut archive = archive::open(File::open(path)?, EFUDE_LIMITS.archive_entries)?;
     let mut entry = archive.by_name("thumbnail.png")?;
     if entry.size() > 4 * 1024 * 1024 {
         return Err("thumbnail too large".into());
@@ -857,10 +855,10 @@ pub fn export_psd_report(
     doc: &Document,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     const MAX_PSD_LAYERS: usize = 200;
-    // PSD has no tone layers: write them as the dots they show.
+    let has_tint = doc.layers.iter().any(|l| l.layer_color.is_some());
     let baked;
-    let doc = if doc.layers.iter().any(|layer| layer.tone.is_some()) {
-        baked = efude_canvas::bake_tone_layers(doc);
+    let doc = if has_tint || doc.layers.iter().any(|layer| layer.tone.is_some()) {
+        baked = efude_canvas::bake_display_layers(doc);
         &baked
     } else {
         doc
@@ -1254,6 +1252,12 @@ pub fn export_psd_report(
     drop(f);
     temp.persist(path)?;
     let mut warnings = Vec::new();
+    if doc.layers.iter().any(|l| l.alpha_lock) {
+        warnings.push("透明ピクセルのロック設定はPSDに保存されません".into());
+    }
+    if has_tint {
+        warnings.push("レイヤーカラーを画素に焼き込みました".into());
+    }
     if ps_layers
         .iter()
         .any(|ps| ps.layer.is_some_and(|l| l.linear_blend))
@@ -1405,7 +1409,17 @@ pub fn import_psd_report(path: &Path) -> Result<PsdImport, Box<dyn std::error::E
     }
     let mut doc = Document::new(width, height);
     doc.dpi = image_dpi;
-    let alpha_channel = if channels as usize > color_channels {
+    // A signed layer count marks merged transparency. Positive counts leave
+    // extra channels available for saved selections rather than opacity.
+    // With no layer records, retain the existing flattened-image behavior.
+    let merged_has_alpha =
+        if layer_mask.len() >= 6 && u32::from_be_bytes(layer_mask[..4].try_into()?) >= 2 {
+            let count = i16::from_be_bytes(layer_mask[4..6].try_into()?);
+            count <= 0
+        } else {
+            true
+        };
+    let alpha_channel = if merged_has_alpha && channels as usize > color_channels {
         Some(color_channels)
     } else {
         None
@@ -3160,6 +3174,85 @@ mod tests {
     }
 
     #[test]
+    fn psd_merged_transparency_follows_signed_layer_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("merged.psd");
+        for compression in [0, 1] {
+            for depth in [8, 16] {
+                for (count, expected_alpha) in [(1i16, 255), (-1, 128)] {
+                    let mut bytes = cmyk_psd_fixture(compression, depth, true);
+                    // Unsupported blend mode forces import of the merged image.
+                    let blend = bytes.windows(8).position(|w| w == b"8BIMnorm").unwrap();
+                    bytes[blend + 4..blend + 8].copy_from_slice(b"diss");
+                    bytes[42..44].copy_from_slice(&count.to_be_bytes());
+                    fs::write(&path, bytes).unwrap();
+                    let report = import_psd_report(&path).unwrap();
+                    assert!(report.warnings.iter().any(|w| w.contains("合成モード")));
+                    assert_eq!(
+                        report.document.layers[0].pixels.pixel(3, 0),
+                        [255, 0, 0, expected_alpha],
+                        "compression={compression}, depth={depth}, count={count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn psd_rgb_saved_selection_is_not_merged_transparency() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rgb-extra-channel.psd");
+        for (count, expected_alpha) in [(1i16, 255), (-1, 0)] {
+            let mut record = Vec::new();
+            for bound in [0i32, 0, 1, 1] {
+                record.extend_from_slice(&bound.to_be_bytes());
+            }
+            record.extend_from_slice(&3u16.to_be_bytes());
+            let mut channel_data = Vec::new();
+            for (channel, value) in [(0i16, 200u8), (1, 30), (2, 40)] {
+                record.extend_from_slice(&channel.to_be_bytes());
+                record.extend_from_slice(&3u32.to_be_bytes());
+                channel_data.extend_from_slice(&0u16.to_be_bytes());
+                channel_data.push(value);
+            }
+            record.extend_from_slice(b"8BIMdiss");
+            record.extend_from_slice(&[255, 0, 0, 0]);
+            record.extend_from_slice(&12u32.to_be_bytes());
+            record.extend_from_slice(&[0; 12]);
+            let mut info = count.to_be_bytes().to_vec();
+            info.extend_from_slice(&record);
+            info.extend_from_slice(&channel_data);
+            if !info.len().is_multiple_of(2) {
+                info.push(0);
+            }
+            let mut section = (info.len() as u32).to_be_bytes().to_vec();
+            section.extend_from_slice(&info);
+            section.extend_from_slice(&0u32.to_be_bytes());
+            let mut bytes = b"8BPS".to_vec();
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&[0; 6]);
+            bytes.extend_from_slice(&4u16.to_be_bytes());
+            bytes.extend_from_slice(&1u32.to_be_bytes());
+            bytes.extend_from_slice(&1u32.to_be_bytes());
+            bytes.extend_from_slice(&8u16.to_be_bytes());
+            bytes.extend_from_slice(&3u16.to_be_bytes());
+            bytes.extend_from_slice(&[0; 8]);
+            bytes.extend_from_slice(&(section.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&section);
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            bytes.extend_from_slice(&[200, 30, 40, 0]);
+            fs::write(&path, bytes).unwrap();
+            let report = import_psd_report(&path).unwrap();
+            assert!(report.warnings.iter().any(|w| w.contains("合成モード")));
+            assert_eq!(
+                report.document.layers[0].pixels.pixel(0, 0),
+                [200, 30, 40, expected_alpha],
+                "count={count}"
+            );
+        }
+    }
+
+    #[test]
     fn psd_layer_parser_rejects_lengths_outside_their_sections() {
         let file = cmyk_psd_fixture(0, 8, true);
         let section_len = u32::from_be_bytes(file[34..38].try_into().unwrap()) as usize;
@@ -3188,6 +3281,168 @@ mod tests {
         assert!(parse_psd_layers(&bad_name, 4, 1, 4, 8).is_err());
     }
 
+    #[test]
+    fn stage7_zip_comments_can_contain_footer_signatures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("comment.efude");
+        let mut doc = Document::new(3, 2);
+        doc.layers[0].pixels.set_pixel(1, 1, [1, 2, 3, 127]);
+        doc.dpi = 600.;
+        doc.metadata.insert("title".into(), "Comment test".into());
+        let mut mask = efude_canvas::TilePixels::new(3, 2);
+        mask.ensure_tile_filled(0, 0, [255; 4]);
+        mask.set_pixel(1, 1, [96, 96, 96, 255]);
+        doc.layers[0].mask = Some(mask);
+        save(&path, &doc).unwrap();
+        let saved = fs::read(&path).unwrap();
+        for comment in [
+            b"note PK\x05\x06 end".as_slice(),
+            b"PK\x05\x06",
+            b"PK\x05\x06 some longer text after the signature",
+        ] {
+            let mut bytes = saved.clone();
+            bytes.truncate(bytes.len() - 2);
+            bytes.extend((comment.len() as u16).to_le_bytes());
+            bytes.extend(comment);
+            fs::write(&path, bytes).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!((loaded.width, loaded.height), (3, 2));
+            assert_eq!(loaded.dpi, doc.dpi);
+            assert_eq!(loaded.metadata, doc.metadata);
+            assert_eq!(loaded.layers.len(), 1);
+            assert_eq!(loaded.layers[0].name, doc.layers[0].name);
+            assert_eq!(
+                loaded.layers[0].mask.as_ref().unwrap().pixel(1, 1),
+                [96, 96, 96, 255]
+            );
+            assert_eq!(
+                loaded.layers[0].pixels.to_dense(),
+                doc.layers[0].pixels.to_dense()
+            );
+        }
+    }
+
+    #[test]
+    fn stage5_zip64_directory_loads_a_small_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("small.efude");
+        save(&path, &Document::new(3, 2)).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let offset = bytes.len() - 22;
+        let mut footer = bytes.split_off(offset);
+        let count = u16::from_le_bytes(footer[10..12].try_into().unwrap());
+        let size = u32::from_le_bytes(footer[12..16].try_into().unwrap());
+        let start = u32::from_le_bytes(footer[16..20].try_into().unwrap());
+        bytes.extend(b"PK\x06\x06");
+        bytes.extend(44u64.to_le_bytes());
+        bytes.extend(45u16.to_le_bytes());
+        bytes.extend(45u16.to_le_bytes());
+        bytes.extend([0; 8]);
+        for n in [
+            u64::from(count),
+            u64::from(count),
+            u64::from(size),
+            u64::from(start),
+        ] {
+            bytes.extend(n.to_le_bytes());
+        }
+        bytes.extend(b"PK\x06\x07");
+        bytes.extend([0; 4]);
+        bytes.extend((offset as u64).to_le_bytes());
+        bytes.extend(1u32.to_le_bytes());
+        footer[8..20].fill(255);
+        bytes.extend(footer);
+        fs::write(&path, bytes).unwrap();
+        let doc = load(&path).unwrap();
+        assert_eq!((doc.width, doc.height), (3, 2));
+    }
+    #[test]
+    fn stage5_directory_limits_and_unique_names_precede_document_decode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.efude");
+        let mut z = ZipWriter::new(File::create(&path).unwrap());
+        for name in ["first", "other"] {
+            z.start_file(name, SimpleFileOptions::default()).unwrap();
+        }
+        z.finish().unwrap();
+        let small = EfudeLimits {
+            archive_entries: 1,
+            ..EFUDE_LIMITS
+        };
+        assert!(
+            load_with_limits(&path, small)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("too many")
+        );
+        let mut bytes = fs::read(&path).unwrap();
+        for i in 0..bytes.len() - 4 {
+            if &bytes[i..i + 5] == b"other" {
+                bytes[i..i + 5].copy_from_slice(b"first");
+            }
+        }
+        fs::write(&path, bytes).unwrap();
+        assert!(load(&path).err().unwrap().to_string().contains("duplicate"));
+    }
+    #[test]
+    fn stage5_layer_color_and_lock_survive_save_and_render_in_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
+        let mut doc = Document::new(8, 8);
+        let layer = &mut doc.layers[0];
+        layer.alpha_lock = true;
+        layer.layer_color = Some([128, 32, 200]);
+        for y in 0..8 {
+            for x in 0..8 {
+                layer.pixels.set_pixel(x, y, [0, 0, 0, 255]);
+            }
+        }
+        let path = tmp.join("color.efude");
+        save(&path, &doc).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(loaded.layers[0].alpha_lock);
+        assert_eq!(loaded.layers[0].layer_color, Some([128, 32, 200]));
+        assert_eq!(loaded.layers[0].pixels.pixel(0, 0), [0, 0, 0, 255]);
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut merged = Vec::new();
+        zip.by_name("merged.png")
+            .unwrap()
+            .read_to_end(&mut merged)
+            .unwrap();
+        assert_eq!(
+            image::load_from_memory(&merged)
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(0, 0)
+                .0,
+            [128, 32, 200, 255]
+        );
+        let png = tmp.join("color.png");
+        export_png(&png, &doc).unwrap();
+        assert_eq!(
+            image::open(png).unwrap().to_rgba8().get_pixel(0, 0).0,
+            [128, 32, 200, 255]
+        );
+        let jpg = tmp.join("color.jpg");
+        export_jpeg(&jpg, &doc, 100).unwrap();
+        assert!(
+            image::open(jpg)
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0
+                .iter()
+                .zip([128, 32, 200])
+                .all(|(a, b)| a.abs_diff(b) <= 2)
+        );
+        let warnings = export_psd_report(&tmp.join("color.psd"), &doc).unwrap();
+        assert!(warnings.iter().any(|s| s.contains("透明ピクセル")));
+        assert!(warnings.iter().any(|s| s.contains("レイヤーカラー")));
+        let read = import_psd(&tmp.join("color.psd")).unwrap();
+        assert_eq!(read.layers[0].pixels.pixel(0, 0), [128, 32, 200, 255]);
+        assert_eq!(&composite_transparent(&read)[..4], &[128, 32, 200, 255]);
+    }
     fn psd_masked_layer_fixture(mask_flags: u8, mask_default: u8, mask_value: u8) -> Vec<u8> {
         psd_masked_layer_fixture_with_parameters(mask_flags, mask_default, mask_value, None)
     }

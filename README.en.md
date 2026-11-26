@@ -62,12 +62,12 @@ See the [User Guide](docs/USER_GUIDE.md) and in-app Help for detailed steps and 
 
 | What you want to do | Tools |
 | --- | --- |
-| Draw and paint | Pen, pencil, watercolor and other brushes; colour mixing, stabilization, pressure curves, tapers, tip and grain textures. Import and export brush sets. |
-| Organize artwork in layers | Raster and vector layers, folders, blend modes, clipping and masks. Vector lines remain editable through their control points. |
-| Edit part of an image | Rectangle, lasso, magic wand and other selections; selection brush, quick mask, move, transform, mesh warp, copy and paste, flood fill. |
-| Adjust colours and finish | Blur, sharpen, tone curve, hue/saturation/brightness, mosaic, line width and other filters, with before/after previews. |
+| Draw and paint | Use pen, pencil and watercolor brushes with pressure curves, stabilization, tapers and textured tips. Pick colours on the HSV ring and square, mix paint, draw shapes and drag out gradients. Import and export brush sets. |
+| Organize artwork in layers | Raster and vector layers, folders, 14 blend modes, transparent pixel locking, layer tinting, layer and folder merging, clipping and masks. Vector lines remain editable through their control points. |
+| Edit part of an image | Select with a rectangle, lasso, magic wand, brush or quick mask. Move, crop, fill, copy and paste, or drag handles for free transform and 4×4 mesh warp. |
+| Adjust colours and finish | Blur, sharpen, tone curve, hue/saturation/brightness, mosaic, line width, invert, luminance to opacity, posterize, threshold, colour balance, gradient map and outline, with before/after previews. |
 | Make manga | Page setup with bleed and trim, panel splitting, screentones, focus and speed lines, speech balloons with vertical text, multi-page books and batch PNG export. |
-| Set up your canvas view | Rotation, flipping, zoom, rulers, symmetry, a checkerboard for transparency and tabs for multiple documents. |
+| Set up your canvas view | Rotation, flipping, zoom, rulers, symmetry, a checkerboard for transparency, a brush-size cursor, the History panel and document tabs. |
 
 PNG, JPEG, BMP, GIF and PSD files can be imported. Open an image, paint on it and save it as `.efude`.
 

@@ -27,9 +27,53 @@ pub const FAST_SCREEN_SPEED: f32 = 0.5;
 /// 2000 px).
 const CHARGE_PER_PIXEL: f32 = 1.0 / 2000.0;
 
+fn stroke_seed(origin: Vec2) -> u64 {
+    u64::from(origin.x.to_bits()) << 32 | u64::from(origin.y.to_bits())
+}
+
+fn jitter_color(color: [u8; 4], brush: &Brush, seed: u64, index: u64) -> [u8; 4] {
+    if brush.hue_jitter == 0. && brush.saturation_jitter == 0. && brush.brightness_jitter == 0. {
+        return color;
+    }
+    // SplitMix64: independent deterministic samples for the three components.
+    let mut state = seed.wrapping_add(index.wrapping_mul(3).wrapping_mul(0x9e3779b97f4a7c15));
+    let mut signed = || {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut h = state;
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
+        ((h ^ (h >> 31)) >> 40) as f32 / 8388607.5 - 1.
+    };
+    let [r, g, b, _] = color.map(|v| v as f32 / 255.);
+    let v = r.max(g).max(b);
+    let delta = v - r.min(g).min(b);
+    let h = if delta == 0. {
+        0.
+    } else if v == r {
+        (g - b) / delta
+    } else if v == g {
+        2. + (b - r) / delta
+    } else {
+        4. + (r - g) / delta
+    };
+    let h = (h + signed() * 3. * brush.hue_jitter).rem_euclid(6.);
+    let s =
+        (if v > 0. { delta / v } else { 0. } + signed() * brush.saturation_jitter).clamp(0., 1.);
+    let v = (v + signed() * brush.brightness_jitter).clamp(0., 1.);
+    let channel = |offset: f32| {
+        let k = (offset + h) % 6.;
+        (255. * v * (1. - s * k.min(4. - k).clamp(0., 1.))).round() as u8
+    };
+    [channel(5.), channel(3.), channel(1.), color[3]]
+}
+
 /// Per-dab multipliers derived from pressure, speed, tilt and the taper.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dynamics {
+    /// Stroke tangent, after any reflection or rotational symmetry.
+    pub direction_angle: Option<f32>,
+    /// Final straight RGBA captured before advancing a queued input dab.
+    pub dab_color: Option<[u8; 4]>,
     pub size: f32,
     pub opacity: f32,
     pub concentration: f32,
@@ -40,6 +84,8 @@ pub struct Dynamics {
 impl Default for Dynamics {
     fn default() -> Self {
         Self {
+            direction_angle: None,
+            dab_color: None,
             size: 1.0,
             opacity: 1.0,
             concentration: 1.0,
@@ -90,6 +136,8 @@ pub fn dynamics(
     };
     let taper = p.taper.clamp(0.01, 1.0);
     Dynamics {
+        direction_angle: None,
+        dab_color: None,
         size: mapped(brush.size_source, brush.size_min)
             * if has_previous {
                 (1. + brush.speed_size.clamp(-1., 1.) * (speed - 0.5) * 1.5).clamp(0.2, 1.8)
@@ -202,7 +250,8 @@ impl DabGeometry {
         } else {
             0.
         };
-        let angle = brush.tip_rotation.to_radians() + p.rotation + tilt_angle;
+        let angle = brush.tip_rotation.to_radians()
+            + dynamics.direction_angle.unwrap_or(p.rotation + tilt_angle);
         let (sin, cos) = angle.sin_cos();
         let hard_edged = !matches!(
             style.kind,
@@ -376,6 +425,7 @@ impl StrokeCover {
         base: impl FnOnce() -> [u8; 4],
         color: [f32; 3],
         alpha: f32,
+        alpha_lock: bool,
     ) -> [u8; 4] {
         let texel = self.texel(x, y, base);
         if alpha >= texel.alpha.to_f32() {
@@ -383,6 +433,9 @@ impl StrokeCover {
             texel.color = color.map(f16::from_f32);
         }
         let a = texel.alpha.to_f32();
+        if alpha_lock {
+            return locked_color(texel.base, texel.color.map(f16::to_f32), a);
+        }
         let base = texel.base.map(|channel| channel as f32 / 255.0);
         let out_alpha = a + base[3] * (1.0 - a);
         let mut out = [0u8; 4];
@@ -476,6 +529,7 @@ pub struct CoverTile {
 /// the same result as [`StrokeRaster::stamp`] (up to rounding).
 #[derive(Clone, Debug)]
 pub struct CoverBatch<'a> {
+    pub alpha_lock: bool,
     pub eraser: bool,
     /// Pencil paper noise.
     pub pencil: bool,
@@ -580,6 +634,15 @@ fn f16_round(value: f32) -> f32 {
     f16::from_f32(value).to_f32()
 }
 
+fn locked_color(mut base: [u8; 4], paint: [f32; 3], a: f32) -> [u8; 4] {
+    if base[3] > 0 {
+        for c in 0..3 {
+            base[c] = (paint[c] * 255. * a + base[c] as f32 * (1. - a)).round() as u8;
+        }
+    }
+    base
+}
+
 fn paint_cover_tile(batch: &CoverBatch, tile: &CoverTile) -> CoverTileResult {
     let cells = (COVER_TILE * COVER_TILE) as usize;
     let mut state = tile.state.clone();
@@ -593,7 +656,7 @@ fn paint_cover_tile(batch: &CoverBatch, tile: &CoverTile) -> CoverTileResult {
             let selection = tile.selection[cell] as f32 / 255.0;
             let mut st = state[cell];
             let mut hit = false;
-            if selection > 0.0 {
+            if selection > 0.0 && !(batch.alpha_lock && (batch.eraser || tile.base[cell][3] == 0)) {
                 for dab in &dabs {
                     let (dx, dy) = (
                         x as f32 + 0.5 - dab.center[0],
@@ -647,7 +710,13 @@ fn paint_cover_tile(batch: &CoverBatch, tile: &CoverTile) -> CoverTileResult {
             state[cell] = st;
             touched[cell] = hit;
             let base = tile.base[cell];
-            out[cell] = if batch.eraser {
+            out[cell] = if batch.alpha_lock {
+                if batch.eraser {
+                    base
+                } else {
+                    locked_color(base, [st[0], st[1], st[2]], st[3])
+                }
+            } else if batch.eraser {
                 let a = (base[3] as f32 * (1.0 - st[3])).round().clamp(0.0, 255.0) as u8;
                 if a > 0 {
                     [base[0], base[1], base[2], a]
@@ -779,6 +848,9 @@ pub struct StrokeRaster {
     pub remaining_charge: f32,
     /// Previous dab of this stroke, for speed and direction.
     pub last_dab: Option<InkPoint>,
+    last_direction_angle: Option<f32>,
+    dab_index: u64,
+    stroke_seed: u64,
     /// The stroke's first point: grain turns around it (see
     /// `grain_rotation`).
     pub grain_origin: Vec2,
@@ -813,6 +885,9 @@ impl StrokeRaster {
             previous_mix_color: paint,
             remaining_charge: charge,
             last_dab: None,
+            last_direction_angle: None,
+            dab_index: 0,
+            stroke_seed: stroke_seed(grain_origin),
             grain_origin,
             grain_rotation: 0.0,
             accum: HashMap::new(),
@@ -827,6 +902,10 @@ impl StrokeRaster {
 
     /// Clears per-pixel stroke buffers and samplers (keeps colour state).
     pub fn reset_buffers(&mut self) {
+        self.dab_index = 0;
+        self.last_direction_angle = None;
+        self.last_dab = None;
+        self.stroke_seed = stroke_seed(self.grain_origin);
         self.accum = HashMap::new();
         self.cover = StrokeCover::default();
         self.reservoir = None;
@@ -834,6 +913,56 @@ impl StrokeRaster {
         self.wet_base = HashMap::new();
         self.layer_sampler = None;
         self.composite_sampler = None;
+    }
+
+    /// Set the stroke origin used by grain and deterministic colour variation.
+    pub fn set_grain_origin(&mut self, origin: Vec2) {
+        self.grain_origin = origin;
+        self.stroke_seed = stroke_seed(origin);
+    }
+
+    /// Last valid tangent when the new point is stationary.
+    pub fn direction_angle(&self, p: &InkPoint) -> Option<f32> {
+        Self::tangent(self.last_dab, p, self.last_direction_angle)
+    }
+
+    fn tangent(previous: Option<InkPoint>, p: &InkPoint, last_angle: Option<f32>) -> Option<f32> {
+        previous
+            .and_then(|last| {
+                let d = p.position - last.position;
+                (d.length_squared() >= 1e-6).then(|| d.y.atan2(d.x))
+            })
+            .or(last_angle)
+    }
+    /// Capture colour and orientation before advancing a queued input dab.
+    pub fn prepare_dynamics(&self, style: DabStyle, p: &InkPoint, dynamics: Dynamics) -> Dynamics {
+        let angle = if style.brush.follow_stroke_direction && dynamics.direction_angle.is_none() {
+            self.direction_angle(p)
+        } else {
+            None
+        };
+        self.prepare_variation(style, dynamics, angle, self.dab_index)
+    }
+
+    fn prepare_variation(
+        &self,
+        style: DabStyle,
+        mut dynamics: Dynamics,
+        angle: Option<f32>,
+        index: u64,
+    ) -> Dynamics {
+        if style.brush.follow_stroke_direction {
+            dynamics.direction_angle.get_or_insert(angle.unwrap_or(0.));
+        }
+        if !style.eraser && dynamics.dab_color.is_none() {
+            dynamics.dab_color = Some(jitter_color(
+                style.color,
+                style.brush,
+                self.stroke_seed,
+                index,
+            ));
+        }
+        dynamics
     }
 
     /// Paints one dab. Call `finish_dab` once per input dab afterwards (a
@@ -845,6 +974,15 @@ impl StrokeRaster {
         dynamics: &Dynamics,
         p: InkPoint,
     ) {
+        if style.eraser && target.doc.layers[target.layer].alpha_lock {
+            return;
+        }
+        let prepared = self.prepare_dynamics(style, &p, *dynamics);
+        let dynamics = &prepared;
+        let style = DabStyle {
+            color: prepared.dab_color.unwrap_or(style.color),
+            ..style
+        };
         if self.composite_sampler.is_none() {
             self.layer_sampler = match style.brush.mix.reference_target {
                 ReferenceTarget::Layer(layer_id) => {
@@ -1025,7 +1163,10 @@ impl StrokeRaster {
                     Some(mask) => mask.get(pixel_index).copied().unwrap_or(0) as f32 / 255.0,
                     None => 1.0,
                 };
-                if selection_coverage <= 0.0 {
+                if selection_coverage <= 0.0
+                    || (target.doc.layers[layer].alpha_lock
+                        && target.doc.layers[layer].pixels.pixel(xx as u32, yy as u32)[3] == 0)
+                {
                     continue;
                 }
                 for ch in 0..4 {
@@ -1134,9 +1275,14 @@ impl StrokeRaster {
                     // keeps building up, like spray.
                     let color = [c[0], c[1], c[2]].map(|channel| channel as f32 / 255.0);
                     let layer = &mut target.doc.layers[layer];
-                    let out = self
-                        .cover
-                        .paint(px, py, || layer.pixels.pixel(px, py), color, a);
+                    let out = self.cover.paint(
+                        px,
+                        py,
+                        || layer.pixels.pixel(px, py),
+                        color,
+                        a,
+                        layer.alpha_lock,
+                    );
                     layer.pixels.set_pixel(px, py, out);
                     continue;
                 }
@@ -1279,11 +1425,15 @@ impl StrokeRaster {
             |xx: i32, yy: i32| current[((yy - gy0) as usize) * gw as usize + (xx - gx0) as usize];
         let selection = target.selection;
         let doc_width = width as usize;
+        let alpha_lock = target.doc.layers[target.layer].alpha_lock;
         let reservoir = self.reservoir;
         let (bw, bh) = ((bx1 - bx0 + 1) as usize, (by1 - by0 + 1) as usize);
         // What each reached pixel becomes (converted here, in parallel).
         let compute = |yy: i32, row: &mut [Option<Stored>]| {
             let compute_one = |xx: i32| -> Option<([f32; 4], f32)> {
+                if alpha_lock && at(xx, yy)[3] == 0. {
+                    return None;
+                }
                 let (dx, dy) = (xx as f32 + 0.5 - g.center.x, yy as f32 + 0.5 - g.center.y);
                 let (local_x, local_y) = (dx * g.cos + dy * g.sin, -dx * g.sin + dy * g.cos);
                 let distance2 = local_x * local_x / (g.aspect * g.aspect)
@@ -1393,8 +1543,12 @@ impl StrokeRaster {
                 None
             };
             for xx in bx0..=bx1 {
-                row[(xx - bx0) as usize] =
-                    compute_one(xx).map(|(pixel, wet)| Stored::new(pixel, wet));
+                row[(xx - bx0) as usize] = compute_one(xx).map(|(mut pixel, wet)| {
+                    if alpha_lock {
+                        pixel[3] = at(xx, yy)[3];
+                    }
+                    Stored::new(pixel, wet)
+                });
             }
         };
         let mut out: Vec<Option<Stored>> = vec![None; bw * bh];
@@ -1529,6 +1683,8 @@ impl StrokeRaster {
         self.stamp_many_with_fallback(target, style, stamps, accelerator, min_pixels, None);
     }
 
+    /// With varying colour or direction, prepare each queued stamp with
+    /// [`Self::prepare_dynamics`] before advancing its logical input dab.
     /// Like [`Self::stamp_many`], but batches that do not go to
     /// `accelerator` go to `fallback` (typically [`CpuCover`]) before the
     /// per-dab CPU path.
@@ -1541,6 +1697,38 @@ impl StrokeRaster {
         min_pixels: f32,
         fallback: Option<&dyn CoverAccelerator>,
     ) {
+        let brush = style.brush;
+        let varies = brush.follow_stroke_direction
+            || brush.hue_jitter > 0.
+            || brush.saturation_jitter > 0.
+            || brush.brightness_jitter > 0.;
+        let prepared;
+        let stamps = if varies
+            && stamps.iter().any(|(_, d)| {
+                (!style.eraser && d.dab_color.is_none())
+                    || (brush.follow_stroke_direction && d.direction_angle.is_none())
+            }) {
+            let mut previous = self.last_dab;
+            let mut angle = self.last_direction_angle;
+            prepared = stamps
+                .iter()
+                .enumerate()
+                .map(|(offset, &(point, dynamics))| {
+                    angle = Self::tangent(previous, &point, angle);
+                    let dynamics = self.prepare_variation(
+                        style,
+                        dynamics,
+                        angle,
+                        self.dab_index.wrapping_add(offset as u64),
+                    );
+                    previous = Some(point);
+                    (point, dynamics)
+                })
+                .collect::<Vec<_>>();
+            prepared.as_slice()
+        } else {
+            stamps
+        };
         if (accelerator.is_some() || fallback.is_some())
             && accelerator_can_paint(style)
             && !stamps.is_empty()
@@ -1602,8 +1790,11 @@ impl StrokeRaster {
                 } else {
                     factors.paint
                 },
-                color: [style.color[0], style.color[1], style.color[2]]
-                    .map(|channel| channel as f32 / 255.0),
+                color: {
+                    let color = dynamics.dab_color.unwrap_or(style.color);
+                    [color[0], color[1], color[2]]
+                }
+                .map(|channel| channel as f32 / 255.0),
             });
             // Same pixel range as the CPU loop in `stamp`.
             let Some([x0, y0, x1, y1]) = dab_bounds(g.center, g.max_radius, width, height) else {
@@ -1663,6 +1854,7 @@ impl StrokeRaster {
             });
         }
         let batch = CoverBatch {
+            alpha_lock: target.doc.layers[layer].alpha_lock,
             eraser: style.eraser,
             pencil: matches!(style.kind, BrushKind::Pencil),
             grain_strength: brush.grain,
@@ -1729,6 +1921,8 @@ impl StrokeRaster {
                 - charge_depletion(style.brush, style.eraser, travelled))
             .max(0.0);
         }
+        self.dab_index = self.dab_index.wrapping_add(1);
+        self.last_direction_angle = self.direction_angle(&p);
         self.last_dab = Some(p);
     }
 
@@ -1876,6 +2070,13 @@ impl StrokeRaster {
     }
 
     fn store_stroke_pixel(&mut self, target: &mut DabTarget, x: u32, y: u32, mut pixel: [f32; 4]) {
+        if target.doc.layers[target.layer].alpha_lock {
+            let a = target.doc.layers[target.layer].pixels.pixel(x, y)[3];
+            if a == 0 {
+                return;
+            }
+            pixel[3] = a as f32 / 255.;
+        }
         for channel in &mut pixel {
             *channel = channel.clamp(0.0, 1.0);
         }
@@ -2212,6 +2413,38 @@ mod tests {
         assert_eq!(pixels(&doc), painted);
     }
 
+    #[test]
+    fn jitter_is_reproducible_changes_by_dab_and_preserves_alpha() {
+        let mut brush = crate::defaults().remove(0);
+        let input = [162, 97, 50, 117];
+        let seed = stroke_seed(Vec2::new(1., 4.));
+        for channel in 0..3 {
+            brush.hue_jitter = if channel == 0 { 0.65 } else { 0. };
+            brush.saturation_jitter = if channel == 1 { 0.65 } else { 0. };
+            brush.brightness_jitter = if channel == 2 { 0.65 } else { 0. };
+            let colors: Vec<_> = (0..16)
+                .map(|i| jitter_color(input, &brush, seed, i))
+                .collect();
+            assert!(colors.windows(2).any(|pair| pair[0] != pair[1]));
+            for (i, color) in colors.into_iter().enumerate() {
+                assert_eq!(color[3], 117);
+                assert_eq!(color, jitter_color(input, &brush, seed, i as u64));
+            }
+        }
+    }
+    #[test]
+    fn stationary_dab_retains_last_tangent() {
+        let mut raster = StrokeRaster::default();
+        let mut p = InkPoint::new(8., 8., 1., 0);
+        raster.last_dab = Some(p);
+        p.position.y += 3.;
+        raster.last_direction_angle = raster.direction_angle(&p);
+        raster.last_dab = Some(p);
+        assert_eq!(
+            raster.direction_angle(&p),
+            Some(std::f32::consts::FRAC_PI_2)
+        );
+    }
     #[test]
     fn enormous_imported_pen_dab_is_limited_to_document() {
         for size in [3.0e38, 1.0e6] {
@@ -2554,6 +2787,47 @@ mod tests {
         assert!(doc.layers[0].pixels.pixel(80, 20)[2] > 200);
     }
 
+    #[test]
+    fn locked_dense_brushes_and_wet_edges_keep_every_alpha_byte() {
+        for kind in [
+            BrushKind::Airbrush,
+            BrushKind::Blur,
+            BrushKind::Smudge,
+            BrushKind::Pen,
+        ] {
+            let mut brush = crate::defaults().remove(0);
+            brush.kind = kind;
+            if kind == BrushKind::Pen {
+                brush.mix.blend = 0.5;
+                brush.wet_edge_on = true;
+                brush.wet_edge = 1.;
+            }
+            let mut doc = Document::new(20, 12);
+            doc.layers[0].alpha_lock = true;
+            for y in 0..12 {
+                for x in 0..20 {
+                    doc.layers[0].pixels.set_pixel(
+                        x,
+                        y,
+                        [x as u8 * 10, 64, y as u8 * 20, (x % 4) as u8 * 85],
+                    );
+                }
+            }
+            let before = doc.layers[0].pixels.to_dense();
+            let points: Vec<_> = (0..16)
+                .map(|x| InkPoint::new(x as f32 + 1., 5., 1., x))
+                .collect();
+            stroke(&mut doc, &brush, [220, 30, 70, 230], 8., false, &points);
+            let after = doc.layers[0].pixels.to_dense();
+            assert_ne!(before, after);
+            for (a, b) in before.chunks_exact(4).zip(after.chunks_exact(4)) {
+                assert_eq!(a[3], b[3]);
+                if a[3] == 0 {
+                    assert_eq!(a, b);
+                }
+            }
+        }
+    }
     #[test]
     fn wet_paint_follows_pressure_and_does_not_pile_up() {
         let alpha_at = |pressure: f32| {

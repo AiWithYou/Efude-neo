@@ -40,6 +40,7 @@ impl EfudeApp {
 
     pub(crate) fn capture_coalesced_window_contacts_before_ui(&mut self, ctx: &egui::Context) {
         if self.canvas_input_handled
+            || self.reserves_canvas_pointer(ctx)
             || !self.uses_contact_strokes()
             || self.paste_preview.is_some()
             || self.selection_start.is_some()
@@ -133,9 +134,9 @@ impl EfudeApp {
             }
             self.history.begin();
             self.raster.previous_mix_color = [
-                self.color.r() as f32 / 255.,
-                self.color.g() as f32 / 255.,
-                self.color.b() as f32 / 255.,
+                self.color[0] as f32 / 255.,
+                self.color[1] as f32 / 255.,
+                self.color[2] as f32 / 255.,
             ];
             self.raster.remaining_charge = self.brushes[self.selected_brush].mix.charge;
         }
@@ -144,6 +145,18 @@ impl EfudeApp {
         self.raster.last_dab = None;
         self.input_diagnostics = InputDiagnostics::default();
         self.start_window_samples(ctx, origin, rect, scale);
+        if modifiers.shift
+            && matches!(self.tool, Tool::Brush | Tool::Eraser)
+            && let Some((layer, previous)) = self.studio.last_brush_point
+            && layer == self.doc.layers[self.selected_layer].id
+        {
+            let time = ctx.input(|i| (i.time * 1000.) as u64);
+            self.push_live_sample(
+                InkPoint::new(previous.x, previous.y, 1., time.saturating_sub(1)),
+                None,
+                ctx,
+            );
+        }
         self.canvas_gesture_interrupted = false;
     }
 
@@ -155,6 +168,7 @@ impl EfudeApp {
         scale: f32,
     ) -> bool {
         self.canvas_viewport.0.contains(pos)
+            && !self.hud_bounds().contains(pos)
             && self.canvas_contains_screen_position(pos, rect, scale)
             && self.canvas_input_layer.is_some()
             && self.canvas_input_layer == ctx.layer_id_at(pos)
@@ -171,7 +185,8 @@ impl EfudeApp {
             }
             return;
         };
-        if !self.uses_contact_strokes()
+        if self.reserves_canvas_pointer(ctx)
+            || !self.uses_contact_strokes()
             || self.paste_preview.is_some()
             || !ctx.input(|input| input.focused)
         {
@@ -591,6 +606,178 @@ impl EfudeApp {
         self.gesture_end = None
     }
 
+    fn rotation_key_down(&self, input: &egui::InputState) -> bool {
+        input.key_down(egui::Key::R)
+            && !self
+                .tool_bindings()
+                .iter()
+                .any(|(key, _)| *key == egui::Key::R)
+    }
+    fn reserves_canvas_pointer(&self, ctx: &egui::Context) -> bool {
+        self.transform_session.is_some()
+            || self.studio.size_drag.is_some()
+            || self.studio.rotate_drag.is_some()
+            || self.studio.sampled_from.is_some()
+            || ctx.input(|i| self.rotation_key_down(i) || i.modifiers.alt && !i.modifiers.shift)
+    }
+    fn canvas_navigation(
+        &mut self,
+        response: &egui::Response,
+        painter: &egui::Painter,
+        rect: Rect,
+        scale: f32,
+        to_screen: &impl Fn(Vec2) -> Pos2,
+    ) -> bool {
+        let ctx = &response.ctx;
+        let primary = egui::PointerButton::Primary;
+        let (mods, r, origin, down) = ctx.input(|i| {
+            (
+                i.modifiers,
+                self.rotation_key_down(i),
+                i.pointer.press_origin(),
+                i.pointer.primary_down(),
+            )
+        });
+        let hover = ctx.pointer_hover_pos().filter(|p| {
+            response.hovered()
+                && self.canvas_contains_screen_position(*p, rect, scale)
+                && !self.hud_bounds().contains(*p)
+        });
+        let pos = response.interact_pointer_pos().or(hover);
+        if response.drag_started_by(primary)
+            && origin.is_some_and(|p| self.hud_bounds().contains(p))
+        {
+            return true;
+        }
+        if self.transform_session.is_some() {
+            return false;
+        }
+        if response.drag_started_by(primary)
+            && let Some(start) = origin
+        {
+            if r {
+                self.studio.rotate_drag =
+                    Some(((start - rect.center()).angle(), self.view_rotation));
+            } else if mods.ctrl && mods.alt && self.uses_contact_strokes() {
+                self.studio.size_drag = Some((start, self.size));
+            }
+        }
+        if let Some((angle, base)) = self.studio.rotate_drag {
+            if let Some(p) = pos {
+                let raw = base + ((p - rect.center()).angle() - angle).to_degrees();
+                self.view_rotation = if mods.shift {
+                    (raw / 15.).round() * 15.
+                } else {
+                    raw
+                };
+                painter.text(
+                    p,
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{:.0}°", self.view_rotation),
+                    egui::FontId::monospace(14.),
+                    Color32::WHITE,
+                );
+            }
+            if !down {
+                self.studio.rotate_drag = None;
+            }
+            return true;
+        }
+        if let Some((start, size)) = self.studio.size_drag {
+            if let Some(p) = pos {
+                self.size = (size * ((p.x - start.x) / 80.).exp()).clamp(1., MAX_BRUSH_SIZE);
+                self.brushes[self.selected_brush].size = self.size;
+            }
+            let radius = (self.size * scale * 0.5).max(1.);
+            painter.circle_stroke(start, radius, Stroke::new(3., Color32::BLACK));
+            painter.circle_stroke(start, radius, Stroke::new(1., Color32::WHITE));
+            painter.text(
+                start + Vec2::new(8., 8.),
+                egui::Align2::LEFT_TOP,
+                format!("{:.1} px", self.size),
+                egui::FontId::monospace(13.),
+                Color32::WHITE,
+            );
+            if !down {
+                self.studio.size_drag = None;
+            }
+            return true;
+        }
+        if mods.alt
+            && !mods.ctrl
+            && !mods.command
+            && !mods.shift
+            && self.studio.drag.is_none()
+            && self.selection_start.is_none()
+            && matches!(
+                self.tool,
+                Tool::Brush | Tool::Eraser | Tool::Fill | Tool::Gradient | Tool::Shape
+            )
+        {
+            if let Some(p) = hover.or_else(|| response.dragged_by(primary).then_some(pos).flatten())
+            {
+                let q = self.document_position_unsnapped(p, rect, scale);
+                if let Some(sample) = self.sample_eyedropper(q.x.floor() as i32, q.y.floor() as i32)
+                {
+                    let before = *self.studio.sampled_from.get_or_insert(self.color);
+                    for (half, color) in [(0, before), (1, sample)] {
+                        let path = (0..=32)
+                            .map(|i| {
+                                p + Vec2::angled(
+                                    (half as f32 + i as f32 / 32.) * std::f32::consts::PI,
+                                ) * 19.
+                            })
+                            .collect();
+                        painter.add(egui::Shape::line(
+                            path,
+                            Stroke::new(6., color_panel::swatch_color(color)),
+                        ));
+                    }
+                    if response.dragged_by(primary)
+                        || response.drag_started_by(primary)
+                        || response.drag_stopped_by(primary)
+                    {
+                        self.color = sample;
+                        self.transparent_color = false;
+                    }
+                }
+            }
+            return true;
+        }
+        self.studio.sampled_from = None;
+        if let Some(p) = hover
+            && self.uses_contact_strokes()
+        {
+            let brush = &self.brushes[self.selected_brush];
+            let aspect = brush.tip_aspect.clamp(0.1, 10.);
+            let radius = (self.size * scale * 0.5).max(1.5) / scale;
+            let rotate = egui::emath::Rot2::from_angle(brush.tip_rotation.to_radians());
+            let center = self.document_position_unsnapped(p, rect, scale);
+            let points: Vec<_> = (0..48)
+                .map(|i| {
+                    to_screen(
+                        center
+                            + rotate
+                                * (Vec2::angled(i as f32 * std::f32::consts::TAU / 48.)
+                                    * Vec2::new(aspect, 1. / aspect)
+                                    * radius),
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(
+                points.clone(),
+                Stroke::new(3., Color32::BLACK),
+            ));
+            painter.add(egui::Shape::closed_line(
+                points,
+                Stroke::new(1., Color32::WHITE),
+            ));
+            for v in [Vec2::new(2., 0.), Vec2::new(0., 2.)] {
+                painter.line_segment([p - v, p + v], Stroke::new(1., Color32::WHITE));
+            }
+        }
+        false
+    }
     /// Draws the canvas into `ui` and handles pointer input on it.
     pub(crate) fn canvas_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.painter().rect_filled(
@@ -697,7 +884,23 @@ impl EfudeApp {
         // The composite is always stored upright; rotation and flips are
         // applied when it is drawn (see `canvas_quad`).
         let mut gpu_canvas_active = false;
-        if self.gpu_dab_pipeline.is_some() && !self.gpu_canvas_disabled {
+        let viewport_texture = self.needs_viewport_texture(ctx);
+        let visible_region = if viewport_texture {
+            self.preview_region(
+                rect,
+                painter.clip_rect(),
+                scale,
+                ctx.pixels_per_point(),
+                self.max_texture_side(ctx),
+            )
+        } else {
+            None
+        };
+        if self.canvas_region != visible_region {
+            self.canvas_texture_dirty = true;
+        }
+        self.canvas_region = visible_region;
+        if !viewport_texture && self.gpu_dab_pipeline.is_some() && !self.gpu_canvas_disabled {
             // The GPU display has its own texture; only changed tiles are
             // recomposited unless everything must be redrawn.
             let surface_missing = self.gpu_canvas_surface.as_ref().is_none_or(|surface| {
@@ -710,7 +913,24 @@ impl EfudeApp {
                 gpu_canvas_active = self.gpu_canvas_surface.is_some();
             }
         }
-        if !gpu_canvas_active && (self.canvas_texture_dirty || self.canvas_texture.is_none()) {
+        if viewport_texture {
+            if let Some(region) = visible_region
+                && (self.canvas_texture_dirty
+                    || !self.dirty_canvas_tiles.is_empty()
+                    || self.canvas_texture.is_none())
+            {
+                let image = self.display_region(region);
+                if let Some(texture) = &mut self.canvas_texture {
+                    texture.set(image, display::CANVAS_TEXTURE);
+                } else {
+                    self.canvas_texture =
+                        Some(ctx.load_texture("canvas-viewport", image, display::CANVAS_TEXTURE));
+                }
+                self.canvas_texture_dirty = false;
+                self.dirty_canvas_tiles.clear();
+            }
+        } else if !gpu_canvas_active && (self.canvas_texture_dirty || self.canvas_texture.is_none())
+        {
             let pixels = efude_canvas::composite_display(&self.doc, self.display_checker());
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [self.doc.width as usize, self.doc.height as usize],
@@ -790,7 +1010,7 @@ impl EfudeApp {
             corners,
             Color32::WHITE,
         ));
-        let reduced = if gpu_canvas_active {
+        let reduced = if gpu_canvas_active || viewport_texture {
             None
         } else {
             self.cpu_mips.texture_for(ctx, scale * pixels_per_point)
@@ -801,7 +1021,19 @@ impl EfudeApp {
             _ => None,
         };
         if let Some(texture) = picture {
-            painter.add(canvas_quad(texture, corners, Color32::WHITE));
+            if let Some(region) = visible_region {
+                let r = region.rect;
+                let corners = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                ]
+                .map(|p| to_screen(p.to_vec2()));
+                painter.add(canvas_quad(texture, corners, Color32::WHITE));
+            } else if !viewport_texture {
+                painter.add(canvas_quad(texture, corners, Color32::WHITE));
+            }
         }
         if let Some((paste_w, paste_h, _, position)) = &self.paste_preview
             && let Some(texture) = &self.paste_texture
@@ -906,7 +1138,7 @@ impl EfudeApp {
                 Tool::Eraser => Color32::from_gray(230),
                 Tool::SelectionBrush => Color32::from_rgb(60, 160, 255),
                 Tool::QuickMask => Color32::from_rgb(250, 80, 90),
-                _ => self.color,
+                _ => color_panel::swatch_color(self.color),
             };
             painter.line_segment(
                 [from, to],
@@ -1151,7 +1383,26 @@ impl EfudeApp {
         self.paint_finishing_check(&painter, &to_screen);
         self.paint_balloon_overlay(&painter, &to_screen);
         self.paint_vector_overlay(&painter, &to_screen);
+        if self.tool == Tool::PolygonSelect {
+            let mut path: Vec<_> = self
+                .selection_points
+                .iter()
+                .map(|&(x, y)| to_screen(Vec2::new(x as f32, y as f32)))
+                .collect();
+            if !path.is_empty()
+                && response.hovered()
+                && let Some(pos) = ctx.pointer_hover_pos()
+            {
+                path.push(pos);
+            }
+            if path.len() > 1 {
+                painter.add(egui::Shape::line(path, Stroke::new(1.5, Color32::WHITE)));
+            }
+        }
         if !ctx.input(|input| input.focused) {
+            self.studio.size_drag = None;
+            self.studio.rotate_drag = None;
+            self.studio.sampled_from = None;
             return;
         }
         if self.canvas_input_handled {
@@ -1166,6 +1417,12 @@ impl EfudeApp {
             return;
         }
         self.canvas_gesture_interrupted = false;
+        if self.paste_preview.is_none()
+            && (self.canvas_navigation(&response, &painter, rect, scale, &to_screen)
+                || self.geometry_canvas(&response, &painter, rect, scale, &to_screen))
+        {
+            return;
+        }
         if response.drag_started_by(egui::PointerButton::Primary)
             && self.paste_preview.is_none()
             && let Some(pos) = response.interact_pointer_pos()
@@ -1400,7 +1657,11 @@ impl EfudeApp {
 /// A textured quad from document corners (top-left, top-right,
 /// bottom-right, bottom-left) already mapped to the screen. The default
 /// texture id gives a plain fill.
-fn canvas_quad(texture: egui::TextureId, corners: [Pos2; 4], tint: Color32) -> egui::Shape {
+pub(super) fn canvas_quad(
+    texture: egui::TextureId,
+    corners: [Pos2; 4],
+    tint: Color32,
+) -> egui::Shape {
     let mut mesh = egui::Mesh::with_texture(texture);
     let uvs = [
         Pos2::new(0.0, 0.0),

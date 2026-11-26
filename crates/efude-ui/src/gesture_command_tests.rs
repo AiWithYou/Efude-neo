@@ -16,7 +16,7 @@ fn oversized_brush_mask_paint_is_bounded_by_the_document_and_undoable() {
         app.size = size;
         app.dynamic_size = dynamic_size;
         app.brushes[app.selected_brush].tip_aspect = aspect;
-        app.color = Color32::BLACK;
+        app.color = [0, 0, 0, 255];
         let pixels = app.doc.layers[0].pixels.to_dense();
         app.history.begin();
         app.dab_mask(InkPoint::new(1.0, 1.0, 1.0, 0));
@@ -89,7 +89,7 @@ impl Harness {
         app.use_windows_ink = false;
         app.use_wintab = false;
         app.selected_layer = 0;
-        app.color = Color32::BLACK;
+        app.color = [0, 0, 0, 255];
         app.tool = tool;
         app.size = 6.0;
         let ctx = egui::Context::default();

@@ -20,7 +20,7 @@ impl BatchedPanelHarness {
         app.use_wintab = false;
         app.show_tools_panel = false;
         app.size = 8.0;
-        app.color = Color32::BLACK;
+        app.color = [0, 0, 0, 255];
         app.brushes[app.selected_brush].opacity = 0.5;
         // A supported dock arrangement that renders the command before Canvas.
         app.workspace = egui_dock::DockState::new(vec![pane]);

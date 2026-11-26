@@ -153,7 +153,11 @@ impl EfudeApp {
         tab.history
             .record_all_layer_tiles(&tab.doc.layers[index], tab.doc.width, tab.doc.height);
         tab.doc.layers[index].pixels = pixels;
-        tab.history.commit();
+        tab.history.commit_labeled(if self.language_english {
+            "Filter"
+        } else {
+            "フィルター"
+        });
         true
     }
 
@@ -222,6 +226,11 @@ impl EfudeApp {
     /// Clears gestures finished on the old document and redraws everything
     /// whenever the active document changes.
     fn reset_transient_state(&mut self) {
+        self.pending_merge = None;
+        self.confirm_layer_clear = false;
+        self.cancel_studio_session();
+        self.studio.last_brush_point = None;
+        self.thumbnails.clear();
         self.active.clear();
         self.stroke_builder = None;
         self.provisional = None;
@@ -282,6 +291,8 @@ impl EfudeApp {
             recovered_title: None,
         });
         self.tabs.active = self.tabs.slots.len() - 1;
+        self.selected_layer = 0;
+        self.editing_mask = false;
         self.reset_transient_state();
     }
 

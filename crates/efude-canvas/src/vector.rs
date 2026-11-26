@@ -400,40 +400,175 @@ fn cut_circle(points: &[VectorPoint], center: (f32, f32), radius: f32) -> Vec<Ve
     pieces
 }
 
-/// Erases the points for which `erase` is true, splitting lines where they
-/// are cut. Returns the pixels that need drawing again.
-pub fn erase_points(
+/// Cuts stroke paths inside selected pixel cells (coverage at least 128).
+/// Tests the segments between stored points too. Unchanged strokes retain
+/// their curves; cut pieces keep their exact point geometry without refitting.
+/// Returns the pixels that need drawing again.
+pub fn erase_mask(
     strokes: &mut Vec<VectorStroke>,
-    erase: impl Fn(f32, f32) -> bool,
+    mask: &[u8],
+    width: u32,
+    height: u32,
 ) -> Option<PixelRect> {
+    let size = (width as usize).checked_mul(height as usize)?;
+    if !crate::valid_document_dimensions(width, height) || mask.len() < size {
+        return None;
+    }
+    let mut selected = None;
+    for (i, &coverage) in mask[..size].iter().enumerate() {
+        if coverage >= 128 {
+            let (x, y) = ((i % width as usize) as i32, (i / width as usize) as i32);
+            selected = union_rect(selected, Some([x, y, x + 1, y + 1]));
+        }
+    }
+    let selected = selected?;
+    let contains = |x: f64, y: f64| {
+        x >= selected[0] as f64
+            && y >= selected[1] as f64
+            && x < selected[2] as f64
+            && y < selected[3] as f64
+            && mask[y.floor() as usize * width as usize + x.floor() as usize] >= 128
+    };
     let mut dirty = None;
     let mut result = Vec::with_capacity(strokes.len());
     for stroke in strokes.drain(..) {
-        if !stroke.points.iter().any(|p| erase(p.x, p.y)) {
+        if stroke.points.len() <= 1 {
+            if stroke
+                .points
+                .first()
+                .is_some_and(|p| contains(p.x as f64, p.y as f64))
+            {
+                dirty = union_rect(dirty, stroke.bounds());
+            } else {
+                result.push(stroke);
+            }
+            continue;
+        }
+        let mut erased = false;
+        let mut pieces = Vec::new();
+        let mut current = Vec::new();
+        for pair in stroke.points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let mut cursor = 0.0;
+            for (start, end) in mask_spans(a, b, selected, &contains) {
+                erased = true;
+                if cursor < start {
+                    append_point(&mut current, point_between(a, b, cursor));
+                    append_point(&mut current, point_between(a, b, start));
+                }
+                if !current.is_empty() {
+                    pieces.push(std::mem::take(&mut current));
+                }
+                cursor = end;
+            }
+            if cursor < 1.0 {
+                append_point(&mut current, point_between(a, b, cursor));
+                append_point(&mut current, b);
+            }
+        }
+        if !erased {
             result.push(stroke);
             continue;
         }
         dirty = union_rect(dirty, stroke.bounds());
-        let mut current = Vec::new();
-        for &p in &stroke.points {
-            if erase(p.x, p.y) {
-                if !current.is_empty() {
-                    result.push(VectorStroke::fitted(
-                        std::mem::take(&mut current),
-                        stroke.color,
-                        stroke.hardness,
-                    ));
-                }
-            } else {
-                current.push(p);
-            }
-        }
         if !current.is_empty() {
-            result.push(VectorStroke::fitted(current, stroke.color, stroke.hardness));
+            pieces.push(current);
+        }
+        for points in pieces {
+            result.push(VectorStroke {
+                points,
+                color: stroke.color,
+                hardness: stroke.hardness,
+                // Refitting could shift unselected geometry or close a tiny gap.
+                // The control-point tool fits these point paths when requested.
+                anchors: Vec::new(),
+            });
         }
     }
     *strokes = result;
     dirty
+}
+
+fn append_point(points: &mut Vec<VectorPoint>, point: VectorPoint) {
+    if points.last() != Some(&point) {
+        points.push(point);
+    }
+}
+
+fn point_between(a: VectorPoint, b: VectorPoint, t: f64) -> VectorPoint {
+    if t == 0.0 {
+        return a;
+    }
+    if t == 1.0 {
+        return b;
+    }
+    let lerp = |a: f32, b: f32| (a as f64 + (b as f64 - a as f64) * t) as f32;
+    VectorPoint {
+        x: lerp(a.x, b.x),
+        y: lerp(a.y, b.y),
+        width: lerp(a.width, b.width),
+    }
+}
+
+/// Selected parameter intervals of a segment. Clip to the selected bounds
+/// before crossing pixel boundaries so off-canvas length cannot expand the scan.
+fn mask_spans(
+    a: VectorPoint,
+    b: VectorPoint,
+    bounds: PixelRect,
+    contains: &impl Fn(f64, f64) -> bool,
+) -> Vec<(f64, f64)> {
+    let origin = [a.x as f64, a.y as f64];
+    let delta = [b.x as f64 - origin[0], b.y as f64 - origin[1]];
+    let (mut start, mut end) = (0.0f64, 1.0f64);
+    for axis in 0..2 {
+        let (lo, hi) = (bounds[axis] as f64, bounds[axis + 2] as f64);
+        if delta[axis] == 0.0 {
+            if origin[axis] < lo || origin[axis] >= hi {
+                return Vec::new();
+            }
+        } else {
+            let t0 = (lo - origin[axis]) / delta[axis];
+            let t1 = (hi - origin[axis]) / delta[axis];
+            start = start.max(t0.min(t1));
+            end = end.min(t0.max(t1));
+        }
+    }
+    if start >= end {
+        return Vec::new();
+    }
+    let mut cuts = vec![start, end];
+    for axis in 0..2 {
+        if delta[axis] == 0.0 {
+            continue;
+        }
+        let from = origin[axis] + delta[axis] * start;
+        let to = origin[axis] + delta[axis] * end;
+        let first = from.min(to).floor().max(bounds[axis] as f64) as i32 + 1;
+        let last = from.max(to).ceil().min(bounds[axis + 2] as f64) as i32;
+        for boundary in first..last {
+            let t = (boundary as f64 - origin[axis]) / delta[axis];
+            if t > start && t < end {
+                cuts.push(t);
+            }
+        }
+    }
+    cuts.sort_unstable_by(f64::total_cmp);
+    cuts.dedup();
+    let mut spans: Vec<(f64, f64)> = Vec::new();
+    for pair in cuts.windows(2) {
+        let middle = pair[0] + (pair[1] - pair[0]) * 0.5;
+        if contains(origin[0] + delta[0] * middle, origin[1] + delta[1] * middle) {
+            if let Some(last) = spans.last_mut()
+                && last.1 == pair[0]
+            {
+                last.1 = pair[1];
+            } else {
+                spans.push((pair[0], pair[1]));
+            }
+        }
+    }
+    spans
 }
 
 /// Moves every point with `map`, and scales line widths by `width_scale`.
@@ -1070,6 +1205,151 @@ mod tests {
         let mut missed = vec![original.clone()];
         assert!(erase_circle(&mut missed, (20.0, 70.0), 5.0, false).is_none());
         assert_eq!(missed, [original]);
+    }
+
+    fn sparse_line(a: (f32, f32), b: (f32, f32), widths: (f32, f32)) -> VectorStroke {
+        VectorStroke {
+            points: vec![
+                VectorPoint {
+                    x: a.0,
+                    y: a.1,
+                    width: widths.0,
+                },
+                VectorPoint {
+                    x: b.0,
+                    y: b.1,
+                    width: widths.1,
+                },
+            ],
+            color: [20, 40, 200, 255],
+            hardness: 0.6,
+            anchors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selection_erasure_cuts_sparse_segments_and_interpolates_width() {
+        let original = sparse_line((8.0, 16.0), (56.0, 16.0), (1.0, 7.0));
+        let mut strokes = vec![original.clone()];
+        let mut mask = vec![0; 64 * 32];
+        for x in 20..24 {
+            mask[16 * 64 + x] = 128;
+        }
+        for x in 40..44 {
+            mask[16 * 64 + x] = 255;
+        }
+        assert_eq!(erase_mask(&mut strokes, &mask, 64, 32), original.bounds());
+        assert_eq!(strokes.len(), 3);
+        let intervals: Vec<_> = strokes
+            .iter()
+            .map(|s| (s.points.first().unwrap().x, s.points.last().unwrap().x))
+            .collect();
+        assert_eq!(intervals, [(8.0, 20.0), (24.0, 40.0), (44.0, 56.0)]);
+        assert_eq!(strokes[0].points.last().unwrap().width, 2.5);
+        assert_eq!(strokes[1].points[0].width, 3.0);
+        for stroke in &strokes {
+            assert_eq!(stroke.color, original.color);
+            assert_eq!(stroke.hardness, original.hardness);
+            assert!(stroke.anchors.is_empty());
+        }
+    }
+
+    #[test]
+    fn selection_erasure_catches_diagonal_pixel_corner_crossings_in_both_directions() {
+        let original = sparse_line((0.0, 0.9999), (64.0, 64.9999), (2.0, 4.0));
+        let mut mask = vec![0; 66 * 66];
+        mask[66 + 1] = 255;
+        let mut cuts = Vec::new();
+        for reverse in [false, true] {
+            let mut stroke = original.clone();
+            if reverse {
+                stroke.points.reverse();
+            }
+            let mut strokes = vec![stroke];
+            assert!(erase_mask(&mut strokes, &mask, 66, 66).is_some());
+            assert_eq!(strokes.len(), 2);
+            if reverse {
+                strokes.reverse();
+                for part in &mut strokes {
+                    part.points.reverse();
+                }
+            }
+            let left = *strokes[0].points.last().unwrap();
+            let right = strokes[1].points[0];
+            assert!((left.x - 1.0).abs() < 0.00001);
+            assert!(right.x > left.x && right.x < 1.0002);
+            cuts.push((left, right));
+        }
+        assert_eq!(cuts[0], cuts[1]);
+    }
+
+    #[test]
+    fn selection_erasure_clips_scan_to_mask_and_keeps_misses_exact() {
+        let original = sparse_line((-1_000_000.0, 8.0), (1_000_000.0, 8.0), (2.0, 4.0));
+        let mut mask = vec![0; 16 * 16];
+        mask[8 * 16 + 3] = 255;
+        let mut strokes = vec![original.clone()];
+        assert!(erase_mask(&mut strokes, &mask, 16, 16).is_some());
+        assert_eq!(strokes.len(), 2);
+        assert!((strokes[0].points.last().unwrap().x - 3.0).abs() < 0.0001);
+        assert!((strokes[1].points[0].x - 4.0).abs() < 0.0001);
+        assert_eq!(strokes[0].points[0], original.points[0]);
+        assert_eq!(*strokes[1].points.last().unwrap(), original.points[1]);
+
+        let curved = VectorStroke::fitted(
+            line((1.0, 4.0), (14.0, 4.0), 2.0).points,
+            [1, 2, 3, 255],
+            0.5,
+        );
+        for coverage in [0, 127, 255] {
+            mask.fill(0);
+            mask[12 * 16 + 3] = coverage;
+            let mut strokes = vec![curved.clone()];
+            assert!(erase_mask(&mut strokes, &mask, 16, 16).is_none());
+            assert_eq!(strokes.as_slice(), std::slice::from_ref(&curved));
+        }
+        let mut strokes = vec![curved.clone()];
+        assert!(erase_mask(&mut strokes, &[255], 16, 16).is_none());
+        assert_eq!(strokes, [curved]);
+    }
+
+    #[test]
+    fn selection_erasure_handles_vertical_boundary_dots_and_duplicate_points() {
+        let mut mask = vec![0; 16 * 16];
+        mask[8 * 16 + 4] = 128;
+        let original = sparse_line((4.0, 2.0), (4.0, 14.0), (2.0, 2.0));
+        for reverse in [false, true] {
+            let mut stroke = original.clone();
+            stroke.points.insert(0, stroke.points[0]);
+            stroke.points.push(*stroke.points.last().unwrap());
+            if reverse {
+                stroke.points.reverse();
+            }
+            let mut strokes = vec![stroke];
+            assert!(erase_mask(&mut strokes, &mask, 16, 16).is_some());
+            assert_eq!(strokes.len(), 2);
+            if reverse {
+                strokes.reverse();
+                for part in &mut strokes {
+                    part.points.reverse();
+                }
+            }
+            assert_eq!(strokes[0].points.last().unwrap().y, 8.0);
+            assert_eq!(strokes[1].points[0].y, 9.0);
+        }
+        for (x, coverage) in [(4.0, 127), (4.0, 128), (5.0, 255)] {
+            mask[8 * 16 + 4] = coverage;
+            let mut dot = sparse_line((x, 8.0), (x, 8.0), (2.0, 2.0));
+            dot.points.truncate(1);
+            let mut strokes = vec![dot.clone()];
+            let erased = erase_mask(&mut strokes, &mask, 16, 16).is_some();
+            assert_eq!(erased, x == 4.0 && coverage >= 128);
+            if erased {
+                assert!(strokes.is_empty());
+            } else {
+                assert_eq!(strokes, [dot]);
+            }
+        }
     }
 
     #[test]

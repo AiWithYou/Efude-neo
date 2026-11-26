@@ -29,7 +29,7 @@ struct Params {
     tile_offset: u32,
     cell_offset: u32,
     grain_rotation: f32,
-    _padding1: u32,
+    alpha_lock: u32,
     _padding2: u32,
     _padding3: u32,
 };
@@ -156,6 +156,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     );
     var touched = 0u;
     let cell_word = params.cell_offset + cell * 2u;
+    let packed = input[cell_word];
+    if (params.alpha_lock != 0u && (params.eraser != 0u || (packed >> 24u) == 0u)) {
+        io[io_base + 4u] = packed;
+        io[io_base + 5u] = 0u;
+        return;
+    }
     let selection = f32(input[cell_word + 1u]) / 255.0;
     for (var k = 0u; k < count; k = k + 1u) {
         let d = input[first + k] * DAB_FLOATS;
@@ -210,11 +216,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     io[io_base + 2u] = bitcast<u32>(st.z);
     io[io_base + 3u] = bitcast<u32>(st.w);
     // Exact integer channels, as on the CPU (no unorm round trip).
-    let packed = input[cell_word];
     let base_i = vec4<u32>(packed & 255u, (packed >> 8u) & 255u, (packed >> 16u) & 255u, (packed >> 24u) & 255u);
     let base = vec4<f32>(base_i) / 255.0;
     var out = vec4<u32>(0u);
-    if (params.eraser != 0u) {
+    if (params.alpha_lock != 0u) {
+        let rgb = st.xyz * 255.0 * st.w + vec3<f32>(base_i.xyz) * (1.0 - st.w);
+        out = vec4<u32>(vec3<u32>(round_half_up3(rgb)), base_i.w);
+    } else if (params.eraser != 0u) {
         let a = u32(clamp(round_half_up(f32(base_i.w) * (1.0 - st.w)), 0.0, 255.0));
         if (a > 0u) {
             out = vec4<u32>(base_i.xyz, a);
@@ -320,6 +328,12 @@ impl GpuCover {
             compatible_surface: None,
         }))
         .ok_or("no GPU adapter")?;
+        #[cfg(test)]
+        eprintln!(
+            "Cover adapter: {} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("efude-cover-device"),
@@ -446,6 +460,7 @@ impl GpuCover {
         params[14] = grain_offset;
         params[15] = tile_offset as u32;
         params[16] = cell_offset as u32;
+        params[18] = u32::from(batch.alpha_lock);
         params[17] = batch.grain_rotation.to_bits();
 
         let bytes = |words: &[u32]| {
@@ -655,6 +670,7 @@ mod tests {
                 .iter()
                 .map(|p| {
                     let d = dynamics(brush, p, raster.last_dab, 1.0);
+                    let d = raster.prepare_dynamics(style, p, d);
                     raster.finish_dab(style, *p);
                     (*p, d)
                 })
@@ -730,6 +746,101 @@ mod tests {
         efude_brush::defaults().remove(index)
     }
 
+    #[test]
+    fn locked_cover_matches_cpu_and_preserves_every_alpha() {
+        let gpu = gpu();
+        let (w, h) = (64, 32);
+        let points = wavy(28, 64., 32., 8.);
+        for eraser in [false, true] {
+            let mut original = background(w, h);
+            original.layers[0].alpha_lock = true;
+            for y in 0..h {
+                for x in 0..w {
+                    original.layers[0]
+                        .pixels
+                        .set_pixel(x, y, [90, 50, 20, (x % 3 * 89) as u8]);
+                }
+            }
+            let mut reference = original.clone();
+            let brush = brush(0);
+            paint(&mut reference, &brush, eraser, 8., &points, None, None);
+            for accel in std::iter::once(&efude_brush::engine::CpuCover as &dyn CoverAccelerator)
+                .chain(gpu.as_ref().map(|g| g as &dyn CoverAccelerator))
+            {
+                let mut d = original.clone();
+                paint(&mut d, &brush, eraser, 8., &points, None, Some(accel));
+                for y in 0..h {
+                    for x in 0..w {
+                        let p = d.layers[0].pixels.pixel(x, y);
+                        let base = original.layers[0].pixels.pixel(x, y);
+                        assert_eq!(p[3], base[3]);
+                        if eraser || base[3] == 0 {
+                            assert_eq!(base, p);
+                        }
+                        assert!(
+                            p.iter()
+                                .zip(reference.layers[0].pixels.pixel(x, y))
+                                .all(|(a, b)| a.abs_diff(b) <= 1)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn jitter_and_direction_match_sequential_replay_across_batch_boundaries() {
+        let mut brush = brush(0);
+        brush.tip_aspect = 2.;
+        brush.follow_stroke_direction = true;
+        brush.hue_jitter = 0.8;
+        brush.saturation_jitter = 0.4;
+        brush.brightness_jitter = 0.5;
+        let points = wavy(70, 80., 64., 10.);
+        let mut reference = Document::new(80, 64);
+        let mut history = History::default();
+        let mut raster = StrokeRaster::new([0.1, 0.2, 0.3], brush.mix.charge, Vec2::new(3., 4.));
+        let style = DabStyle {
+            brush: &brush,
+            kind: brush.kind,
+            eraser: false,
+            color: [30, 140, 220, 230],
+            size: 10.,
+        };
+        for p in &points {
+            let d = dynamics(&brush, p, raster.last_dab, 1.);
+            raster.stamp(
+                &mut DabTarget {
+                    doc: &mut reference,
+                    layer: 0,
+                    selection: None,
+                    history: &mut history,
+                },
+                style,
+                &d,
+                *p,
+            );
+            raster.finish_dab(style, *p);
+        }
+        let cpu = efude_brush::engine::CpuCover;
+        let gpu = gpu();
+        for (accel, tolerance) in std::iter::once((&cpu as &dyn CoverAccelerator, 0))
+            .chain(gpu.as_ref().map(|g| (g as &dyn CoverAccelerator, 1)))
+        {
+            let mut doc = Document::new(80, 64);
+            paint(&mut doc, &brush, false, 10., &points, None, Some(accel));
+            let reference = reference.layers[0].pixels.to_dense();
+            let actual = doc.layers[0].pixels.to_dense();
+            assert!(
+                actual
+                    .iter()
+                    .zip(reference)
+                    .all(|(a, b)| a.abs_diff(b) <= tolerance)
+            );
+        }
+        if let Some(gpu) = gpu {
+            assert!(gpu.batches_painted() > 0);
+        }
+    }
     #[test]
     fn pen_matches_cpu() {
         compare(brush(0), false, 14.0, false);

@@ -338,12 +338,7 @@ impl EfudeApp {
                 .button(self.text("現在の色にする", "Use Current Color"))
                 .clicked()
             {
-                let color = [
-                    self.color.r(),
-                    self.color.g(),
-                    self.color.b(),
-                    self.color.a(),
-                ];
+                let color = self.color;
                 self.edit_selected_vector(|strokes, stroke, _| strokes[stroke].color = color);
             }
         });

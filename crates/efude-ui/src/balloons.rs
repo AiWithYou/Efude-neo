@@ -86,7 +86,7 @@ impl EfudeApp {
             .unwrap_or_default()
     }
 
-    fn store_balloons(&mut self, balloons: &[Balloon]) {
+    pub(super) fn store_balloons(&mut self, balloons: &[Balloon]) {
         let text = (!balloons.is_empty())
             .then(|| serde_json::to_string(balloons).ok())
             .flatten();
@@ -993,6 +993,54 @@ mod tests {
 
     fn add_balloon(app: &mut EfudeApp, center: glam::Vec2) -> u64 {
         app.create_balloon(center, Some(glam::Vec2::splat(40.0)), BalloonShape::Ellipse)
+    }
+
+    #[test]
+    fn stage5_crop_and_edit_balloon_undo_together() {
+        let mut app = small_app();
+        add_balloon(&mut app, glam::Vec2::new(64., 48.));
+        let mut original = app.balloons()[0].clone();
+        original.tails.push(Tail {
+            tip: glam::Vec2::new(90., 65.),
+            width: 8.,
+            bend: 0.3,
+            bubbles: false,
+        });
+        app.update_balloon(original.clone());
+        app.apply_crop([12, 8, 108, 80]);
+        let mut moved = app.balloons()[0].clone();
+        assert_eq!(moved.center, glam::Vec2::new(52., 40.));
+        for (a, b) in moved.tails.iter().zip(&original.tails) {
+            assert_eq!(a.tip, b.tip - glam::Vec2::new(12., 8.));
+        }
+        moved.text = "Edited".into();
+        app.update_balloon(moved);
+        assert_eq!(app.balloons()[0].center, glam::Vec2::new(52., 40.));
+        app.undo();
+        app.undo();
+        assert_eq!(app.doc.width, 128);
+        assert_eq!(app.balloons()[0], original);
+    }
+    #[test]
+    fn stage5_merge_requires_rasterizing_balloon_on_either_side() {
+        let mut app = small_app();
+        add_balloon(&mut app, glam::Vec2::splat(48.));
+        let original = app.balloons();
+        app.merge_selected(false);
+        assert_eq!(app.doc.layers.len(), 2);
+        app.add_raster_layer();
+        app.doc.layers[2].pixels.set_pixel(0, 0, [255; 4]);
+        app.merge_selected(false);
+        assert_eq!(app.doc.layers.len(), 3);
+        assert_eq!(app.balloons(), original);
+        app.rasterize_layer(1);
+        assert!(app.balloons().is_empty());
+        app.merge_selected(false);
+        assert_eq!(app.doc.layers.len(), 2);
+        app.undo();
+        app.undo();
+        assert_eq!(app.balloons(), original);
+        assert_eq!(app.doc.layers[2].pixels.pixel(0, 0), [255; 4]);
     }
 
     #[test]

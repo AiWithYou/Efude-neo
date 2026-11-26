@@ -102,10 +102,10 @@ impl EfudeApp {
             });
         }
         let color = [
-            self.color.r(),
-            self.color.g(),
-            self.color.b(),
-            (self.color.a() as f32 * brush.opacity.clamp(0.0, 1.0)).round() as u8,
+            self.color[0],
+            self.color[1],
+            self.color[2],
+            (self.color[3] as f32 * brush.opacity.clamp(0.0, 1.0)).round() as u8,
         ];
         let hardness = brush.hardness;
         let mut dirty: Option<PixelRect> = None;
@@ -272,17 +272,7 @@ impl EfudeApp {
         };
         let mut strokes = before.clone();
         let dirty = if self.selection.active {
-            let mask = &self.selection.mask;
-            vector::erase_points(&mut strokes, |x, y| {
-                let (x, y) = (x.floor(), y.floor());
-                x >= 0.0
-                    && y >= 0.0
-                    && (x as u32) < w
-                    && (y as u32) < h
-                    && mask
-                        .get((y as u32 * w + x as u32) as usize)
-                        .is_some_and(|&v| v >= 128)
-            })
+            vector::erase_mask(&mut strokes, &self.selection.mask, w, h)
         } else {
             let all = strokes
                 .iter()
@@ -352,53 +342,16 @@ impl EfudeApp {
     ) {
         let index = self.selected_layer;
         let (w, h) = (self.doc.width, self.doc.height);
-        let Some(before) = self.doc.layers[index].vector.clone() else {
-            return;
-        };
-        // The same centre as the pixel transform: the middle of the
-        // selected pixels (of the canvas without a selection).
-        let mut bounds = (w as i32, h as i32, -1i32, -1i32);
-        if selected {
-            for (i, &v) in before_selection.iter().enumerate() {
-                if v != 0 {
-                    let (x, y) = ((i % w as usize) as i32, (i / w as usize) as i32);
-                    bounds = (
-                        bounds.0.min(x),
-                        bounds.1.min(y),
-                        bounds.2.max(x),
-                        bounds.3.max(y),
-                    );
-                }
-            }
-            if bounds.2 < 0 {
-                return;
-            }
-        } else {
-            bounds = (0, 0, w as i32 - 1, h as i32 - 1);
-        }
-        let cx = (bounds.0 + bounds.2) as f32 / 2.0 + 0.5;
-        let cy = (bounds.1 + bounds.3) as f32 / 2.0 + 0.5;
-        let (c, s) = (angle.cos(), angle.sin());
-        let width_scale = (scale.0 * scale.1).abs().sqrt();
-        let mut strokes = before.clone();
-        for stroke in &mut strokes {
-            if !selected || in_selection(stroke, before_selection, w, h) {
-                vector::transform_strokes(
-                    std::slice::from_mut(stroke),
-                    |x, y| {
-                        let dx = (x - cx) * scale.0;
-                        let dy = (y - cy) * scale.1;
-                        (cx + dx * c - dy * s, cy + dx * s + dy * c)
-                    },
-                    width_scale,
-                );
-            }
-        }
-        let id = self.doc.layers[index].id;
-        self.doc.layers[index].vector = Some(strokes);
-        vector::render_all(&mut self.doc.layers[index], w, h, Some(&mut self.history));
-        self.history
-            .record_vector(id, Some(&before), self.doc.layers[index].vector.as_deref());
+        transform_lines(
+            &mut self.doc.layers[index],
+            (w, h),
+            before_selection,
+            selected,
+            scale,
+            angle,
+            Vec2::ZERO,
+            &mut self.history,
+        );
     }
 
     /// Adds an empty vector layer above the selected layer.
@@ -430,13 +383,19 @@ impl EfudeApp {
         let Some(layer) = self.doc.layers.get_mut(index) else {
             return;
         };
-        let Some(before) = layer.vector.take() else {
-            return;
-        };
         let id = layer.id;
+        let before = layer.vector.take();
+        if before.is_none() && !self.editable_object_layers().contains(&id) {
+            return;
+        }
         self.history.begin();
-        self.history.record_vector(id, Some(&before), None);
-        self.history.commit();
+        if let Some(before) = before {
+            self.history.record_vector(id, Some(&before), None);
+        }
+        self.remove_balloon_layer_data(&[id]);
+        self.detach_panel(id);
+        self.history
+            .commit_labeled(self.text("ラスタライズ", "Rasterize"));
         self.status = self.text("ラスタライズしました", "Rasterized").into();
     }
 }
@@ -450,4 +409,87 @@ fn segment_rect(a: &VectorPoint, b: &VectorPoint) -> Option<PixelRect> {
         ((a.x.max(b.x) + r).ceil() as i32).saturating_add(1),
         ((a.y.max(b.y) + r).ceil() as i32).saturating_add(1),
     ])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn transform_lines(
+    layer: &mut efude_canvas::Layer,
+    (w, h): (u32, u32),
+    before_selection: &[u8],
+    selected: bool,
+    scale: (f32, f32),
+    angle: f32,
+    offset: Vec2,
+    history: &mut History,
+) {
+    let Some(before) = layer.vector.clone() else {
+        return;
+    };
+    // The same centre as the pixel transform: the middle of the
+    // selected pixels (of the canvas without a selection).
+    let mut bounds = (w as i32, h as i32, -1i32, -1i32);
+    if selected {
+        for (i, &v) in before_selection.iter().enumerate() {
+            if v != 0 {
+                let (x, y) = ((i % w as usize) as i32, (i / w as usize) as i32);
+                bounds = (
+                    bounds.0.min(x),
+                    bounds.1.min(y),
+                    bounds.2.max(x),
+                    bounds.3.max(y),
+                );
+            }
+        }
+        if bounds.2 < 0 {
+            return;
+        }
+    } else {
+        bounds = (0, 0, w as i32 - 1, h as i32 - 1);
+    }
+    let cx = (bounds.0 + bounds.2) as f32 / 2.0 + 0.5;
+    let cy = (bounds.1 + bounds.3) as f32 / 2.0 + 0.5;
+    let mut strokes = before.clone();
+    transform_line_geometry(
+        &mut strokes,
+        (w, h),
+        selected.then_some(before_selection),
+        Vec2::new(cx, cy),
+        scale,
+        angle,
+        offset,
+    );
+    let id = layer.id;
+    layer.vector = Some(strokes);
+    vector::render_all(layer, w, h, Some(history));
+    history.record_vector(id, Some(&before), layer.vector.as_deref());
+}
+
+pub(super) fn transform_line_geometry(
+    strokes: &mut [VectorStroke],
+    (w, h): (u32, u32),
+    selection: Option<&[u8]>,
+    center: Vec2,
+    scale: (f32, f32),
+    angle: f32,
+    offset: Vec2,
+) {
+    let (cx, cy) = (center.x, center.y);
+    let (c, s) = (angle.cos(), angle.sin());
+    let width_scale = (scale.0 * scale.1).abs().sqrt();
+    for stroke in strokes {
+        if selection.is_none_or(|mask| in_selection(stroke, mask, w, h)) {
+            vector::transform_strokes(
+                std::slice::from_mut(stroke),
+                |x, y| {
+                    let dx = (x - cx) * scale.0;
+                    let dy = (y - cy) * scale.1;
+                    (
+                        cx + dx * c - dy * s + offset.x,
+                        cy + dx * s + dy * c + offset.y,
+                    )
+                },
+                width_scale,
+            );
+        }
+    }
 }
